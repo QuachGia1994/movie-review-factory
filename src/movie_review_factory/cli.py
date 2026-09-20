@@ -4,7 +4,14 @@ from typing import Optional
 import typer
 
 from .models import JobConfig
-from .pipeline import create_job, validate_job, run_job, job_status, manifest_path
+from .pipeline import (
+    approve_metadata,
+    create_job,
+    job_status,
+    manifest_path,
+    run_job,
+    validate_job,
+)
 
 app = typer.Typer(no_args_is_help=True)
 
@@ -67,3 +74,66 @@ def status(path: Path):
         if s["message"]:
             line += f" - {s['message']}"
         typer.echo(line)
+
+
+@app.command()
+def serve(
+    host: str = "127.0.0.1",
+    port: int = 8765,
+    jobs_root: Path = Path("jobs"),
+):
+    """Launch the local web UI for creating and reviewing jobs.
+
+    Serves a single-page dashboard (job creation, progress, artifact review,
+    final-render preview, metadata approval, and the publish gate) with a
+    stdlib-only server. Binds to localhost by default.
+    """
+    from .webapp import run_server
+
+    run_server(host=host, port=port, jobs_root=jobs_root)
+
+
+@app.command("approve-metadata")
+def approve_metadata_cmd(
+    path: Path,
+    confirm: bool = typer.Option(
+        False, "--confirm", help="Required: approval is a deliberate act."
+    ),
+):
+    """Explicitly approve a job's YouTube metadata (required before publish).
+
+    Refuses to act without --confirm so approval is never accidental. Never
+    uploads anything and never runs the publish stage.
+    """
+    if not confirm:
+        typer.echo("Refusing to approve metadata without --confirm (approval is deliberate).")
+        raise typer.Exit(2)
+    meta = approve_metadata(path)
+    typer.echo(f"approved metadata for {meta.get('job_id', path.name)}")
+
+
+@app.command()
+def publish(
+    path: Path,
+    confirm: bool = typer.Option(
+        False, "--confirm", help="Required: publishing is a deliberate act."
+    ),
+):
+    """Run the publish gate. Writes publish_record.json only when approvals are
+    complete; never uploads. Refuses without --confirm."""
+    if not manifest_path(path).exists():
+        typer.echo("ERROR: manifest.json is missing")
+        raise typer.Exit(1)
+    if not confirm:
+        typer.echo(
+            "Refusing to publish without --confirm "
+            "(publishing is deliberate; this only writes a handoff record, never uploads)."
+        )
+        raise typer.Exit(2)
+    manifest = run_job(path, until="publish")
+    stage = manifest.stage("publish")
+    status_text = stage.status if stage else "missing"
+    message = stage.message if stage else "publish stage not found"
+    typer.echo(f"publish: {status_text} - {message}")
+    if status_text != "ready":
+        raise typer.Exit(1)

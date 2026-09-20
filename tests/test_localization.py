@@ -1,0 +1,50 @@
+"""Unit tests for the Vietnamese localization layer."""
+
+import movie_review_factory.pipeline as pipeline
+from movie_review_factory import localization
+
+
+def test_every_stage_has_a_vietnamese_label() -> None:
+    # The label table must cover exactly the canonical pipeline stages.
+    assert set(localization.STAGE_LABELS) == set(pipeline.STAGES)
+    assert all(localization.STAGE_LABELS[s] for s in pipeline.STAGES)
+
+
+def test_every_status_has_a_vietnamese_label() -> None:
+    for status in ("pending", "running", "ready", "failed", "skipped"):
+        assert localization.status_label(status) != status
+        assert localization.status_label(status)
+
+
+def test_labels_fall_back_to_raw_value() -> None:
+    assert localization.stage_label("unknown-stage") == "unknown-stage"
+    assert localization.status_label("weird") == "weird"
+
+
+def test_localize_known_ready_messages() -> None:
+    assert localization.localize_message("draft metadata written") == "đã tạo bản nháp siêu dữ liệu"
+    assert localization.localize_message("rendered 6 clips to final.mp4") == (
+        "đã kết xuất 6 phân đoạn vào final.mp4"
+    )
+    assert localization.localize_message("qa passed — 8 checks OK") == "kiểm tra đạt — 8 mục OK"
+
+
+def test_localize_publish_blocked_translates_each_reason() -> None:
+    raw = (
+        "publish blocked: script.json not approved (set approved=true); "
+        "youtube_metadata.json not approved (set approved=true)"
+    )
+    out = localization.localize_message(raw)
+    assert out.startswith("Chưa thể xuất bản:")
+    assert "kịch bản chưa được duyệt" in out
+    assert "siêu dữ liệu chưa được duyệt" in out
+
+
+def test_localize_missing_before_pattern() -> None:
+    out = localization.localize_message("voice.json missing - run tts before alignment")
+    assert out == "thiếu voice.json — chạy bước tts trước bước alignment"
+
+
+def test_unknown_message_is_returned_unchanged() -> None:
+    assert localization.localize_message("some novel message") == "some novel message"
+    assert localization.localize_message("") == ""
