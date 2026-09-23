@@ -8,8 +8,8 @@ public service.
 
 Publishing safety is built into the shape of the API, not just the UI:
 
-* The web "run" action stops the pipeline at the ``metadata`` stage
-  (``until="metadata"``) and never reaches ``publish`` on its own.
+* The web "run" action stops the pipeline at the ``thumbnail`` stage
+  (``until="thumbnail"``) and never reaches ``publish`` on its own.
 * Metadata approval (``approved=true``) is a separate, explicit endpoint.
 * Publishing requires an explicit ``confirm`` and, even then, only runs the
   ``publish`` stage - which merely writes the handoff record
@@ -35,7 +35,7 @@ from .models import JobConfig
 _SAFE_SEGMENT = re.compile(r"^[A-Za-z0-9._-]+$")
 
 # The web "run" button intentionally stops here; publish is a separate action.
-RUN_UNTIL_STAGE = "metadata"
+RUN_UNTIL_STAGE = "thumbnail"
 
 # Optional bearer-token auth.  Set DASHBOARD_TOKEN in the environment to require
 # a token on every request.  When the variable is absent or empty every request
@@ -57,7 +57,7 @@ _SECURITY_HEADERS: dict[str, str] = {
         "script-src 'self' 'unsafe-inline'; "
         "style-src 'self' 'unsafe-inline'; "
         "media-src 'self' blob:; "
-        "img-src 'self' data:; "
+        "img-src 'self' data: blob:; "
         "connect-src 'self'"
     ),
 }
@@ -69,6 +69,8 @@ _CONTENT_TYPES = {
     ".srt": "text/plain; charset=utf-8",
     ".md": "text/markdown; charset=utf-8",
     ".txt": "text/plain; charset=utf-8",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
 }
 
 _ARTIFACT_KINDS = {
@@ -78,6 +80,8 @@ _ARTIFACT_KINDS = {
     ".srt": "subtitle",
     ".md": "markdown",
     ".txt": "text",
+    ".jpg": "image",
+    ".jpeg": "image",
 }
 
 
@@ -168,6 +172,7 @@ class JobsService:
         }
         info["artifacts"] = self.list_artifacts(job_id)
         info["has_final_video"] = (root / "final.mp4").exists()
+        info["has_thumbnail"] = (root / "thumbnail.jpg").exists()
         return info
 
     def list_artifacts(self, job_id: str) -> list[dict]:
@@ -195,6 +200,11 @@ class JobsService:
         meta = self._read_json(root, pipeline.METADATA_NAME)
         return {"present": bool(meta), "metadata": meta}
 
+    def get_thumbnails(self, job_id: str) -> dict:
+        root = self._require_job(job_id)
+        thumbnails = self._read_json(root, "thumbnails.json")
+        return {"present": bool(thumbnails), "thumbnails": thumbnails}
+
     def artifact_path(self, job_id: str, name: str) -> Path:
         root = self._require_job(job_id)
         if not _is_safe_segment(name):
@@ -217,19 +227,24 @@ class JobsService:
         if pipeline.manifest_path(root).exists():
             raise FileExistsError(f"job đã tồn tại: {job_id}")
         source_video = payload.get("source_video") or None
+        content_agent = str(payload.get("content_agent") or "scaffold")
+        if content_agent not in {"scaffold", "claude"}:
+            raise ValueError("content_agent phải là scaffold hoặc claude")
         config = JobConfig(
             job_id=job_id,
             language=str(payload.get("language") or "vi"),
             target_minutes=float(payload.get("target_minutes") or 10),
             aspect_ratio=str(payload.get("aspect_ratio") or "16:9"),
             source_video=Path(source_video) if source_video else None,
+            movie_title=str(payload.get("movie_title") or "").strip() or None,
+            content_agent=content_agent,
         )
         pipeline.create_job(root, config)
         return self.status(job_id)
 
     def start_run(self, job_id: str, *, until: str | None = RUN_UNTIL_STAGE) -> dict:
         """Run the pipeline in a background thread up to ``until`` (default
-        ``metadata``). Progress is observed by polling ``status`` because
+        ``thumbnail``). Progress is observed by polling ``status`` because
         ``run_job`` persists the manifest after every stage."""
         root = self._require_job(job_id)
         with self._lock:
@@ -266,28 +281,20 @@ class JobsService:
 
     def update_script(self, job_id: str, fields: dict) -> dict:
         root = self._require_job(job_id)
-        path = root / "script.json"
-        if not path.exists():
-            raise FileNotFoundError("script.json missing - run the script stage first")
-        script = json.loads(path.read_text(encoding="utf-8"))
-        if "sections" in fields and fields["sections"] is not None:
-            if not isinstance(fields["sections"], list):
-                raise ValueError("sections must be a JSON array")
-            script["sections"] = fields["sections"]
-        if "notes" in fields and fields["notes"] is not None:
-            script["notes"] = str(fields["notes"])
-        script["approved"] = False
-        path.write_text(json.dumps(script, ensure_ascii=False, indent=2), encoding="utf-8")
+        script = pipeline.update_script(root, fields)
         return {"approved": False, "script": script}
+
+    def select_thumbnail(self, job_id: str, candidate: str) -> dict:
+        root = self._require_job(job_id)
+        thumbnails = pipeline.select_thumbnail(root, candidate)
+        return {
+            "selected": thumbnails.get("primary_candidate", ""),
+            "thumbnails": thumbnails,
+        }
 
     def approve_script(self, job_id: str) -> dict:
         root = self._require_job(job_id)
-        path = root / "script.json"
-        if not path.exists():
-            raise FileNotFoundError("script.json missing - run the script stage first")
-        script = json.loads(path.read_text(encoding="utf-8"))
-        script["approved"] = True
-        path.write_text(json.dumps(script, ensure_ascii=False, indent=2), encoding="utf-8")
+        script = pipeline.approve_script(root)
         return {"approved": True, "script": script}
 
     def prepare_publish(self, job_id: str, *, confirm: bool) -> dict:
@@ -331,7 +338,7 @@ class _Server(ThreadingHTTPServer):
 
 
 class MRFRequestHandler(BaseHTTPRequestHandler):
-    server_version = "MovieReviewFactory/0.1"
+    server_version = "MovieReviewFactory/0.2"
 
     @property
     def service(self) -> JobsService:
@@ -532,6 +539,9 @@ class MRFRequestHandler(BaseHTTPRequestHandler):
         if len(parts) == 3 and parts[0] == "jobs" and parts[2] == "script":
             self._send_json(200, self.service.get_script(parts[1]))
             return
+        if len(parts) == 3 and parts[0] == "jobs" and parts[2] == "thumbnails":
+            self._send_json(200, self.service.get_thumbnails(parts[1]))
+            return
         self._send_json(404, {"error": "not found", "error_vi": "không tìm thấy"})
 
     def _route_post(self, parts: list[str]) -> None:
@@ -552,6 +562,13 @@ class MRFRequestHandler(BaseHTTPRequestHandler):
             return
         if len(parts) == 4 and parts[0] == "jobs" and parts[2] == "script" and parts[3] == "approve":
             self._send_json(200, self.service.approve_script(parts[1]))
+            return
+        if len(parts) == 4 and parts[0] == "jobs" and parts[2] == "thumbnails" and parts[3] == "select":
+            body = self._read_body()
+            candidate = str(body.get("candidate") or "").strip()
+            if not candidate:
+                raise ValueError("thiếu candidate ảnh bìa")
+            self._send_json(200, self.service.select_thumbnail(parts[1], candidate))
             return
         if len(parts) == 3 and parts[0] == "jobs" and parts[2] == "publish":
             body = self._read_body()
@@ -636,6 +653,11 @@ INDEX_HTML = """<!DOCTYPE html>
   .arts a { color: #9db4ff; text-decoration: none; }
   .arts li { margin: 3px 0; }
   video { width: 100%; border-radius: 8px; background: #000; margin-top: 8px; }
+  .thumb-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 10px; }
+  .thumb-item { border: 1px solid #333a48; border-radius: 8px; padding: 8px; }
+  .thumb-item.selected { border-color: var(--accent); background: #1c2438; }
+  .thumb-item img { width: 100%; aspect-ratio: 16/9; object-fit: cover; border-radius: 6px; background: #000; }
+  .thumb-item button { width: 100%; margin-top: 6px; }
   .gate { border: 1px dashed #6b5324; background: #1c1706; border-radius: 8px; padding: 10px; }
   .ok { color: #57d98a; } .warn { color: #f5c451; } .err { color: #ff7a86; }
   .notice { font-size: 12px; color: #9aa3b2; margin-top: 6px; }
@@ -654,8 +676,15 @@ INDEX_HTML = """<!DOCTYPE html>
       <form id="createForm">
         <label>Mã job (job_id)</label>
         <input name="job_id" placeholder="vd: review-abc" required>
+        <label>Tên phim / truy vấn nghiên cứu</label>
+        <input name="movie_title" placeholder="vd: The Matrix (1999)">
         <label>Ngôn ngữ</label>
         <input name="language" value="vi">
+        <label>Bộ tạo nội dung</label>
+        <select name="content_agent">
+          <option value="scaffold">Scaffold (offline)</option>
+          <option value="claude">Claude Code (research → outline → script)</option>
+        </select>
         <label>Thời lượng mục tiêu (phút)</label>
         <input name="target_minutes" type="number" value="10" min="1" max="60" step="0.5">
         <label>Tỷ lệ khung hình</label>
@@ -680,11 +709,11 @@ INDEX_HTML = """<!DOCTYPE html>
         <div class="row" style="justify-content:space-between">
           <h2 id="jobTitle" style="margin:0"></h2>
           <div class="row">
-            <button id="runBtn" class="primary">Chạy pipeline (đến bước Siêu dữ liệu)</button>
+            <button id="runBtn" class="primary">Chạy pipeline (đến bước Ảnh bìa)</button>
             <button id="refreshBtn">Làm mới</button>
           </div>
         </div>
-        <div class="notice">Nút "Chạy" dừng ở bước <code>metadata</code>; bước <code>publish</code> không bao giờ tự chạy.</div>
+        <div class="notice">Nút "Chạy" dừng ở bước <code>thumbnail</code>; bước <code>publish</code> không bao giờ tự chạy.</div>
         <div style="margin-top:10px" class="progress"><div id="progBar"></div></div>
         <div id="progText" class="muted" style="margin-top:6px"></div>
         <div id="runErr" class="err" style="margin-top:6px"></div>
@@ -698,6 +727,13 @@ INDEX_HTML = """<!DOCTYPE html>
       <div class="card" id="videoCard" style="display:none">
         <h2>Xem trước bản dựng cuối (final.mp4)</h2>
         <video id="video" controls preload="metadata"></video>
+      </div>
+
+      <div class="card" id="thumbnailCard" style="display:none">
+        <h2>Chọn ảnh bìa</h2>
+        <div class="muted">Chọn một trong các frame đã tạo. Ảnh được chọn sẽ trở thành <code>thumbnail.jpg</code>.</div>
+        <div id="thumbnailGrid" class="thumb-grid" style="margin-top:10px"></div>
+        <div id="thumbnailMsg" class="notice"></div>
       </div>
 
       <div class="card">
@@ -756,6 +792,7 @@ INDEX_HTML = """<!DOCTYPE html>
 const $ = (id) => document.getElementById(id);
 let current = null;
 let poller = null;
+let thumbnailObjectUrls = [];
 
 // Read bearer token from URL fragment (#token=...) — fragment is never sent
 // to the server so the token never appears in access logs.  Not persisted.
@@ -785,6 +822,82 @@ async function authFetch(url) {
   } catch (e) { return url; }
 }
 
+function clearThumbnailObjectUrls() {
+  for (const url of thumbnailObjectUrls) URL.revokeObjectURL(url);
+  thumbnailObjectUrls = [];
+}
+
+async function renderThumbnails() {
+  const card = $('thumbnailCard');
+  const grid = $('thumbnailGrid');
+  const message = $('thumbnailMsg');
+  clearThumbnailObjectUrls();
+
+  let result;
+  try {
+    result = await api('GET', '/api/jobs/' + encodeURIComponent(current) + '/thumbnails');
+  } catch (e) {
+    card.style.display = '';
+    grid.replaceChildren();
+    message.innerHTML = '<span class="err">Lỗi tải ảnh bìa: ' + e.message + '</span>';
+    return;
+  }
+
+  const doc = result.thumbnails || {};
+  const candidates = Array.isArray(doc.candidates) ? doc.candidates : [];
+  if (!result.present || !candidates.length) {
+    card.style.display = 'none';
+    grid.replaceChildren();
+    message.textContent = '';
+    return;
+  }
+
+  card.style.display = '';
+  grid.replaceChildren();
+  message.textContent = '';
+
+  for (const candidate of candidates) {
+    if (!candidate || typeof candidate.file !== 'string') continue;
+
+    const item = document.createElement('div');
+    item.className = 'thumb-item' + (candidate.file === doc.primary_candidate ? ' selected' : '');
+
+    const img = document.createElement('img');
+    img.alt = 'Ảnh bìa ứng viên ' + (candidate.index || '');
+    const artifactUrl = '/api/jobs/' + encodeURIComponent(current)
+      + '/artifacts/' + encodeURIComponent(candidate.file);
+    const resolved = await authFetch(artifactUrl);
+    if (resolved.startsWith('blob:')) thumbnailObjectUrls.push(resolved);
+    img.src = resolved;
+
+    const meta = document.createElement('div');
+    meta.className = 'muted';
+    const seconds = Number(candidate.source_seconds || 0).toFixed(1);
+    meta.textContent = candidate.file + ' · ' + seconds + 's';
+
+    const button = document.createElement('button');
+    const selected = candidate.file === doc.primary_candidate;
+    button.textContent = selected ? 'Đang dùng' : 'Chọn ảnh này';
+    button.disabled = selected;
+    button.onclick = async () => {
+      try {
+        await api(
+          'POST',
+          '/api/jobs/' + encodeURIComponent(current) + '/thumbnails/select',
+          { candidate: candidate.file }
+        );
+        message.innerHTML = '<span class="ok">Đã chọn ' + candidate.file + ' làm ảnh bìa.</span>';
+        await loadStatus();
+      } catch (e) {
+        message.innerHTML = '<span class="err">' + e.message + '</span>';
+      }
+    };
+
+    item.append(img, meta, button);
+    grid.appendChild(item);
+  }
+}
+
 async function loadJobs() {
   try {
     const { jobs } = await api('GET', '/api/jobs');
@@ -804,6 +917,7 @@ async function loadJobs() {
 }
 
 function selectJob(id) {
+  clearThumbnailObjectUrls();
   current = id;
   $('empty').style.display = 'none';
   $('detail').style.display = '';
@@ -844,6 +958,15 @@ async function loadStatus() {
       authFetch(src).then(resolved => { v.src = resolved; });
     }
   } else { vc.style.display = 'none'; }
+
+  if (s.has_thumbnail) {
+    await renderThumbnails();
+  } else {
+    clearThumbnailObjectUrls();
+    $('thumbnailCard').style.display = 'none';
+    $('thumbnailGrid').replaceChildren();
+    $('thumbnailMsg').textContent = '';
+  }
 
   const artHtml = s.artifacts.length
     ? s.artifacts.map(a => `<li><a href="${a.href}" data-auth-href="${a.href}" target="_blank">${a.name}</a> `

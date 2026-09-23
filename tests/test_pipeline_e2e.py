@@ -11,7 +11,9 @@ stays out: this test supplies narration.mp3 + voice.json locally and lets the tt
 stage skip honestly. No server is started and no network call is made.
 """
 
+import importlib.util
 import json
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -24,6 +26,8 @@ from movie_review_factory.pipeline import (
     create_job,
     load_manifest,
     run_job,
+    save_manifest,
+    _probe_duration_seconds,
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -117,3 +121,96 @@ def test_end_to_end_real_render_then_publish_gate(tmp_path: Path) -> None:
     assert pub.status == "ready", pub.message
     record = json.loads((tmp_path / "publish_record.json").read_text(encoding="utf-8"))
     assert record["publish_ready"] is True
+
+
+@pytest.mark.skipif(
+    os.environ.get("MRF_RUN_LIVE_TTS_TESTS") != "1",
+    reason="live Edge-TTS network test is opt-in",
+)
+@pytest.mark.skipif(
+    importlib.util.find_spec("edge_tts") is None,
+    reason="edge-tts is not installed",
+)
+@pytest.mark.skipif(not SAMPLE_VIDEO.exists(), reason=f"sample video missing: {SAMPLE_VIDEO}")
+def test_live_edge_tts_alignment_render_and_qa(tmp_path: Path) -> None:
+    cfg = JobConfig(
+        job_id="live-tts-e2e",
+        language="vi",
+        target_minutes=1,
+        aspect_ratio="16:9",
+        source_video=SAMPLE_VIDEO,
+    )
+    create_job(tmp_path, cfg)
+
+    script = {
+        "job_id": cfg.job_id,
+        "language": "vi",
+        "approved": True,
+        "notes": "live Edge-TTS verification",
+        "sections": [{
+            "title": "Smoke",
+            "duration_seconds": 6.0,
+            "narration": "Xin chào. Đây là kiểm tra đường sản xuất thật của Movie Review Factory.",
+        }],
+    }
+    (tmp_path / "script.json").write_text(
+        json.dumps(script, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+    source_duration = _probe_duration_seconds(SAMPLE_VIDEO)
+    assert source_duration and source_duration > 0
+    source_end = min(float(source_duration), 3.0)
+    scene_plan = {
+        "job_id": cfg.job_id,
+        "language": "vi",
+        "generator": "verification",
+        "clips": [{
+            "section": "Smoke",
+            "section_index": 1,
+            "shot_index": 1,
+            "shot_count": 1,
+            "type": "narration",
+            "start_seconds": 0.0,
+            "duration_seconds": 6.0,
+            "source_clip": {"start_seconds": 0.0, "end_seconds": source_end},
+            "notes": "owned verification sample",
+        }],
+        "notes": "live TTS verification plan",
+    }
+    (tmp_path / "scene_plan.json").write_text(
+        json.dumps(scene_plan, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+    manifest = load_manifest(tmp_path)
+    for name in (
+        "ingest", "research", "transcript", "scenes", "outline", "script", "scene_plan"
+    ):
+        manifest.stage(name).status = "ready"
+    save_manifest(tmp_path, manifest)
+
+    after_tts = run_job(tmp_path, until="tts")
+    assert after_tts.stage("tts").status == "ready", after_tts.stage("tts").message
+    voice = json.loads((tmp_path / "voice.json").read_text(encoding="utf-8"))
+    assert voice["engine"] == "edge-tts"
+
+    narration_duration = _probe_duration_seconds(tmp_path / "narration.mp3")
+    assert narration_duration and narration_duration > 0
+    scene_plan["clips"][0]["duration_seconds"] = narration_duration
+    (tmp_path / "scene_plan.json").write_text(
+        json.dumps(scene_plan, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+    final_manifest = run_job(tmp_path, until="qa")
+    for name in ("alignment", "render", "qa"):
+        assert final_manifest.stage(name).status == "ready", final_manifest.stage(name).message
+
+    alignment = json.loads((tmp_path / "alignment.json").read_text(encoding="utf-8"))
+    assert alignment["cue_source"] == "voice.json"
+    assert alignment["cue_count"] == 1
+    final_mp4 = tmp_path / "final.mp4"
+    assert final_mp4.exists() and final_mp4.stat().st_size > 0
+    qa = json.loads((tmp_path / "qa.json").read_text(encoding="utf-8"))
+    assert qa["passed"] is True

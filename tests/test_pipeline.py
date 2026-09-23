@@ -109,8 +109,18 @@ def test_publish_ready_after_approvals(job_dir: Path) -> None:
     data["approved"] = True
     meta_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
+    # Publish handoff also requires a verified final render.
+    (job_dir / "final.mp4").write_bytes(b"verified-video")
+    (job_dir / "qa.json").write_text(
+        json.dumps({"passed": True}, indent=2),
+        encoding="utf-8",
+    )
+
     # Reset publish stage to pending so runner picks it up
     manifest = load_manifest(job_dir)
+    for name in ("qa", "thumbnail"):
+        stage = next(s for s in manifest.stages if s.stage == name)
+        stage.status = "ready"
     pub = next(s for s in manifest.stages if s.stage == "publish")
     pub.status = "pending"
     from movie_review_factory.pipeline import save_manifest
@@ -157,8 +167,10 @@ def test_transcript_writes_timed_segments_and_srt(tmp_path: Path, monkeypatch: p
     create_job(tmp_path, JobConfig(job_id="transcript-job", source_video=source))
 
     class FakeModel:
-        def __init__(self, model_name: str) -> None:
+        def __init__(self, model_name: str, *, device: str, compute_type: str) -> None:
             assert model_name == "small"
+            assert device == "cpu"
+            assert compute_type == "int8"
 
         def transcribe(self, source_path: str, **kwargs: object) -> tuple[list[object], object]:
             assert source_path == str(source)
@@ -435,6 +447,66 @@ def test_tts_synthesizes_narration_and_writes_voice_metadata(
     assert "narration.mp3" in message
 
 
+def test_tts_failure_cleans_partial_audio_and_keeps_metadata_absent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _approved_script_job(
+        tmp_path, [{"title": "Hook", "narration": "Xin chào các bạn."}]
+    )
+
+    class FailingCommunicate:
+        def __init__(self, text: str, voice: str) -> None:
+            self.text = text
+            self.voice = voice
+
+        def save_sync(self, output_path: str) -> None:
+            Path(output_path).write_bytes(b"partial")
+            raise RuntimeError("network interrupted")
+
+    monkeypatch.setitem(
+        sys.modules,
+        "edge_tts",
+        types.SimpleNamespace(Communicate=FailingCommunicate),
+    )
+    import movie_review_factory.pipeline as pipeline
+
+    with pytest.raises(RuntimeError, match="network interrupted"):
+        pipeline._tts(tmp_path, load_manifest(tmp_path))
+
+    assert not (tmp_path / "narration.mp3").exists()
+    assert not (tmp_path / "narration.synthesizing.mp3").exists()
+    assert not (tmp_path / "voice.json").exists()
+
+
+def test_tts_rejects_empty_synthesized_audio(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _approved_script_job(
+        tmp_path, [{"title": "Hook", "narration": "Xin chào các bạn."}]
+    )
+
+    class EmptyCommunicate:
+        def __init__(self, text: str, voice: str) -> None:
+            pass
+
+        def save_sync(self, output_path: str) -> None:
+            Path(output_path).write_bytes(b"")
+
+    monkeypatch.setitem(
+        sys.modules,
+        "edge_tts",
+        types.SimpleNamespace(Communicate=EmptyCommunicate),
+    )
+    import movie_review_factory.pipeline as pipeline
+
+    with pytest.raises(RuntimeError, match="without producing narration audio"):
+        pipeline._tts(tmp_path, load_manifest(tmp_path))
+
+    assert not (tmp_path / "narration.mp3").exists()
+    assert not (tmp_path / "narration.synthesizing.mp3").exists()
+    assert not (tmp_path / "voice.json").exists()
+
+
 def test_tts_selects_default_voice_for_unknown_language(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -530,12 +602,15 @@ def test_alignment_skips_when_narration_audio_missing(tmp_path: Path) -> None:
     assert not (tmp_path / "aligned.srt").exists()
 
 
-def test_alignment_skips_when_captions_missing(tmp_path: Path) -> None:
+def test_alignment_skips_when_captions_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     _alignment_job(tmp_path, with_captions=False)
-    from movie_review_factory.pipeline import _alignment
+    import movie_review_factory.pipeline as pipeline
 
+    monkeypatch.setattr(pipeline, "_probe_duration_seconds", lambda src: 5.0)
     with pytest.raises(SkipStage) as excinfo:
-        _alignment(tmp_path, load_manifest(tmp_path))
+        pipeline._alignment(tmp_path, load_manifest(tmp_path))
     assert "captions.srt" in str(excinfo.value)
     assert not (tmp_path / "alignment.json").exists()
 
@@ -645,7 +720,7 @@ def test_job_status_reports_counts_covering_every_stage(job_dir: Path) -> None:
     assert sum(counts.values()) == len(status["stages"])
     # No-video run: 5 text stages ready, the rest skipped.
     assert counts["ready"] == 5
-    assert counts["skipped"] == 8
+    assert counts["skipped"] == 9
 
 
 def test_cli_status_command_succeeds(job_dir: Path) -> None:
@@ -731,6 +806,37 @@ def test_alignment_writes_empty_output_when_all_cues_dropped(
     assert doc["cues"] == []
     assert (tmp_path / "aligned.srt").read_text(encoding="utf-8") == ""
     assert message == "aligned 0 cues within narration bounds (dropped 2)"
+
+
+def test_alignment_prefers_tts_narration_sections_over_source_captions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _alignment_job(tmp_path)
+    voice_path = tmp_path / "voice.json"
+    voice = json.loads(voice_path.read_text(encoding="utf-8"))
+    voice["sections"] = [
+        {"title": "Hook", "narration": "Đây là lời dẫn mở đầu."},
+        {"title": "Kết", "narration": "Đây là phần kết của review."},
+    ]
+    voice_path.write_text(json.dumps(voice), encoding="utf-8")
+
+    import movie_review_factory.pipeline as pipeline
+
+    monkeypatch.setattr(pipeline, "_probe_duration_seconds", lambda src: 10.0)
+    _, message = pipeline._alignment(tmp_path, load_manifest(tmp_path))
+
+    doc = json.loads((tmp_path / "alignment.json").read_text(encoding="utf-8"))
+    assert doc["cue_source"] == "voice.json"
+    assert doc["source_captions"] == "voice.json"
+    assert doc["dropped_cues"] == 0
+    assert [cue["text"] for cue in doc["cues"]] == [
+        "Đây là lời dẫn mở đầu.",
+        "Đây là phần kết của review.",
+    ]
+    assert doc["cues"][0]["start_seconds"] == 0.0
+    assert doc["cues"][-1]["end_seconds"] == 10.0
+    assert "Xin chào" not in (tmp_path / "aligned.srt").read_text(encoding="utf-8")
+    assert "from voice" in message
 
 
 def test_alignment_falls_back_to_approved_script_when_transcript_captions_are_empty(
@@ -953,6 +1059,50 @@ def test_render_loops_short_source_to_cover_clip_duration(
     doc = json.loads((tmp_path / "render.json").read_text(encoding="utf-8"))
     assert doc["clips"][0]["source_seconds"] == 2.0
     assert doc["clips"][0]["duration_seconds"] == 30.0
+
+
+def test_render_trims_long_source_to_exact_shot_duration(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _render_job(
+        tmp_path,
+        clips=[{
+            "section": "Hook",
+            "section_index": 1,
+            "shot_index": 1,
+            "shot_count": 2,
+            "type": "narration",
+            "duration_seconds": 1.0,
+            "source_clip": {"start_seconds": 0.0, "end_seconds": 3.0},
+        }],
+    )
+    import movie_review_factory.pipeline as pipeline
+
+    commands: list[list[str]] = []
+    monkeypatch.setattr(
+        pipeline,
+        "_probe_duration_seconds",
+        lambda path: _render_duration(path, tmp_path),
+    )
+    monkeypatch.setattr(pipeline.shutil, "which", lambda name: f"/{name}")
+
+    def fake_run(command: list[str], **kwargs: object) -> object:
+        commands.append(command)
+        (tmp_path / "final.rendering.mp4").write_bytes(b"fake-mp4")
+        return object()
+
+    monkeypatch.setattr(pipeline.subprocess, "run", fake_run)
+    pipeline._render(tmp_path, load_manifest(tmp_path))
+
+    filter_complex = commands[0][commands[0].index("-filter_complex") + 1]
+    assert "trim=start=0.000000:end=3.000000" in filter_complex
+    assert "trim=end=1.000000" in filter_complex
+    assert "loop=loop=" not in filter_complex
+    doc = json.loads((tmp_path / "render.json").read_text(encoding="utf-8"))
+    assert doc["clips"][0]["source_seconds"] == 3.0
+    assert doc["clips"][0]["duration_seconds"] == 1.0
+    assert doc["clips"][0]["shot_index"] == 1
+    assert doc["clips"][0]["shot_count"] == 2
 
 
 def test_render_omits_subtitles_filter_for_empty_aligned_srt(
@@ -1241,6 +1391,30 @@ def test_assign_source_clips_gap_between_scenes_snaps_to_nearest() -> None:
     )
 
 
+def test_assign_source_shots_spreads_long_section_across_distinct_scenes() -> None:
+    from movie_review_factory.pipeline import _assign_source_shots
+
+    scenes = [
+        {
+            "index": index + 1,
+            "start_seconds": float(index * 4),
+            "end_seconds": float((index + 1) * 4),
+            "segment_count": 1,
+            "text": str(index + 1),
+        }
+        for index in range(6)
+    ]
+    sections = _make_sections(24.0)
+    shots = _assign_source_shots(sections, _make_scenes_doc(scenes, 24.0))
+
+    assert len(shots) == 1
+    assert [shot[0] for shot in shots[0]] == [
+        {"start_seconds": 0.0, "end_seconds": 4.0},
+        {"start_seconds": 8.0, "end_seconds": 12.0},
+        {"start_seconds": 20.0, "end_seconds": 24.0},
+    ]
+
+
 def test_scene_plan_auto_populates_source_clip_when_scenes_present(
     tmp_path: Path,
 ) -> None:
@@ -1318,6 +1492,84 @@ def test_scene_plan_is_deterministic_with_scenes(tmp_path: Path) -> None:
     assert first == second
 
 
+def test_claude_scene_plan_uses_only_valid_indexed_scene_ranges(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import movie_review_factory.pipeline as pipeline_mod
+
+    create_job(tmp_path, JobConfig(job_id="scene-agent", content_agent="claude"))
+    (tmp_path / "script.json").write_text(json.dumps({
+        "sections": [
+            {"title": "Hook", "duration_seconds": 30, "narration": "A"},
+            {"title": "Analysis", "duration_seconds": 45, "narration": "B"},
+        ]
+    }), encoding="utf-8")
+    (tmp_path / "scenes.json").write_text(json.dumps({
+        "duration_seconds": 40.0,
+        "scenes": [
+            {"index": 1, "start_seconds": 0.0, "end_seconds": 10.0, "text": "one"},
+            {"index": 2, "start_seconds": 10.0, "end_seconds": 20.0, "text": "two"},
+            {"index": 3, "start_seconds": 20.0, "end_seconds": 30.0, "text": "three"},
+            {"index": 4, "start_seconds": 30.0, "end_seconds": 40.0, "text": "four"},
+        ],
+    }), encoding="utf-8")
+
+    def fake_agent(**kwargs: object) -> dict:
+        assert kwargs["stage"] == "scene_plan"
+        return {
+            "assignments": [
+                {"shots": [
+                    {"start_scene_index": 1, "end_scene_index": 1, "rationale": "setup-a"},
+                    {"start_scene_index": 2, "end_scene_index": 2, "rationale": "setup-b"},
+                ]},
+                {"shots": [
+                    {"start_scene_index": 3, "end_scene_index": 3, "rationale": "payoff-a"},
+                    {"start_scene_index": 4, "end_scene_index": 4, "rationale": "payoff-b"},
+                ]},
+            ],
+            "notes": "chosen from indexed scenes",
+        }
+
+    monkeypatch.setattr(pipeline_mod, "_run_reasoning_agent", fake_agent)
+    artifacts, message = pipeline_mod._scene_plan(tmp_path, load_manifest(tmp_path))
+
+    assert [artifact.name for artifact in artifacts] == ["scene_plan.json"]
+    assert message.startswith("scene_plan generated by Claude")
+    plan = json.loads((tmp_path / "scene_plan.json").read_text(encoding="utf-8"))
+    assert plan["generator"] == "claude"
+    assert len(plan["clips"]) == 4
+    assert [clip["source_clip"] for clip in plan["clips"]] == [
+        {"start_seconds": 0.0, "end_seconds": 10.0},
+        {"start_seconds": 10.0, "end_seconds": 20.0},
+        {"start_seconds": 20.0, "end_seconds": 30.0},
+        {"start_seconds": 30.0, "end_seconds": 40.0},
+    ]
+    assert [clip["duration_seconds"] for clip in plan["clips"]] == [15.0, 15.0, 22.5, 22.5]
+    assert [clip["shot_index"] for clip in plan["clips"]] == [1, 2, 1, 2]
+    assert [clip["notes"] for clip in plan["clips"]] == [
+        "setup-a", "setup-b", "payoff-a", "payoff-b"
+    ]
+
+
+def test_claude_scene_plan_rejects_unknown_scene_index(tmp_path: Path) -> None:
+    from movie_review_factory.pipeline import _agent_scene_assignments
+
+    sections = [{"title": "A"}]
+    scenes_doc = {
+        "duration_seconds": 10.0,
+        "scenes": [{"index": 1, "start_seconds": 0.0, "end_seconds": 10.0}],
+    }
+    with pytest.raises(ValueError, match="unknown scene index"):
+        _agent_scene_assignments(
+            sections,
+            scenes_doc,
+            [{"shots": [
+                {"start_scene_index": 1, "end_scene_index": 99, "rationale": "bad"}
+            ]}],
+        )
+
+
 def test_scene_plan_source_clips_bounded_to_video_duration(
     tmp_path: Path,
 ) -> None:
@@ -1353,3 +1605,334 @@ def test_scene_plan_source_clips_bounded_to_video_duration(
         assert sc["start_seconds"] >= 0.0
         assert sc["end_seconds"] <= VIDEO_DURATION
         assert sc["start_seconds"] < sc["end_seconds"]
+
+
+def test_thumbnail_stage_generates_three_candidates_and_primary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import movie_review_factory.pipeline as pipeline_mod
+
+    source = tmp_path / "owned.mp4"
+    source.write_bytes(b"video")
+    create_job(tmp_path, JobConfig(job_id="thumb", source_video=source))
+    (tmp_path / "scene_plan.json").write_text(
+        json.dumps({
+            "clips": [
+                {"source_clip": {"start_seconds": 0.0, "end_seconds": 20.0}},
+                {"source_clip": {"start_seconds": 20.0, "end_seconds": 40.0}},
+                {"source_clip": {"start_seconds": 40.0, "end_seconds": 60.0}},
+                {"source_clip": {"start_seconds": 60.0, "end_seconds": 80.0}},
+            ]
+        }),
+        encoding="utf-8",
+    )
+    (tmp_path / "youtube_metadata.json").write_text(
+        json.dumps({"title": "Recap test"}), encoding="utf-8"
+    )
+
+    monkeypatch.setattr(pipeline_mod.shutil, "which", lambda name: name)
+    monkeypatch.setattr(pipeline_mod, "_probe_duration_seconds", lambda _: 100.0)
+
+    calls: list[list[str]] = []
+
+    def fake_run(command: list[str], **_: object) -> object:
+        Path(command[-1]).write_bytes(b"jpeg")
+        calls.append(command)
+        return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(pipeline_mod.subprocess, "run", fake_run)
+
+    artifacts, message = pipeline_mod._thumbnail(tmp_path, load_manifest(tmp_path))
+
+    assert message == "generated 3 thumbnail candidates"
+    assert len(calls) == 3
+    assert [Path(call[-1]).name for call in calls] == [
+        "thumbnail-1.jpg", "thumbnail-2.jpg", "thumbnail-3.jpg"
+    ]
+    assert all("scale=1280:720" in call[call.index("-vf") + 1] for call in calls)
+    for name in (
+        "thumbnails.json", "thumbnail.jpg",
+        "thumbnail-1.jpg", "thumbnail-2.jpg", "thumbnail-3.jpg",
+    ):
+        assert (tmp_path / name).exists()
+
+    data = json.loads((tmp_path / "thumbnails.json").read_text(encoding="utf-8"))
+    assert data["candidate_count"] == 3
+    assert data["primary_candidate"] == "thumbnail-2.jpg"
+    assert data["primary_thumbnail"] == "thumbnail.jpg"
+    assert data["title_hint"] == "Recap test"
+    assert [item["source_seconds"] for item in data["candidates"]] == [30.0, 50.0, 70.0]
+    assert [artifact.name for artifact in artifacts] == [
+        "thumbnails.json", "thumbnail-1.jpg", "thumbnail-2.jpg",
+        "thumbnail-3.jpg", "thumbnail.jpg",
+    ]
+
+
+def test_select_thumbnail_replaces_primary_and_invalidates_publish(tmp_path: Path) -> None:
+    import movie_review_factory.pipeline as pipeline_mod
+
+    create_job(tmp_path, JobConfig(job_id="select-thumb"))
+    candidates = []
+    for index in range(1, 4):
+        name = f"thumbnail-{index}.jpg"
+        (tmp_path / name).write_bytes(f"candidate-{index}".encode())
+        candidates.append({
+            "index": index,
+            "file": name,
+            "source_seconds": float(index * 10),
+            "width": 1280,
+            "height": 720,
+        })
+    (tmp_path / "thumbnail.jpg").write_bytes(b"candidate-2")
+    (tmp_path / "thumbnails.json").write_text(
+        json.dumps({
+            "job_id": "select-thumb",
+            "candidates": candidates,
+            "primary_thumbnail": "thumbnail.jpg",
+            "primary_candidate": "thumbnail-2.jpg",
+        }),
+        encoding="utf-8",
+    )
+    (tmp_path / "publish_record.json").write_text("{}", encoding="utf-8")
+
+    manifest = load_manifest(tmp_path)
+    manifest.stage("thumbnail").mark("ready", "generated 3 thumbnail candidates")
+    manifest.stage("publish").mark("ready", "publish record written")
+    pipeline_mod.save_manifest(tmp_path, manifest)
+
+    result = pipeline_mod.select_thumbnail(tmp_path, "thumbnail-3.jpg")
+
+    assert result["primary_candidate"] == "thumbnail-3.jpg"
+    assert (tmp_path / "thumbnail.jpg").read_bytes() == b"candidate-3"
+    persisted = json.loads((tmp_path / "thumbnails.json").read_text(encoding="utf-8"))
+    assert persisted["primary_candidate"] == "thumbnail-3.jpg"
+    refreshed = load_manifest(tmp_path)
+    assert refreshed.stage("thumbnail").status == "ready"
+    assert refreshed.stage("publish").status == "pending"
+    assert not (tmp_path / "publish_record.json").exists()
+
+
+def test_select_thumbnail_rejects_unknown_candidate_without_mutation(tmp_path: Path) -> None:
+    import movie_review_factory.pipeline as pipeline_mod
+
+    create_job(tmp_path, JobConfig(job_id="select-invalid"))
+    (tmp_path / "thumbnail-1.jpg").write_bytes(b"one")
+    (tmp_path / "thumbnail.jpg").write_bytes(b"one")
+    thumbnails = {
+        "job_id": "select-invalid",
+        "candidates": [{"index": 1, "file": "thumbnail-1.jpg"}],
+        "primary_thumbnail": "thumbnail.jpg",
+        "primary_candidate": "thumbnail-1.jpg",
+    }
+    (tmp_path / "thumbnails.json").write_text(json.dumps(thumbnails), encoding="utf-8")
+    (tmp_path / "publish_record.json").write_text("{}", encoding="utf-8")
+    manifest = load_manifest(tmp_path)
+    manifest.stage("thumbnail").mark("ready")
+    manifest.stage("publish").mark("ready")
+    pipeline_mod.save_manifest(tmp_path, manifest)
+
+    with pytest.raises(ValueError, match="not part"):
+        pipeline_mod.select_thumbnail(tmp_path, "thumbnail-99.jpg")
+
+    assert (tmp_path / "thumbnail.jpg").read_bytes() == b"one"
+    assert json.loads((tmp_path / "thumbnails.json").read_text(encoding="utf-8")) == thumbnails
+    assert (tmp_path / "publish_record.json").exists()
+    assert load_manifest(tmp_path).stage("publish").status == "ready"
+
+
+def test_skipped_thumbnail_is_retried_on_next_run(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import movie_review_factory.pipeline as pipeline_mod
+
+    create_job(tmp_path, JobConfig(job_id="retry-thumb"))
+    first = run_job(tmp_path, until="thumbnail")
+    assert first.stage("thumbnail").status == "skipped"
+
+    def ready_thumbnail(root: Path, manifest: object) -> tuple[list, str]:
+        output = root / "thumbnail.jpg"
+        output.write_bytes(b"jpeg")
+        return [pipeline_mod.Artifact(name=output.name, path=output, status="ready")], "ready"
+
+    monkeypatch.setitem(pipeline_mod.STAGE_HANDLERS, "thumbnail", ready_thumbnail)
+    second = run_job(tmp_path, until="thumbnail")
+    assert second.stage("thumbnail").status == "ready"
+    assert (tmp_path / "thumbnail.jpg").exists()
+
+
+def test_load_manifest_upgrades_pre_thumbnail_jobs(tmp_path: Path) -> None:
+    create_job(tmp_path, JobConfig(job_id="legacy"))
+    raw = json.loads((tmp_path / "manifest.json").read_text(encoding="utf-8"))
+    raw["stages"] = [stage for stage in raw["stages"] if stage["stage"] != "thumbnail"]
+    (tmp_path / "manifest.json").write_text(json.dumps(raw), encoding="utf-8")
+
+    upgraded = load_manifest(tmp_path)
+    assert [stage.stage for stage in upgraded.stages] == list(__import__(
+        "movie_review_factory.pipeline", fromlist=["STAGES"]
+    ).STAGES)
+    assert upgraded.stage("thumbnail").status == "pending"
+    assert validate_job(tmp_path) == []
+
+def test_claude_content_agent_drives_research_outline_and_script(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import movie_review_factory.pipeline as pipeline_mod
+
+    calls: list[str] = []
+
+    def fake_agent(**kwargs: object) -> dict:
+        stage = str(kwargs["stage"])
+        calls.append(stage)
+        if stage == "research":
+            return {
+                "brief": "Bản nghiên cứu có nguồn.",
+                "facts": ["Nhân vật chính đối mặt một lựa chọn quan trọng."],
+                "sources": [
+                    {
+                        "title": "Reference",
+                        "url": "https://example.test/movie",
+                        "note": "metadata reference",
+                    }
+                ],
+                "uncertainties": [],
+            }
+        if stage == "outline":
+            return {
+                "sections": [
+                    {"title": "Hook", "budget_minutes": 1, "purpose": "Mở vấn đề"},
+                    {"title": "Diễn biến", "budget_minutes": 2, "purpose": "Tóm tắt"},
+                    {"title": "Phân tích", "budget_minutes": 1, "purpose": "Bình luận"},
+                ],
+                "notes": "agent outline",
+            }
+        if stage == "script":
+            return {
+                "sections": [
+                    {"title": "Hook", "narration": "Mở đầu có nội dung thật."},
+                    {"title": "Diễn biến", "narration": "Phần diễn biến có nội dung thật."},
+                    {"title": "Phân tích", "narration": "Phần phân tích có nội dung thật."},
+                ],
+                "notes": "agent script",
+            }
+        raise AssertionError(stage)
+
+    monkeypatch.setattr(pipeline_mod, "run_claude_json", fake_agent)
+
+    create_job(
+        tmp_path,
+        JobConfig(
+            job_id="claude-job",
+            language="vi",
+            target_minutes=5,
+            movie_title="Example Movie",
+            content_agent="claude",
+        ),
+    )
+    manifest = run_job(tmp_path, until="script")
+
+    assert calls == ["research", "outline", "script"]
+    assert manifest.stage("research").status == "ready"
+    assert manifest.stage("outline").status == "ready"
+    assert manifest.stage("script").status == "ready"
+
+    research = json.loads((tmp_path / "research.json").read_text(encoding="utf-8"))
+    assert research["movie_title"] == "Example Movie"
+    assert research["generator"] == "claude"
+    assert research["status"] == "ready"
+
+    outline = json.loads((tmp_path / "outline.json").read_text(encoding="utf-8"))
+    assert outline["generator"] == "claude"
+    assert sum(section["budget_minutes"] for section in outline["sections"]) == 5.0
+
+    script = json.loads((tmp_path / "script.json").read_text(encoding="utf-8"))
+    assert script["generator"] == "claude"
+    assert script["approved"] is False
+    assert [section["title"] for section in script["sections"]] == [
+        section["title"] for section in outline["sections"]
+    ]
+    assert all(section["narration"].strip() for section in script["sections"])
+    assert "**approved: false**" in (tmp_path / "script.md").read_text(encoding="utf-8")
+
+
+def test_scaffold_mode_never_calls_claude(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import movie_review_factory.pipeline as pipeline_mod
+
+    def forbidden(**_: object) -> dict:
+        raise AssertionError("Claude must not run for scaffold jobs")
+
+    monkeypatch.setattr(pipeline_mod, "run_claude_json", forbidden)
+    create_job(tmp_path, JobConfig(job_id="offline", content_agent="scaffold"))
+    run_job(tmp_path, until="script")
+
+    assert json.loads((tmp_path / "research.json").read_text(encoding="utf-8"))[
+        "generator"
+    ] == "scaffold"
+    assert json.loads((tmp_path / "outline.json").read_text(encoding="utf-8"))[
+        "generator"
+    ] == "scaffold"
+    assert json.loads((tmp_path / "script.json").read_text(encoding="utf-8"))[
+        "generator"
+    ] == "scaffold"
+
+
+def test_claude_failure_does_not_fall_back_to_scaffold(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import movie_review_factory.pipeline as pipeline_mod
+    from movie_review_factory.content_agent import ContentAgentError
+
+    def failing_agent(**_: object) -> dict:
+        raise ContentAgentError("backend unavailable")
+
+    monkeypatch.setattr(pipeline_mod, "run_claude_json", failing_agent)
+    create_job(
+        tmp_path,
+        JobConfig(job_id="agent-fail", content_agent="claude"),
+    )
+    manifest = run_job(tmp_path, until="research")
+
+    assert manifest.stage("research").status == "failed"
+    assert "backend unavailable" in manifest.stage("research").message
+    assert not (tmp_path / "research.json").exists()
+
+
+def test_claude_script_section_mismatch_marks_stage_failed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import movie_review_factory.pipeline as pipeline_mod
+
+    def fake_agent(**kwargs: object) -> dict:
+        stage = str(kwargs["stage"])
+        if stage == "research":
+            return {"brief": "x", "facts": [], "sources": [], "uncertainties": []}
+        if stage == "outline":
+            return {
+                "sections": [
+                    {"title": "A", "budget_minutes": 1, "purpose": "a"},
+                    {"title": "B", "budget_minutes": 1, "purpose": "b"},
+                    {"title": "C", "budget_minutes": 1, "purpose": "c"},
+                ],
+                "notes": "",
+            }
+        return {
+            "sections": [{"title": "A", "narration": "only one"}],
+            "notes": "",
+        }
+
+    monkeypatch.setattr(pipeline_mod, "run_claude_json", fake_agent)
+    create_job(
+        tmp_path,
+        JobConfig(job_id="bad-claude", target_minutes=3, content_agent="claude"),
+    )
+    manifest = run_job(tmp_path, until="script")
+
+    assert manifest.stage("script").status == "failed"
+    assert "section count" in manifest.stage("script").message

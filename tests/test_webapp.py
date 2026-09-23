@@ -26,16 +26,56 @@ runner = CliRunner()
 
 
 def _job_with_metadata(jobs_root: Path, job_id: str = "demo") -> Path:
-    """Create a media-less job and run it up to the metadata draft.
-
-    With no source video the media stages honestly skip, but research/outline/
-    script/scene_plan/metadata still run, so youtube_metadata.json exists with
-    approved=false - exactly the state the UI reviews.
-    """
+    """Create a media-less job and run it up to the metadata draft."""
     root = jobs_root / job_id
     pipeline.create_job(root, JobConfig(job_id=job_id))
     pipeline.run_job(root, until="metadata")
     return root
+
+
+def _job_with_thumbnails(jobs_root: Path, job_id: str = "thumbs") -> Path:
+    root = jobs_root / job_id
+    pipeline.create_job(root, JobConfig(job_id=job_id))
+    candidates = []
+    for index in range(1, 4):
+        name = f"thumbnail-{index}.jpg"
+        (root / name).write_bytes(f"candidate-{index}".encode())
+        candidates.append({
+            "index": index,
+            "file": name,
+            "source_seconds": float(index * 10),
+            "width": 1280,
+            "height": 720,
+        })
+    (root / "thumbnail.jpg").write_bytes(b"candidate-2")
+    (root / "thumbnails.json").write_text(
+        json.dumps({
+            "job_id": job_id,
+            "candidate_count": 3,
+            "candidates": candidates,
+            "primary_thumbnail": "thumbnail.jpg",
+            "primary_candidate": "thumbnail-2.jpg",
+        }),
+        encoding="utf-8",
+    )
+    manifest = pipeline.load_manifest(root)
+    manifest.stage("thumbnail").mark("ready", "generated 3 thumbnail candidates")
+    pipeline.save_manifest(root, manifest)
+    return root
+
+
+def _mark_verified_render(root: Path, *, thumbnail_ready: bool = True) -> None:
+    """Provide the publish gate with a verified final render without running media."""
+    (root / "final.mp4").write_bytes(b"verified-video")
+    (root / "qa.json").write_text(
+        json.dumps({"passed": True}, indent=2),
+        encoding="utf-8",
+    )
+    manifest = pipeline.load_manifest(root)
+    manifest.stage("qa").mark("ready", "qa passed")
+    if thumbnail_ready:
+        manifest.stage("thumbnail").mark("ready", "thumbnail ready")
+    pipeline.save_manifest(root, manifest)
 
 
 # --- JobsService ------------------------------------------------------------
@@ -49,6 +89,18 @@ def test_create_job_status_is_localized(tmp_path: Path) -> None:
     assert by_stage["publish"]["stage_label"] == "Xuất bản"
     assert by_stage["ingest"]["status_label"] == "Chờ xử lý"
     assert status["approvals"]["metadata_present"] is False
+
+
+def test_create_job_persists_movie_title_and_content_agent(tmp_path: Path) -> None:
+    svc = JobsService(tmp_path)
+    svc.create_job({
+        "job_id": "agent-job",
+        "movie_title": "Example Movie",
+        "content_agent": "claude",
+    })
+    manifest = pipeline.load_manifest(tmp_path / "agent-job")
+    assert manifest.config.movie_title == "Example Movie"
+    assert manifest.config.content_agent == "claude"
 
 
 def test_list_jobs(tmp_path: Path) -> None:
@@ -104,7 +156,7 @@ def test_status_remains_readable_while_run_persists_manifest(tmp_path: Path) -> 
     assert status["approvals"]["metadata_present"] is True
 
 
-def test_start_run_reaches_metadata_and_stops(tmp_path: Path) -> None:
+def test_start_run_reaches_thumbnail_and_stops(tmp_path: Path) -> None:
     svc = JobsService(tmp_path)
     svc.create_job({"job_id": "demo"})
     svc.start_run("demo")
@@ -115,6 +167,8 @@ def test_start_run_reaches_metadata_and_stops(tmp_path: Path) -> None:
     status = svc.status("demo")
     assert status["running"] is False
     assert status["approvals"]["metadata_present"] is True
+    thumbnail = next(s for s in status["stages"] if s["stage"] == "thumbnail")
+    assert thumbnail["status"] == "skipped"
     # The UI run must never advance the publish stage on its own.
     publish = next(s for s in status["stages"] if s["stage"] == "publish")
     assert publish["status"] == "pending"
@@ -149,6 +203,7 @@ def test_publish_blocked_until_approved_then_succeeds(tmp_path: Path) -> None:
     (root / "script.json").write_text(json.dumps(script), encoding="utf-8")
     approved = svc.approve_metadata("demo")
     assert approved["metadata"]["approved"] is True
+    _mark_verified_render(root)
 
     ok = svc.prepare_publish("demo", confirm=True)
     assert ok["published"] is True
@@ -166,6 +221,33 @@ def test_update_metadata_clears_approval(tmp_path: Path) -> None:
     assert svc.get_metadata("demo")["metadata"]["title"] == "Tiêu đề mới"
 
 
+def test_metadata_edit_invalidates_ready_publish(tmp_path: Path) -> None:
+    svc = JobsService(tmp_path)
+    root = _job_with_metadata(tmp_path, "demo")
+    svc.approve_script("demo")
+    svc.approve_metadata("demo")
+    manifest = pipeline.load_manifest(root)
+    thumb = root / "thumbnail.jpg"
+    thumb.write_bytes(b"jpeg")
+    manifest.stage("thumbnail").mark(
+        "ready", "generated 1 thumbnail candidates",
+        [pipeline.Artifact(name=thumb.name, path=thumb, status="ready")],
+    )
+    pipeline.save_manifest(root, manifest)
+    _mark_verified_render(root, thumbnail_ready=False)
+    assert svc.prepare_publish("demo", confirm=True)["published"] is True
+    assert (root / "publish_record.json").exists()
+
+    svc.update_metadata("demo", {"title": "Tiêu đề sau publish"})
+
+    manifest = pipeline.load_manifest(root)
+    assert manifest.stage("metadata").status == "ready"
+    assert manifest.stage("thumbnail").status == "pending"
+    assert manifest.stage("publish").status == "pending"
+    assert not thumb.exists()
+    assert not (root / "publish_record.json").exists()
+
+
 def test_script_get_update_approve(tmp_path: Path) -> None:
     svc = JobsService(tmp_path)
     root = _job_with_metadata(tmp_path, "demo")
@@ -181,9 +263,56 @@ def test_script_get_update_approve(tmp_path: Path) -> None:
     assert approved["approved"] is True
     persisted = json.loads((root / "script.json").read_text(encoding="utf-8"))
     assert persisted["approved"] is True
+    assert "**approved: true**" in (root / "script.md").read_text(encoding="utf-8")
 
     svc.update_script("demo", {"notes": "changed"})
     assert svc.status("demo")["approvals"]["script_approved"] is False
+
+
+def test_script_edit_invalidates_all_derived_stages_and_artifacts(tmp_path: Path) -> None:
+    svc = JobsService(tmp_path)
+    root = _job_with_metadata(tmp_path, "demo")
+    (root / "final.mp4").write_bytes(b"stale")
+    (root / "publish_record.json").write_text("{}", encoding="utf-8")
+
+    svc.update_script("demo", {"notes": "new script revision"})
+
+    manifest = pipeline.load_manifest(root)
+    assert manifest.stage("script").status == "ready"
+    script_index = pipeline.STAGES.index("script")
+    assert all(stage.status == "pending" for stage in manifest.stages[script_index + 1:])
+    for name in (
+        "scene_plan.json", "voice.json", "narration.mp3", "alignment.json",
+        "aligned.srt", "render.json", "final.mp4", "qa.json",
+        "youtube_metadata.json", "publish_record.json",
+    ):
+        assert not (root / name).exists()
+    assert "new script revision" not in (root / "script.md").read_text(encoding="utf-8")
+    assert "**approved: false**" in (root / "script.md").read_text(encoding="utf-8")
+
+
+def test_thumbnail_artifacts_are_served_as_images() -> None:
+    assert webapp_mod._content_type("thumbnail.jpg") == "image/jpeg"
+    assert webapp_mod._artifact_kind("thumbnail.jpg") == "image"
+
+
+def test_thumbnail_service_selects_primary_and_invalidates_publish(tmp_path: Path) -> None:
+    svc = JobsService(tmp_path)
+    root = _job_with_thumbnails(tmp_path, "thumbs")
+    (root / "publish_record.json").write_text("{}", encoding="utf-8")
+    manifest = pipeline.load_manifest(root)
+    manifest.stage("publish").mark("ready", "publish record written")
+    pipeline.save_manifest(root, manifest)
+
+    current = svc.get_thumbnails("thumbs")
+    assert current["present"] is True
+    assert current["thumbnails"]["primary_candidate"] == "thumbnail-2.jpg"
+
+    result = svc.select_thumbnail("thumbs", "thumbnail-1.jpg")
+    assert result["selected"] == "thumbnail-1.jpg"
+    assert (root / "thumbnail.jpg").read_bytes() == b"candidate-1"
+    assert pipeline.load_manifest(root).stage("publish").status == "pending"
+    assert not (root / "publish_record.json").exists()
 
 
 # --- HTTP layer -------------------------------------------------------------
@@ -221,6 +350,7 @@ def test_http_index_and_job_lifecycle(tmp_path: Path) -> None:
         with urllib.request.urlopen(base + "/", timeout=5) as response:
             html = response.read().decode("utf-8")
         assert "Xưởng Review Phim" in html
+        assert "Chọn ảnh bìa" in html
 
         status_code, created = _post_json(base + "/api/jobs", {"job_id": "demo"})
         assert status_code == 201
@@ -264,6 +394,33 @@ def test_http_artifact_supports_range(tmp_path: Path) -> None:
         server.server_close()
 
 
+def test_http_thumbnail_get_and_select_routes(tmp_path: Path) -> None:
+    root = _job_with_thumbnails(tmp_path, "thumbs")
+    server, base = _serve(tmp_path)
+    try:
+        status, current = _get_json(base + "/api/jobs/thumbs/thumbnails")
+        assert status == 200
+        assert current["thumbnails"]["primary_candidate"] == "thumbnail-2.jpg"
+
+        status, selected = _post_json(
+            base + "/api/jobs/thumbs/thumbnails/select",
+            {"candidate": "thumbnail-3.jpg"},
+        )
+        assert status == 200
+        assert selected["selected"] == "thumbnail-3.jpg"
+        assert (root / "thumbnail.jpg").read_bytes() == b"candidate-3"
+
+        with pytest.raises(urllib.error.HTTPError) as excinfo:
+            _post_json(
+                base + "/api/jobs/thumbs/thumbnails/select",
+                {"candidate": "thumbnail-99.jpg"},
+            )
+        assert excinfo.value.code == 400
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
 def test_http_script_routes(tmp_path: Path) -> None:
     _job_with_metadata(tmp_path, "demo")
     server, base = _serve(tmp_path)
@@ -284,6 +441,33 @@ def test_http_script_routes(tmp_path: Path) -> None:
 
 
 # --- new CLI commands -------------------------------------------------------
+
+
+def test_cli_init_job_accepts_content_agent_options(tmp_path: Path) -> None:
+    root = tmp_path / "agent-cli"
+    result = runner.invoke(app, [
+        "init-job", str(root),
+        "--movie-title", "Example Movie",
+        "--content-agent", "claude",
+    ])
+    assert result.exit_code == 0
+    manifest = pipeline.load_manifest(root)
+    assert manifest.config.movie_title == "Example Movie"
+    assert manifest.config.content_agent == "claude"
+
+
+def test_cli_approve_script_requires_confirm_and_syncs_markdown(tmp_path: Path) -> None:
+    root = _job_with_metadata(tmp_path, "demo")
+    script_path = root / "script.json"
+
+    result = runner.invoke(app, ["approve-script", str(root)])
+    assert result.exit_code == 2
+    assert json.loads(script_path.read_text(encoding="utf-8"))["approved"] is False
+
+    result = runner.invoke(app, ["approve-script", str(root), "--confirm"])
+    assert result.exit_code == 0
+    assert json.loads(script_path.read_text(encoding="utf-8"))["approved"] is True
+    assert "**approved: true**" in (root / "script.md").read_text(encoding="utf-8")
 
 
 def test_cli_approve_metadata_requires_confirm(tmp_path: Path) -> None:

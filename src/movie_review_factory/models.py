@@ -15,6 +15,8 @@ class JobConfig(BaseModel):
     target_minutes: float = Field(default=10, ge=1, le=60)
     aspect_ratio: Literal["16:9", "9:16"] = "16:9"
     source_video: Path | None = None
+    movie_title: str | None = None
+    content_agent: Literal["scaffold", "claude"] = "scaffold"
 
 
 class Artifact(BaseModel):

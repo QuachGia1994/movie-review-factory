@@ -6,6 +6,7 @@ import typer
 from .models import JobConfig
 from .pipeline import (
     approve_metadata,
+    approve_script,
     create_job,
     job_status,
     manifest_path,
@@ -23,6 +24,11 @@ def init_job(
     target_minutes: float = 10,
     aspect_ratio: str = "16:9",
     source_video: Optional[Path] = None,
+    movie_title: Optional[str] = None,
+    content_agent: str = typer.Option(
+        "scaffold",
+        help="Content generator for research/outline/script: scaffold or claude.",
+    ),
 ):
     config = JobConfig(
         job_id=path.name,
@@ -30,6 +36,8 @@ def init_job(
         target_minutes=target_minutes,
         aspect_ratio=aspect_ratio,
         source_video=source_video,
+        movie_title=movie_title,
+        content_agent=content_agent,
     )
     typer.echo(f"created {create_job(path, config)}")
 
@@ -91,6 +99,21 @@ def serve(
     from .webapp import run_server
 
     run_server(host=host, port=port, jobs_root=jobs_root)
+
+
+@app.command("approve-script")
+def approve_script_cmd(
+    path: Path,
+    confirm: bool = typer.Option(
+        False, "--confirm", help="Required: script approval is a deliberate act."
+    ),
+):
+    """Explicitly approve the current script so TTS may consume it."""
+    if not confirm:
+        typer.echo("Refusing to approve script without --confirm (approval is deliberate).")
+        raise typer.Exit(2)
+    script = approve_script(path)
+    typer.echo(f"approved script for {script.get('job_id', path.name)}")
 
 
 @app.command("approve-metadata")

@@ -1,6 +1,6 @@
 [project]
 name = "movie-review-factory"
-version = "0.1.0"
+version = "0.2.0"
 description = "Deterministic AI movie review/recap production pipeline"
 requires-python = ">=3.11"
 dependencies = ["typer>=0.16,<1", "pydantic>=2.11,<3"]
