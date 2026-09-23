@@ -2,6 +2,11 @@
 
 All notable changes to Movie Review Factory are documented here.
 
+## [Unreleased]
+
+### Added
+- Opt-in live faster-whisper validation now proves CPU/int8 transcription, app-owned model caching, deterministic scene generation, and offline cache reuse on owned Vietnamese speech.
+
 ## [0.2.0] - 2026-09-23
 
 ### Added

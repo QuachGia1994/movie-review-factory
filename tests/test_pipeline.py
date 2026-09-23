@@ -200,6 +200,22 @@ def test_transcript_writes_timed_segments_and_srt(tmp_path: Path, monkeypatch: p
     )
 
 
+def test_whisper_model_options_use_app_cache_and_offline_flags(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import movie_review_factory.pipeline as pipeline
+
+    cache = tmp_path / "whisper-cache"
+    monkeypatch.setenv("MRF_WHISPER_CACHE", str(cache))
+    monkeypatch.setenv("MRF_WHISPER_OFFLINE", "1")
+
+    assert pipeline._whisper_model_options() == {
+        "download_root": str(cache),
+        "local_files_only": True,
+    }
+
+
 # --- scenes stage -----------------------------------------------------------
 
 

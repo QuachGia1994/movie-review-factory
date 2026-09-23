@@ -214,3 +214,99 @@ def test_live_edge_tts_alignment_render_and_qa(tmp_path: Path) -> None:
     assert final_mp4.exists() and final_mp4.stat().st_size > 0
     qa = json.loads((tmp_path / "qa.json").read_text(encoding="utf-8"))
     assert qa["passed"] is True
+
+
+@pytest.mark.skipif(
+    os.environ.get("MRF_RUN_LIVE_WHISPER_TESTS") != "1",
+    reason="live faster-whisper network test is opt-in",
+)
+@pytest.mark.skipif(
+    importlib.util.find_spec("faster_whisper") is None,
+    reason="faster-whisper is not installed",
+)
+@pytest.mark.skipif(
+    importlib.util.find_spec("edge_tts") is None,
+    reason="edge-tts is not installed",
+)
+def test_live_whisper_download_cache_offline_and_scenes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import edge_tts
+
+    source = tmp_path / "owned-vietnamese.mp3"
+    edge_tts.Communicate(
+        (
+            "Xin chào. Đây là đoạn âm thanh tiếng Việt do hệ thống tự tạo để "
+            "kiểm tra nhận dạng giọng nói và bộ nhớ đệm mô hình."
+        ),
+        "vi-VN-HoaiMyNeural",
+    ).save_sync(str(source))
+    assert source.exists() and source.stat().st_size > 0
+
+    cache = tmp_path / "whisper-cache"
+    monkeypatch.setenv("MRF_WHISPER_CACHE", str(cache))
+    monkeypatch.delenv("MRF_WHISPER_OFFLINE", raising=False)
+    monkeypatch.delenv("HF_HUB_OFFLINE", raising=False)
+
+    online = tmp_path / "online"
+    create_job(
+        online,
+        JobConfig(
+            job_id="live-whisper-online",
+            language="vi",
+            target_minutes=1,
+            source_video=source,
+        ),
+    )
+    first = run_job(online, until="scenes")
+    for name in ("ingest", "transcript", "scenes"):
+        assert first.stage(name).status == "ready", first.stage(name).message
+
+    duration = _probe_duration_seconds(source)
+    assert duration and duration > 0
+
+    transcript = json.loads((online / "transcript.json").read_text(encoding="utf-8"))
+    segments = transcript["segments"]
+    assert segments
+    assert sum(len(segment["text"].strip()) for segment in segments) >= 10
+    for segment in segments:
+        start = float(segment["start_seconds"])
+        end = float(segment["end_seconds"])
+        assert 0 <= start < end <= float(duration) + 0.25
+        assert segment["text"].strip()
+
+    scenes_doc = json.loads((online / "scenes.json").read_text(encoding="utf-8"))
+    scenes = scenes_doc["scenes"]
+    assert scenes
+    for scene in scenes:
+        assert 0 <= float(scene["start_seconds"]) < float(scene["end_seconds"])
+        assert float(scene["end_seconds"]) <= float(duration) + 0.25
+
+    assert cache.exists()
+    assert any(path.is_file() for path in cache.rglob("*"))
+
+    monkeypatch.setenv("MRF_WHISPER_OFFLINE", "1")
+    monkeypatch.setenv("HF_HUB_OFFLINE", "1")
+
+    offline = tmp_path / "offline"
+    create_job(
+        offline,
+        JobConfig(
+            job_id="live-whisper-offline",
+            language="vi",
+            target_minutes=1,
+            source_video=source,
+        ),
+    )
+    second = run_job(offline, until="scenes")
+    for name in ("ingest", "transcript", "scenes"):
+        assert second.stage(name).status == "ready", second.stage(name).message
+
+    offline_transcript = json.loads(
+        (offline / "transcript.json").read_text(encoding="utf-8")
+    )
+    assert offline_transcript["segments"]
+    assert [segment["text"] for segment in offline_transcript["segments"]] == [
+        segment["text"] for segment in segments
+    ]

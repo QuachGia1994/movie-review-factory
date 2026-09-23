@@ -15,3 +15,11 @@ Goal: verify the final network-dependent media boundary: model download, CPU int
 - Default CI must not download a Whisper model.
 - Use synthetic/owned audio/video only.
 - No commit/push unless explicitly requested.
+
+## Result
+- Managed CPython 3.12.14 with faster-whisper 1.2.1 downloaded `Systran/faster-whisper-small` into `%LOCALAPPDATA%\\MovieReviewFactory\\models\\whisper`.
+- Live owned Vietnamese speech generated through Edge-TTS transcribed successfully with `device=cpu` and `compute_type=int8`.
+- Evidence: 7 cache files, 2 transcript segments, 1 deterministic scene; every transcript timestamp stayed within the probed 7.632-second source duration.
+- The same model cache reopened with `MRF_WHISPER_OFFLINE=1` + `HF_HUB_OFFLINE=1`; offline transcript text matched the online run.
+- Added an opt-in pytest (`MRF_RUN_LIVE_WHISPER_TESTS=1`) that exercises live speech generation, model/cache use, offline reuse, and `transcript → scenes` integrity. Direct live pytest passed 1/1.
+- Default suite remains network-free: 142 passed, 5 opt-in tests skipped, one existing pytest-asyncio deprecation warning.
