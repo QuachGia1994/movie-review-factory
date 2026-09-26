@@ -10,11 +10,21 @@ const outputPath = path.join(repoRoot, "movie-review-factory.js");
 
 const runtimeFiles = [
   "__init__.py",
+  "agy_agent.py",
+  "agy_vision.py",
   "cli.py",
   "content_agent.py",
+  "cancellation.py",
+  "editor_ops.py",
   "localization.py",
+  "media_store.py",
+  "media_intelligence.py",
   "models.py",
   "pipeline.py",
+  "pool_scheduler.py",
+  "scene_scoring.py",
+  "scene_validation.py",
+  "semantic_search.py",
   "webapp.py",
 ];
 
@@ -22,6 +32,14 @@ const bundle = {};
 for (const name of runtimeFiles) {
   const bytes = fs.readFileSync(path.join(packageRoot, name));
   bundle["movie_review_factory/" + name] = bytes.toString("base64");
+}
+const migrationRoot = path.join(packageRoot, "migrations");
+const migrationFiles = fs.readdirSync(migrationRoot)
+  .filter(name => name === "__init__.py" || name.endsWith(".sql"))
+  .sort();
+for (const name of migrationFiles) {
+  const bytes = fs.readFileSync(path.join(migrationRoot, name));
+  bundle["movie_review_factory/migrations/" + name] = bytes.toString("base64");
 }
 bundle["pyproject.toml"] = fs.readFileSync(path.join(repoRoot, "pyproject.toml")).toString("base64");
 

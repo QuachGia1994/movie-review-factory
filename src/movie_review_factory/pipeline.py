@@ -1,3 +1,4 @@
+import copy
 import json
 import math
 import os
@@ -6,16 +7,15 @@ import shutil
 import subprocess
 import time
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Iterator
 
+from . import agy_vision, cancellation, scene_scoring, semantic_search
+from .agy_agent import run_agy_json
 from .content_agent import run_claude_json
-from .models import Artifact, JobConfig, JobManifest, StageResult
+from .media_store import MediaStore
+from .models import Artifact, JobConfig, JobManifest, MediaAsset, Shot, StageResult, TranscriptSegment, VisualObservation
 
 STAGES = ("ingest","research","transcript","scenes","outline","script","scene_plan","tts","alignment","render","qa","metadata","thumbnail","publish")
-
-# Stages that still need source video / media or external models and have no
-# real handler yet. These are honestly marked "skipped" (never faked).
-MEDIA_STAGES = frozenset({"transcript", "scenes", "alignment"})
 
 MANIFEST_NAME = "manifest.json"
 MANIFEST_RETRY_ATTEMPTS = 10
@@ -27,14 +27,14 @@ _KNOWN_ARTIFACTS = (
     "render.json", "final.mp4", "qa.json",
     "youtube_metadata.json", "thumbnails.json", "thumbnail.jpg",
     "thumbnail-1.jpg", "thumbnail-2.jpg", "thumbnail-3.jpg",
-    "publish_record.json",
+    "media_index.sqlite3", "publish_record.json",
 )
 
 _STAGE_ARTIFACTS = {
     "ingest": ("ingest.json",),
     "research": ("research.json",),
     "transcript": ("transcript.json", "captions.srt"),
-    "scenes": ("scenes.json",),
+    "scenes": ("scenes.json", "media_index.sqlite3"),
     "outline": ("outline.json",),
     "script": ("script.json", "script.md"),
     "scene_plan": ("scene_plan.json",),
@@ -53,7 +53,7 @@ _STAGE_ARTIFACTS = {
 RENDER_CANVASES = {"16:9": (1920, 1080), "9:16": (1080, 1920)}
 RENDER_FRAME_RATE = 25
 RENDER_DURATION_DRIFT_SECONDS = 0.25
-THUMBNAIL_SIZE = (1280, 720)
+THUMBNAIL_SIZES = {"16:9": (1280, 720), "9:16": (720, 1280)}
 THUMBNAIL_COUNT = 3
 SCENE_PLAN_MAX_SHOTS_PER_SECTION = 6
 SCENE_PLAN_TARGET_SHOT_SECONDS = 8.0
@@ -78,6 +78,7 @@ def load_manifest(root: Path) -> JobManifest:
                     existing.get(name, StageResult(stage=name, status="pending"))
                     for name in STAGES
                 ]
+                save_manifest(root, manifest)
             return manifest
         except PermissionError:
             if attempt == MANIFEST_RETRY_ATTEMPTS - 1:
@@ -100,10 +101,18 @@ def save_manifest(root: Path, manifest: JobManifest) -> Path:
             time.sleep(0.01)
 
 
+def _clear_media_cache(root: Path) -> None:
+    for pattern in ("shot-*.jpg", "highlight-h-*.mp4"):
+        for path in root.glob(pattern):
+            path.unlink(missing_ok=True)
+    (root / "transcript.vtt").unlink(missing_ok=True)
+
+
 def create_job(root: Path, config: JobConfig) -> Path:
     root.mkdir(parents=True, exist_ok=True)
     for name in _KNOWN_ARTIFACTS:
         (root / name).unlink(missing_ok=True)
+    _clear_media_cache(root)
     manifest = JobManifest(config=config, stages=[StageResult(stage=s, status="pending") for s in STAGES])
     return save_manifest(root, manifest)
 
@@ -181,6 +190,8 @@ def invalidate_downstream(root: Path, changed_stage: str) -> JobManifest:
 
     manifest = load_manifest(root)
     changed_index = STAGES.index(changed_stage)
+    if changed_index < STAGES.index("scenes"):
+        _clear_media_cache(root)
     for stage in manifest.stages:
         if STAGES.index(stage.stage) <= changed_index:
             continue
@@ -266,6 +277,9 @@ def _transcript(root: Path, manifest: JobManifest) -> tuple[list[Artifact], str]
     src = Path(cfg.source_video)
     if not src.exists():
         raise SkipStage(f"source_video not found: {src}")
+    # Ingest already recorded the fact: a container with zero audio streams makes faster-whisper/PyAV die with a bare "tuple index out of range".
+    if _read_json(root, "ingest.json").get("has_audio") is False:
+        raise SkipStage("source video has no audio track - nothing to transcribe")
     try:
         from faster_whisper import WhisperModel
     except ImportError as exc:
@@ -341,9 +355,8 @@ def _build_scenes(segments: list[dict], duration: float) -> list[dict]:
     """Group timed transcript segments into deterministic, bounded scenes.
 
     All timestamps are clamped to [0, duration]; segments with no positive
-    length after clamping are dropped. When there are no usable segments a
-    single scene spanning the whole video is returned so the index is never
-    empty for an owned video.
+    length after clamping are dropped. Silent spans are kept as bounded
+    selectable ranges, including when the source has no speech.
     """
     bounded: list[dict] = []
     for seg in segments:
@@ -353,9 +366,6 @@ def _build_scenes(segments: list[dict], duration: float) -> list[dict]:
             continue
         bounded.append({"start_seconds": start, "end_seconds": end, "text": str(seg.get("text", "")).strip()})
     bounded.sort(key=lambda s: (s["start_seconds"], s["end_seconds"]))
-    if not bounded:
-        return [{"index": 1, "start_seconds": 0.0, "end_seconds": duration, "segment_count": 0, "text": ""}]
-
     scenes: list[dict] = []
     current: list[dict] = []
     for segment in bounded:
@@ -368,7 +378,31 @@ def _build_scenes(segments: list[dict], duration: float) -> list[dict]:
         current.append(segment)
     if current:
         scenes.append(_scene_from_segments(len(scenes) + 1, current))
-    return scenes
+
+    timeline: list[dict] = []
+    cursor = 0.0
+
+    def add_silent_span(start: float, end: float) -> None:
+        while start < end:
+            stop = min(start + SCENE_MAX_SECONDS, end)
+            timeline.append({
+                "index": len(timeline) + 1,
+                "start_seconds": start,
+                "end_seconds": stop,
+                "segment_count": 0,
+                "text": "",
+            })
+            start = stop
+
+    for scene in scenes:
+        if scene["start_seconds"] - cursor > SCENE_GAP_SECONDS:
+            add_silent_span(cursor, scene["start_seconds"])
+        scene["index"] = len(timeline) + 1
+        timeline.append(scene)
+        cursor = max(cursor, scene["end_seconds"])
+    if duration - cursor > SCENE_GAP_SECONDS or not timeline:
+        add_silent_span(cursor, duration)
+    return timeline
 
 
 def _scene_from_segments(index: int, segments: list[dict]) -> dict:
@@ -402,7 +436,49 @@ def _scenes(root: Path, manifest: JobManifest) -> tuple[list[Artifact], str]:
         "scene_count": len(scenes),
         "scenes": scenes,
     }
-    return [_write_json(root, "scenes.json", data)], f"indexed {len(scenes)} scenes from transcript"
+    database_path = root / "media_index.sqlite3"
+    _clear_media_cache(root)
+    database_path.unlink(missing_ok=True)
+    semantic_mode = "unavailable"
+    semantic_error = ""
+    with MediaStore(database_path) as store:
+        store.migrate()
+        store.replace_index(
+            MediaAsset(path=src, duration_seconds=duration),
+            [
+                Shot(
+                    media_asset_id=1,
+                    start_seconds=scene["start_seconds"],
+                    end_seconds=scene["end_seconds"],
+                    label=scene["text"] or f"Scene {scene['index']}",
+                )
+                for scene in scenes
+            ],
+            [
+                TranscriptSegment(
+                    media_asset_id=1,
+                    start_seconds=float(segment["start_seconds"]),
+                    end_seconds=float(segment["end_seconds"]),
+                    text=str(segment.get("text", "")).strip(),
+                )
+                for segment in transcript.get("segments", [])
+                if str(segment.get("text", "")).strip()
+                and float(segment["end_seconds"]) > float(segment["start_seconds"])
+            ],
+        )
+        try:
+            semantic_search.refresh_store_embeddings(store)
+            semantic_mode = "fastembed"
+        except semantic_search.EmbeddingUnavailable as exc:
+            semantic_error = str(exc)
+    data["semantic_mode"] = semantic_mode
+    data["semantic_model"] = semantic_search.model_name()
+    data["semantic_error"] = semantic_error
+    artifacts = [
+        _write_json(root, "scenes.json", data),
+        Artifact(name=database_path.name, path=database_path, status="ready"),
+    ]
+    return artifacts, f"indexed {len(scenes)} scenes from transcript"
 
 
 # --- reasoning-agent contracts -----------------------------------------------
@@ -541,6 +617,30 @@ def _scene_context(root: Path) -> list[dict]:
     return context
 
 
+SCENE_CANDIDATE_LIMIT = 12
+
+
+def _retrieve_scene_candidates(sections: list[dict], scenes_doc: dict) -> list[list[dict]]:
+    scenes = [item for item in scenes_doc.get("scenes", []) if isinstance(item, dict)]
+    if not scenes:
+        return [[] for _ in sections]
+    result: list[list[dict]] = []
+    previous_top: set[int] = set()
+    for section_index, section in enumerate(sections):
+        anchor = round(section_index * (len(scenes) - 1) / max(len(sections) - 1, 1))
+        ranked = scene_scoring.rank_scenes(
+            section,
+            scenes,
+            anchor=anchor,
+            previous_scene_indexes=previous_top,
+            limit=SCENE_CANDIDATE_LIMIT,
+        )
+        result.append(ranked)
+        if ranked:
+            previous_top.add(int(ranked[0]["index"]))
+    return result
+
+
 def _normalize_outline_sections(raw_sections: list[dict], target_minutes: float) -> list[dict]:
     cleaned: list[dict] = []
     for section in raw_sections:
@@ -559,7 +659,7 @@ def _normalize_outline_sections(raw_sections: list[dict], target_minutes: float)
             "purpose": str(section.get("purpose") or "").strip(),
         })
     if not cleaned:
-        raise ValueError("Claude outline contained no usable sections")
+        raise ValueError("content agent outline contained no usable sections")
 
     total_weight = sum(section["budget_minutes"] for section in cleaned)
     weights = (
@@ -577,8 +677,129 @@ def _normalize_outline_sections(raw_sections: list[dict], target_minutes: float)
             assigned = round(assigned + budget, 1)
         section["budget_minutes"] = budget
     if cleaned[-1]["budget_minutes"] <= 0:
-        raise ValueError("Claude outline could not be normalized to the target duration")
+        raise ValueError("content agent outline could not be normalized to the target duration")
     return cleaned
+
+
+def _agent_display(mode: str) -> str:
+    return "AGY" if mode == "agy" else "Claude"
+
+
+# --- AGY prompt budget fitting ------------------------------------------------
+
+AGY_PROMPT_MAX_DEFAULT = 26000
+AGY_PROMPT_MAX_MINIMUM = 2000
+
+# tier -> (floor, floor after the single relaxation pass)
+_AGY_TRIM_FLOORS = {"A": (120, 60), "B": (200, 150), "C": (400, 300)}
+# Shortest string each tier may cut while its floors are still the first-pass ones.
+_AGY_TRIM_MINIMUM = {"A": 200, "B": 200, "C": 400}
+_AGY_TRIM_TIERS = ("A", "B", "C")
+
+
+def _agy_prompt_max() -> int:
+    """Characters allowed for one AGY prompt (``MRF_AGY_PROMPT_MAX``)."""
+    raw = os.environ.get("MRF_AGY_PROMPT_MAX", str(AGY_PROMPT_MAX_DEFAULT))
+    try:
+        value = int(raw)
+    except ValueError:
+        return AGY_PROMPT_MAX_DEFAULT
+    if value < AGY_PROMPT_MAX_MINIMUM:
+        return AGY_PROMPT_MAX_DEFAULT
+    return value
+
+
+def _agy_string_tier(path: str) -> str:
+    if "scenes" in path or "scene_candidates" in path:
+        return "A"
+    if "script_sections" in path:
+        return "C"
+    return "B"
+
+
+def _agy_string_leaves(node: object, path: str = "") -> Iterator[tuple[dict | list, object, str, str]]:
+    if isinstance(node, dict):
+        for key, value in node.items():
+            child = f"{path}.{key}" if path else str(key)
+            if isinstance(value, str):
+                yield node, key, value, child
+            elif isinstance(value, (dict, list)):
+                yield from _agy_string_leaves(value, child)
+    elif isinstance(node, list):
+        for index, value in enumerate(node):
+            child = f"{path}[{index}]"
+            if isinstance(value, str):
+                yield node, index, value, child
+            elif isinstance(value, (dict, list)):
+                yield from _agy_string_leaves(value, child)
+
+
+def _fit_agy_context(context: dict, budget: int) -> tuple[dict, int]:
+    """Shorten string values until ``context`` serialises within ``budget``.
+
+    ``budget`` is the share of the final AGY prompt left for the serialised
+    context; ``_run_reasoning_agent`` subtracts the fixed prompt head first, so
+    the whole prompt stays under ``MRF_AGY_PROMPT_MAX``. Keys, structure, list
+    indexes, numbers and booleans are never touched - only string values get
+    cut, always to ``max(floor, len // 2)``.
+
+    Tiers are drained in order: A (scenes / scene_candidates), then B (research
+    and every other string), then C (script_sections), so the cheapest context
+    is given up first. Candidates inside a tier rank by (longest first, then
+    json-path ascending) for a deterministic order. Once every string sits at
+    its floor and the budget is still missed, all floors relax once
+    (60 / 150 / 300) for a final pass; a second stall ends the loop even if the
+    prompt remains over budget.
+    """
+    original = json.dumps(context, ensure_ascii=False)
+    if len(original) <= budget:
+        return context, 0
+
+    fitted = copy.deepcopy(context)
+    floors = {tier: bounds[0] for tier, bounds in _AGY_TRIM_FLOORS.items()}
+    trimmed: set[str] = set()
+    size = len(original)
+    relaxed = False
+    while size > budget:
+        progress = False
+        for tier in _AGY_TRIM_TIERS:
+            while size > budget:
+                floor = floors[tier]
+                minimum = floor if relaxed else _AGY_TRIM_MINIMUM[tier]
+                best: tuple[str, dict | list, object, str] | None = None
+                best_rank: tuple[int, str] | None = None
+                for holder, key, value, path in _agy_string_leaves(fitted):
+                    length = len(value)
+                    if length <= floor or length < minimum:
+                        continue
+                    if _agy_string_tier(path) != tier:
+                        continue
+                    rank = (-length, path)
+                    if best_rank is None or rank < best_rank:
+                        best_rank = rank
+                        best = (path, holder, key, value)
+                if best is None:
+                    break
+                path, holder, key, value = best
+                holder[key] = value[: max(floor, len(value) // 2)]
+                trimmed.add(path)
+                size = len(json.dumps(fitted, ensure_ascii=False))
+                progress = True
+            if size <= budget:
+                break
+        if progress:
+            continue
+        if not relaxed:
+            floors = {tier: bounds[1] for tier, bounds in _AGY_TRIM_FLOORS.items()}
+            relaxed = True
+            continue
+        break
+    if trimmed:
+        print(
+            f"agy prompt trimmed: {len(original)} -> {size} chars ({len(trimmed)} strings)",
+            flush=True,
+        )
+    return fitted, len(trimmed)
 
 
 def _run_reasoning_agent(
@@ -591,10 +812,10 @@ def _run_reasoning_agent(
     schema: dict,
     allowed_tools: list[str] | None = None,
 ) -> dict | None:
-    if manifest.config.content_agent != "claude":
+    if manifest.config.content_agent not in ("claude", "agy"):
         return None
 
-    prompt = (
+    prompt_head = (
         "You are the reasoning worker for Movie Review Factory. "
         "Produce original review/recap material, not copied dialogue. "
         "Do not invent facts or source URLs; put unresolved claims in uncertainties when the schema permits it. "
@@ -602,8 +823,15 @@ def _run_reasoning_agent(
         f"STAGE: {stage}\n"
         f"INSTRUCTION: {instruction}\n"
         "JOB CONTEXT:\n"
-        + json.dumps(context, ensure_ascii=False)
     )
+    if manifest.config.content_agent == "agy":
+        context, _ = _fit_agy_context(context, _agy_prompt_max() - len(prompt_head))
+        return run_agy_json(
+            stage=stage,
+            prompt=prompt_head + json.dumps(context, ensure_ascii=False),
+            schema=schema,
+        )
+    prompt = prompt_head + json.dumps(context, ensure_ascii=False)
     return run_claude_json(
         root=root,
         stage=stage,
@@ -613,7 +841,7 @@ def _run_reasoning_agent(
     )
 
 
-# --- research: deterministic scaffold or Claude research ---------------------
+# --- research: deterministic scaffold or content-agent research ---------------------
 
 @register_stage("research")
 def _research(root: Path, manifest: JobManifest) -> tuple[list[Artifact], str]:
@@ -650,11 +878,11 @@ def _research(root: Path, manifest: JobManifest) -> tuple[list[Artifact], str]:
             "sources": list(agent.get("sources") or []),
             "uncertainties": list(agent.get("uncertainties") or []),
             "status": "ready",
-            "generator": "claude",
+            "generator": cfg.content_agent,
         }
         if not data["brief"]:
-            raise ValueError("Claude research returned an empty brief")
-        return [_write_json(root, "research.json", data)], "research generated by Claude"
+            raise ValueError(f"{_agent_display(cfg.content_agent)} research returned an empty brief")
+        return [_write_json(root, "research.json", data)], f"research generated by {_agent_display(cfg.content_agent)}"
 
     data = {
         "job_id": cfg.job_id,
@@ -708,9 +936,9 @@ def _outline(root: Path, manifest: JobManifest) -> tuple[list[Artifact], str]:
             "target_minutes": target_min,
             "sections": sections,
             "notes": str(agent.get("notes") or "").strip(),
-            "generator": "claude",
+            "generator": cfg.content_agent,
         }
-        return [_write_json(root, "outline.json", outline)], "outline generated by Claude"
+        return [_write_json(root, "outline.json", outline)], f"outline generated by {_agent_display(cfg.content_agent)}"
 
     hook_min, cta_min = 0.5, 0.5
     body_min = max(target_min - hook_min - cta_min, 1.0)
@@ -799,7 +1027,7 @@ def _script(root: Path, manifest: JobManifest) -> tuple[list[Artifact], str]:
         generated = list(agent.get("sections") or [])
         if len(generated) != len(raw_sections):
             raise ValueError(
-                "Claude script section count does not match the approved outline shape"
+                f"{_agent_display(cfg.content_agent)} script section count does not match the approved outline shape"
             )
         for outline_section, generated_section in zip(raw_sections, generated):
             title = (
@@ -818,7 +1046,7 @@ def _script(root: Path, manifest: JobManifest) -> tuple[list[Artifact], str]:
                 else ""
             )
             if not narration:
-                raise ValueError(f"Claude script returned empty narration for {title!r}")
+                raise ValueError(f"{_agent_display(cfg.content_agent)} script returned empty narration for {title!r}")
             sections.append({
                 "title": title,
                 "budget_minutes": budget,
@@ -826,8 +1054,8 @@ def _script(root: Path, manifest: JobManifest) -> tuple[list[Artifact], str]:
                 "duration_seconds": round(budget * 60),
             })
         notes = str(agent.get("notes") or "").strip()
-        generator = "claude"
-        message = "script generated by Claude (approval required before TTS)"
+        generator = cfg.content_agent
+        message = f"script generated by {_agent_display(cfg.content_agent)} (approval required before TTS)"
     else:
         # Normalise: sections may arrive as plain strings (legacy) or dicts.
         for section in raw_sections:
@@ -878,12 +1106,12 @@ def _scene_range_from_indexes(
 ) -> dict:
     """Resolve one indexed scene range to validated source timestamps."""
     if not isinstance(start_index, int) or not isinstance(end_index, int):
-        raise ValueError("Claude scene plan indexes must be integers")
+        raise ValueError("content agent scene plan indexes must be integers")
     if start_index not in positions or end_index not in positions:
-        raise ValueError("Claude scene plan referenced an unknown scene index")
+        raise ValueError("content agent scene plan referenced an unknown scene index")
     start_pos, end_pos = positions[start_index], positions[end_index]
     if end_pos < start_pos:
-        raise ValueError("Claude scene plan end scene precedes start scene")
+        raise ValueError("content agent scene plan end scene precedes start scene")
 
     selected = scenes[start_pos:end_pos + 1]
     start = float(selected[0].get("start_seconds") or 0.0)
@@ -893,7 +1121,7 @@ def _scene_range_from_indexes(
         or start < 0 or end <= start
         or (video_duration > 0 and end > video_duration)
     ):
-        raise ValueError("Claude scene plan resolved to an invalid source range")
+        raise ValueError("content agent scene plan resolved to an invalid source range")
     return {"start_seconds": start, "end_seconds": end}
 
 
@@ -901,13 +1129,14 @@ def _agent_scene_assignments(
     sections: list[dict],
     scenes_doc: dict,
     assignments: list[dict],
+    candidates: list[list[dict]] | None = None,
 ) -> list[list[tuple[dict, str]]]:
-    """Validate Claude shot choices and resolve scene IDs to source timestamps."""
+    """Validate content agent shot choices and resolve scene IDs to source timestamps."""
     scenes = [scene for scene in (scenes_doc.get("scenes") or []) if isinstance(scene, dict)]
     if len(assignments) != len(sections):
-        raise ValueError("Claude scene plan assignment count does not match script sections")
+        raise ValueError("content agent scene plan assignment count does not match script sections")
     if not scenes:
-        raise ValueError("Claude scene plan cannot run without indexed scenes")
+        raise ValueError("content agent scene plan cannot run without indexed scenes")
 
     positions: dict[int, int] = {}
     for position, scene in enumerate(scenes):
@@ -917,20 +1146,24 @@ def _agent_scene_assignments(
 
     video_duration = float(scenes_doc.get("duration_seconds") or 0.0)
     result: list[list[tuple[dict, str]]] = []
-    for assignment in assignments:
+    for section_index, assignment in enumerate(assignments):
+        allowed = (
+            {scene["index"] for scene in candidates[section_index]}
+            if candidates is not None else None
+        )
         if not isinstance(assignment, dict):
-            raise ValueError("Claude scene plan assignment must be an object")
+            raise ValueError("content agent scene plan assignment must be an object")
         raw_shots = assignment.get("shots")
         if not isinstance(raw_shots, list) or not raw_shots:
-            raise ValueError("Claude scene plan assignment must contain at least one shot")
+            raise ValueError("content agent scene plan assignment must contain at least one shot")
         if len(raw_shots) > SCENE_PLAN_MAX_SHOTS_PER_SECTION:
-            raise ValueError("Claude scene plan assignment contains too many shots")
+            raise ValueError("content agent scene plan assignment contains too many shots")
 
         shots: list[tuple[dict, str]] = []
         seen_ranges: set[tuple[float, float]] = set()
         for shot in raw_shots:
             if not isinstance(shot, dict):
-                raise ValueError("Claude scene plan shot must be an object")
+                raise ValueError("content agent scene plan shot must be an object")
             source_clip = _scene_range_from_indexes(
                 scenes,
                 positions,
@@ -938,9 +1171,14 @@ def _agent_scene_assignments(
                 shot.get("end_scene_index"),
                 video_duration,
             )
+            if allowed is not None:
+                first = positions[shot["start_scene_index"]]
+                last = positions[shot["end_scene_index"]]
+                if any(scenes[position].get("index") not in allowed for position in range(first, last + 1)):
+                    raise ValueError("content agent scene plan selected a scene outside section candidates")
             key = (source_clip["start_seconds"], source_clip["end_seconds"])
             if key in seen_ranges:
-                raise ValueError("Claude scene plan repeated the same shot within one section")
+                raise ValueError("content agent scene plan repeated the same shot within one section")
             seen_ranges.add(key)
             shots.append((source_clip, str(shot.get("rationale") or "").strip()))
         result.append(shots)
@@ -1103,22 +1341,390 @@ def _expand_scene_plan_clips(
     return clips, cursor
 
 
+def _scene_range_key(scene: dict) -> tuple[float, float]:
+    return (
+        round(float(scene.get("start_seconds") or 0.0), 6),
+        round(float(scene.get("end_seconds") or 0.0), 6),
+    )
+
+
+def _load_scene_visual_observations(database: Path, scenes: list[dict]) -> dict[int, dict]:
+    with MediaStore(database) as store:
+        store.migrate()
+        shots = store.list_shots(1)
+        rows = store.list_visual_observations()
+    shot_by_range = {_scene_range_key(shot.model_dump()): shot.id for shot in shots if shot.id}
+    row_by_shot = {int(row["shot_id"]): row for row in rows}
+    result: dict[int, dict] = {}
+    for scene in scenes:
+        scene_index = scene.get("index")
+        shot_id = shot_by_range.get(_scene_range_key(scene))
+        if not isinstance(scene_index, int) or not shot_id or shot_id not in row_by_shot:
+            continue
+        row = row_by_shot[shot_id]
+        result[scene_index] = {
+            "description": row["description"],
+            "tags": list(row.get("tags") or []),
+            "people": list(row.get("people") or []),
+            "actions": list(row.get("actions") or []),
+        }
+    return result
+
+
+def _save_scene_visual_observations(
+    database: Path,
+    scenes: list[dict],
+    observations: dict[int, dict],
+) -> None:
+    with MediaStore(database) as store:
+        store.migrate()
+        shots = store.list_shots(1)
+        shot_by_range = {_scene_range_key(shot.model_dump()): shot.id for shot in shots if shot.id}
+        records: list[VisualObservation] = []
+        for scene in scenes:
+            scene_index = scene.get("index")
+            if not isinstance(scene_index, int) or scene_index not in observations:
+                continue
+            shot_id = shot_by_range.get(_scene_range_key(scene))
+            if not shot_id:
+                continue
+            observation = observations[scene_index]
+            records.append(VisualObservation(
+                shot_id=shot_id,
+                description=str(observation.get("description") or "").strip(),
+                tags=list(observation.get("tags") or []),
+                people=list(observation.get("people") or []),
+                actions=list(observation.get("actions") or []),
+                source="agy",
+            ))
+        store.replace_visual_observations(records)
+
+
+def _apply_scene_visual_observations(
+    scenes: list[dict], observations: dict[int, dict]
+) -> None:
+    for scene in scenes:
+        scene_index = scene.get("index")
+        observation = observations.get(scene_index) if isinstance(scene_index, int) else None
+        if not observation:
+            continue
+        scene["visual_description"] = observation["description"]
+        scene["visual_tags"] = list(observation.get("tags") or [])
+        scene["visual_people"] = list(observation.get("people") or [])
+        scene["visual_actions"] = list(observation.get("actions") or [])
+
+
+def _save_person_identity(database: Path, scenes: list[dict], identity: dict) -> None:
+    with MediaStore(database) as store:
+        store.migrate()
+        shots = store.list_shots(1)
+        shot_by_range = {_scene_range_key(shot.model_dump()): shot.id for shot in shots if shot.id}
+        scene_to_shot = {
+            int(scene["index"]): shot_by_range.get(_scene_range_key(scene))
+            for scene in scenes if isinstance(scene.get("index"), int)
+        }
+        appearances = []
+        for item in identity.get("appearances", []):
+            shot_id = scene_to_shot.get(int(item.get("scene_index") or 0))
+            if not shot_id:
+                continue
+            appearances.append({
+                "label": item["label"],
+                "shot_id": shot_id,
+                "description": item.get("description", ""),
+                "clothing": item.get("clothing", ""),
+                "ambiguous": bool(item.get("ambiguous", False)),
+                "confidence": item.get("confidence", 0.0),
+                "evidence": item.get("evidence", ""),
+            })
+        store.replace_person_tracks(list(identity.get("tracks") or []), appearances)
+
+
+def _apply_person_identity(database: Path, scenes: list[dict]) -> list[dict]:
+    with MediaStore(database) as store:
+        store.migrate()
+        tracks = store.list_person_tracks()
+        shots = store.list_shots(1)
+        labels_by_shot = {int(shot.id): store.person_labels_for_shot(int(shot.id))
+                          for shot in shots if shot.id}
+    shot_by_range = {_scene_range_key(shot.model_dump()): int(shot.id)
+                     for shot in shots if shot.id}
+    for scene in scenes:
+        shot_id = shot_by_range.get(_scene_range_key(scene))
+        scene["person_tracks"] = labels_by_shot.get(shot_id, [])
+    return tracks
+
+
+def _save_story_graph(database: Path, scenes: list[dict], graph: dict) -> None:
+    with MediaStore(database) as store:
+        store.migrate()
+        shots = store.list_shots(1)
+        shot_by_range = {
+            _scene_range_key(shot.model_dump()): int(shot.id)
+            for shot in shots if shot.id
+        }
+        scene_to_shot = {
+            int(scene["index"]): shot_by_range.get(_scene_range_key(scene))
+            for scene in scenes if isinstance(scene.get("index"), int)
+        }
+        scene_entities = []
+        for item in graph.get("scene_entities", []):
+            shot_id = scene_to_shot.get(int(item.get("scene_index") or 0))
+            if shot_id:
+                scene_entities.append({**item, "shot_id": shot_id})
+        relations = []
+        for item in graph.get("relations", []):
+            shot_id = scene_to_shot.get(int(item.get("scene_index") or 0))
+            if shot_id:
+                relations.append({**item, "shot_id": shot_id})
+        store.replace_story_graph(
+            list(graph.get("entities") or []),
+            scene_entities,
+            relations,
+        )
+
+
+def _apply_story_graph(database: Path, scenes: list[dict]) -> dict:
+    with MediaStore(database) as store:
+        store.migrate()
+        graph = store.list_story_graph()
+        shots = store.list_shots(1)
+    shot_by_range = {
+        _scene_range_key(shot.model_dump()): int(shot.id)
+        for shot in shots if shot.id
+    }
+    entities_by_shot: dict[int, list[dict]] = {}
+    for item in graph["scene_entities"]:
+        entities_by_shot.setdefault(int(item["shot_id"]), []).append({
+            "type": item["type"],
+            "label": item["label"],
+            "confidence": item["confidence"],
+        })
+    relations_by_shot: dict[int, list[dict]] = {}
+    for item in graph["relations"]:
+        relations_by_shot.setdefault(int(item["shot_id"]), []).append({
+            "subject_type": item["subject_type"],
+            "subject_label": item["subject_label"],
+            "predicate": item["predicate"],
+            "object_type": item["object_type"],
+            "object_label": item["object_label"],
+            "confidence": item["confidence"],
+        })
+    for scene in scenes:
+        shot_id = shot_by_range.get(_scene_range_key(scene))
+        scene["story_entities"] = entities_by_shot.get(shot_id, [])
+        scene["story_relations"] = relations_by_shot.get(shot_id, [])
+    return graph
+
+
+def _merge_semantic_scene_candidates(
+    sections: list[dict],
+    scenes: list[dict],
+    database: Path,
+    candidates: list[list[dict]],
+) -> list[list[dict]]:
+    del candidates  # scorer v2 reranks the full bounded scene set.
+    with MediaStore(database) as store:
+        store.migrate()
+        shots = store.list_shots(1)
+        shot_to_scene: dict[int, int] = {}
+        range_to_scene = {
+            _scene_range_key(scene): int(scene["index"])
+            for scene in scenes if isinstance(scene.get("index"), int)
+        }
+        for shot in shots:
+            if shot.id:
+                scene_index = range_to_scene.get(_scene_range_key(shot.model_dump()))
+                if scene_index is not None:
+                    shot_to_scene[int(shot.id)] = scene_index
+
+        merged: list[list[dict]] = []
+        previous_top: set[int] = set()
+        for section_index, section in enumerate(sections):
+            query = " ".join([
+                str(section.get("title") or ""),
+                str(section.get("narration") or ""),
+            ]).strip()
+            semantic_scores: dict[int, float] = {}
+            if query:
+                for item in semantic_search.search_store(
+                    store, query, limit=max(SCENE_CANDIDATE_LIMIT * 3, len(scenes))
+                ):
+                    if item["kind"] != "visual":
+                        continue
+                    scene_index = shot_to_scene.get(int(item["shot_id"]))
+                    if scene_index is not None:
+                        semantic_scores[scene_index] = float(item["score"])
+            anchor = round(
+                section_index * (len(scenes) - 1) / max(len(sections) - 1, 1)
+            )
+            ranked = scene_scoring.rank_scenes(
+                section,
+                scenes,
+                anchor=anchor,
+                semantic_scores=semantic_scores,
+                previous_scene_indexes=previous_top,
+                limit=SCENE_CANDIDATE_LIMIT,
+            )
+            merged.append(ranked)
+            if ranked:
+                previous_top.add(int(ranked[0]["index"]))
+    return merged
+
+
+def index_scene_memory(
+    root: Path,
+    cfg: JobConfig,
+    scenes_doc: dict,
+    scenes: list[dict],
+) -> dict:
+    """Populate per-job scene memory into media_index.sqlite3 and return a summary.
+
+    Builds visual observations, anonymous person tracks, the story graph, and
+    semantic embeddings for the indexed scenes. Extracted verbatim from the head
+    of ``_scene_plan`` so the same work can also run standalone in the background
+    indexing queue (roadmap #14) right after import, decoupled from content
+    generation. Mutates ``scenes`` in place with the cached visual/identity/story
+    fields and returns the per-facet mode/error summary. Only meaningful for
+    ``content_agent`` in ("claude", "agy") with a source video; callers guard that.
+    """
+    visual_mode = "not_requested"
+    visual_error = ""
+    visual_observations: dict[int, dict] = {}
+    identity_mode = "not_requested"
+    identity_error = ""
+    person_tracks: list[dict] = []
+    semantic_mode = "not_requested"
+    semantic_error = ""
+    story_mode = "not_requested"
+    story_error = ""
+    story_graph: dict = {"entities": [], "scene_entities": [], "relations": []}
+    database = root / "media_index.sqlite3"
+
+    indexed_source = scenes_doc.get("source_video")
+    if indexed_source and Path(cfg.source_video).resolve() != Path(indexed_source).resolve():
+        raise ValueError("scene index belongs to a different source video")
+    if database.is_file():
+        visual_observations = _load_scene_visual_observations(database, scenes)
+        if visual_observations:
+            visual_mode = "agy_cached"
+        try:
+            fresh = agy_vision.describe_candidate_observations(
+                Path(cfg.source_video), [scenes]
+            )
+            if fresh:
+                visual_observations = fresh
+                _save_scene_visual_observations(database, scenes, fresh)
+                visual_mode = "agy"
+        except agy_vision.VisionUnavailable as exc:
+            visual_error = str(exc)
+            if not visual_observations:
+                visual_mode = "unavailable"
+        _apply_scene_visual_observations(scenes, visual_observations)
+
+        try:
+            identity = agy_vision.track_anonymous_people(
+                Path(cfg.source_video), scenes
+            )
+            _save_person_identity(database, scenes, identity)
+            identity_mode = "agy"
+        except agy_vision.VisionUnavailable as exc:
+            identity_error = str(exc)
+            with MediaStore(database) as store:
+                store.migrate()
+                identity_mode = "agy_cached" if store.list_person_tracks() else "unavailable"
+        person_tracks = _apply_person_identity(database, scenes)
+
+        try:
+            fresh_story = agy_vision.extract_story_graph(scenes)
+            _save_story_graph(database, scenes, fresh_story)
+            story_mode = "agy"
+        except agy_vision.VisionUnavailable as exc:
+            story_error = str(exc)
+            with MediaStore(database) as store:
+                store.migrate()
+                cached_story = store.list_story_graph()
+            story_mode = (
+                "agy_cached"
+                if cached_story["entities"] or cached_story["relations"]
+                else "unavailable"
+            )
+        story_graph = _apply_story_graph(database, scenes)
+
+        try:
+            with MediaStore(database) as store:
+                store.migrate()
+                semantic_search.refresh_store_embeddings(store)
+            semantic_mode = "fastembed"
+        except semantic_search.EmbeddingUnavailable as exc:
+            semantic_mode = "unavailable"
+            semantic_error = str(exc)
+
+    return {
+        "visual_observations": visual_observations,
+        "visual_mode": visual_mode,
+        "visual_error": visual_error,
+        "identity_mode": identity_mode,
+        "identity_error": identity_error,
+        "person_tracks": person_tracks,
+        "semantic_mode": semantic_mode,
+        "semantic_error": semantic_error,
+        "story_mode": story_mode,
+        "story_error": story_error,
+        "story_graph": story_graph,
+    }
+
+
 @register_stage("scene_plan")
 def _scene_plan(root: Path, manifest: JobManifest) -> tuple[list[Artifact], str]:
-    """Map script sections to time-stamped clip slots.
-
-    When scenes.json is present, each clip's source_clip is automatically
-    populated by proportional assignment (_assign_source_clips), eliminating
-    manual edits.  When scenes.json is absent the field stays None so the
-    stage still completes and the render stage will skip with a clear message.
-    """
+    """Map script sections to time-stamped visual clips."""
     cfg = manifest.config
     script = _read_json(root, "script.json")
     sections = script.get("sections") or []
     scenes_doc = _read_json(root, "scenes.json")
+    scenes = [scene for scene in scenes_doc.get("scenes", []) if isinstance(scene, dict)]
     scene_assignments: list[list[tuple[dict, str]]]
     agent = None
-    if scenes_doc.get("scenes"):
+    candidates: list[list[dict]] = []
+    visual_mode = "not_requested"
+    visual_error = ""
+    visual_observations: dict[int, dict] = {}
+    identity_mode = "not_requested"
+    identity_error = ""
+    person_tracks: list[dict] = []
+    semantic_mode = "not_requested"
+    semantic_error = ""
+    story_mode = "not_requested"
+    story_error = ""
+    story_graph: dict = {"entities": [], "scene_entities": [], "relations": []}
+    database = root / "media_index.sqlite3"
+
+    if scenes:
+        if cfg.content_agent in ("claude", "agy") and cfg.source_video:
+            memory = index_scene_memory(root, cfg, scenes_doc, scenes)
+            visual_observations = memory["visual_observations"]
+            visual_mode = memory["visual_mode"]
+            visual_error = memory["visual_error"]
+            identity_mode = memory["identity_mode"]
+            identity_error = memory["identity_error"]
+            person_tracks = memory["person_tracks"]
+            semantic_mode = memory["semantic_mode"]
+            semantic_error = memory["semantic_error"]
+            story_mode = memory["story_mode"]
+            story_error = memory["story_error"]
+            story_graph = memory["story_graph"]
+
+        candidates = _retrieve_scene_candidates(sections, scenes_doc)
+        if database.is_file():
+            try:
+                candidates = _merge_semantic_scene_candidates(
+                    sections, scenes, database, candidates
+                )
+                semantic_mode = "fastembed"
+            except semantic_search.EmbeddingUnavailable as exc:
+                if semantic_mode == "not_requested":
+                    semantic_mode = "unavailable"
+                semantic_error = str(exc)
         agent = _run_reasoning_agent(
             root=root,
             manifest=manifest,
@@ -1127,17 +1733,22 @@ def _scene_plan(root: Path, manifest: JobManifest) -> tuple[list[Artifact], str]
                 f"Choose 1-{SCENE_PLAN_MAX_SHOTS_PER_SECTION} ordered visual shots for each "
                 "script section. Keep exactly the same section count/order as the script. "
                 "Each shot may reference one scene or a short contiguous scene range. "
-                "Select only supplied scene indexes; never invent timestamps or indexes. "
-                "Prefer varied, representative shots that support the narration and avoid "
-                "repeating the same source range inside a section."
+                "Select only supplied scene indexes for that section; never invent timestamps. "
+                "Scene text is dialogue evidence, not a description of visual content. "
+                "Use visual_description, visual_tags, visual_people and visual_actions only "
+                "when supplied by AGY frame inspection. person_tracks are anonymous continuity labels "
+                "such as Person 1, never real-world identities. story_entities/story_relations are grounded "
+                "AGY memory links from scene evidence. Prefer semantically and visually relevant, varied source "
+                "ranges and avoid repeating the same moment across sections when alternatives exist."
             ),
             context={
                 "movie_title": _movie_title(cfg),
                 "language": cfg.language,
                 "script_sections": sections,
-                "scenes": _scene_context(root),
+                "scene_candidates": candidates,
             },
             schema=_SCENE_PLAN_AGENT_SCHEMA,
+            allowed_tools=[],
         )
 
     if agent is not None:
@@ -1145,8 +1756,9 @@ def _scene_plan(root: Path, manifest: JobManifest) -> tuple[list[Artifact], str]
             sections,
             scenes_doc,
             list(agent.get("assignments") or []),
+            candidates=candidates,
         )
-        generator = "claude"
+        generator = cfg.content_agent
         plan_notes = str(agent.get("notes") or "").strip()
     else:
         scene_assignments = _assign_source_shots(sections, scenes_doc)
@@ -1158,7 +1770,7 @@ def _scene_plan(root: Path, manifest: JobManifest) -> tuple[list[Artifact], str]
         )
 
     clips, cursor = _expand_scene_plan_clips(sections, scene_assignments)
-    resolved = sum(1 for c in clips if c["source_clip"] is not None)
+    resolved = sum(1 for clip in clips if clip["source_clip"] is not None)
     data = {
         "job_id": cfg.job_id,
         "aspect_ratio": cfg.aspect_ratio,
@@ -1166,10 +1778,33 @@ def _scene_plan(root: Path, manifest: JobManifest) -> tuple[list[Artifact], str]
         "clips": clips,
         "notes": plan_notes,
         "generator": generator,
+        "visual_mode": visual_mode,
+        "visual_descriptions": [
+            {"scene_index": index, "description": observation["description"]}
+            for index, observation in sorted(visual_observations.items())
+        ],
+        "visual_observations": [
+            {"scene_index": index, **observation}
+            for index, observation in sorted(visual_observations.items())
+        ],
+        "visual_error": visual_error,
+        "identity_mode": identity_mode,
+        "identity_error": identity_error,
+        "person_tracks": person_tracks,
+        "semantic_mode": semantic_mode,
+        "semantic_model": semantic_search.model_name(),
+        "semantic_error": semantic_error,
+        "story_mode": story_mode,
+        "story_error": story_error,
+        "story_summary": {
+            "entity_count": len(story_graph.get("entities", [])),
+            "appearance_count": len(story_graph.get("scene_entities", [])),
+            "relation_count": len(story_graph.get("relations", [])),
+        },
     }
-    if generator == "claude":
+    if generator in ("claude", "agy"):
         msg = (
-            f"scene_plan generated by Claude ({len(clips)} clips, "
+            f"scene_plan generated by {_agent_display(generator)} ({len(clips)} clips, "
             f"{round(cursor / 60, 1)} min total, {resolved} source_clips resolved)"
         )
     else:
@@ -1843,7 +2478,7 @@ def _thumbnail_timestamps(root: Path, source_duration: float) -> list[float]:
 
 @register_stage("thumbnail")
 def _thumbnail(root: Path, manifest: JobManifest) -> tuple[list[Artifact], str]:
-    """Extract three clean 1280x720 source frames and select a default primary."""
+    """Extract three clean source frames in the job aspect ratio and select a default primary."""
     cfg = manifest.config
     source_path = Path(cfg.source_video) if cfg.source_video else root / "final.mp4"
     if not source_path.exists():
@@ -1861,7 +2496,7 @@ def _thumbnail(root: Path, manifest: JobManifest) -> tuple[list[Artifact], str]:
     if not math.isfinite(duration) or duration <= 0:
         raise SkipStage("thumbnail source has no positive duration")
 
-    width, height = THUMBNAIL_SIZE
+    width, height = THUMBNAIL_SIZES[cfg.aspect_ratio]
     timestamps = _thumbnail_timestamps(root, duration)
     candidates: list[dict] = []
     artifacts: list[Artifact] = []
@@ -2009,24 +2644,28 @@ def _publish(root: Path, manifest: JobManifest) -> tuple[list[Artifact], str]:
 # --- runner -----------------------------------------------------------------
 
 def _skip_reason(stage_name: str) -> str:
-    if stage_name in MEDIA_STAGES:
-        return "needs source video/media - skipped (not implemented)"
-    return "no handler - skipped"
+    return f"no handler registered for {stage_name} - skipped"
+
+
+def recover_interrupted_run(root: Path) -> bool:
+    manifest = load_manifest(root)
+    changed = False
+    for stage in manifest.stages:
+        if stage.status == "running":
+            stage.mark("cancelled", "Run interrupted by application restart; press Run to resume")
+            changed = True
+    if changed:
+        save_manifest(root, manifest)
+    return changed
 
 
 def run_job(root: Path, *, force: bool = False, until: str | None = None) -> JobManifest:
-    """Walk stages in order, run any registered handler, and persist the manifest
-    after every stage so the job is resumable. Stages without a handler are
-    honestly marked "skipped". A handler may raise SkipStage for a controlled
-    skip; any other exception marks it "failed" and stops the run unless
-    force=True (which continues past failures without re-running ready stages)."""
     if until and until not in STAGES:
         raise ValueError(f"unknown stage: {until!r}")
     manifest = load_manifest(root)
     for stage in manifest.stages:
-        # Only ready stages are final; skipped stages are recoverable and retryable.
-        permanently_done = stage.status == "ready"
-        if permanently_done:
+        cancellation.checkpoint()
+        if stage.status == "ready":
             if until and stage.stage == until:
                 break
             continue
@@ -2035,10 +2674,16 @@ def run_job(root: Path, *, force: bool = False, until: str | None = None) -> Job
             stage.mark("skipped", _skip_reason(stage.stage))
             save_manifest(root, manifest)
         else:
-            stage.mark("running")
+            stage.mark("running", "Running")
             save_manifest(root, manifest)
             try:
+                cancellation.checkpoint()
                 artifacts, message = handler(root, manifest)
+                cancellation.checkpoint()
+            except cancellation.RunCancelled as exc:
+                stage.mark("cancelled", str(exc))
+                save_manifest(root, manifest)
+                return manifest
             except SkipStage as exc:
                 stage.mark("skipped", exc.reason)
             except Exception as exc:
@@ -2054,6 +2699,147 @@ def run_job(root: Path, *, force: bool = False, until: str | None = None) -> Job
     return manifest
 
 
+def _execute_stage(
+    root: Path,
+    manifest: JobManifest,
+    stage: StageResult,
+    *,
+    force: bool = False,
+) -> str:
+    """Run one stage handler in place, persisting the manifest, return its status.
+
+    Mirrors the per-stage body of ``run_job`` so the background index runner
+    (``run_index``) shares identical semantics: cancellation is re-raised after
+    the manifest is persisted; a failed handler is recorded and returned so the
+    caller decides whether to stop (``force`` keeps going elsewhere).
+    """
+    handler = STAGE_HANDLERS.get(stage.stage)
+    if handler is None:
+        stage.mark("skipped", _skip_reason(stage.stage))
+        save_manifest(root, manifest)
+        return stage.status
+    stage.mark("running", "Running")
+    save_manifest(root, manifest)
+    try:
+        cancellation.checkpoint()
+        artifacts, message = handler(root, manifest)
+        cancellation.checkpoint()
+    except cancellation.RunCancelled as exc:
+        stage.mark("cancelled", str(exc))
+        save_manifest(root, manifest)
+        raise
+    except SkipStage as exc:
+        stage.mark("skipped", exc.reason)
+    except Exception as exc:  # noqa: BLE001 - surfaced through the stage status
+        stage.mark("failed", str(exc))
+        save_manifest(root, manifest)
+        return stage.status
+    else:
+        stage.mark("ready", message, artifacts)
+    save_manifest(root, manifest)
+    return stage.status
+
+
+# Source-only indexing stages: everything derivable from the imported video
+# without running any content (research/outline/script) stage. ``run_index``
+# runs these plus scene-memory extraction so import can finish first and the
+# heavy indexing happens in the background (roadmap #14).
+INDEX_STAGES = ("ingest", "transcript", "scenes")
+
+
+def run_index(
+    root: Path,
+    *,
+    force: bool = False,
+    progress: Callable[[dict], None] | None = None,
+) -> dict:
+    """Run source-only indexing for a job, decoupled from content generation.
+
+    Runs ``ingest -> transcript -> scenes`` (building ``media_index.sqlite3`` and
+    embeddings) and then scene-memory extraction (visual observations, anonymous
+    person tracks, story graph) for ``content_agent`` in ("claude", "agy"). No
+    research/outline/script stage runs, so this is safe to fire in the background
+    right after import; a later ``run_job`` reuses the cached index cheaply.
+
+    Idempotent: stages already ``ready`` are skipped. ``progress`` (if given) is
+    called with ``{stage, status, index, total}`` after each step so a caller can
+    surface live progress. Returns a serialisable summary; cooperative
+    cancellation stops early and is reported via ``cancelled=True``.
+    """
+    manifest = load_manifest(root)
+    stage_status: dict[str, str] = {}
+    total = len(INDEX_STAGES) + 1  # + scene_memory step
+
+    def _emit(name: str, status: str, index: int) -> None:
+        stage_status[name] = status
+        if progress is not None:
+            progress({"stage": name, "status": status, "index": index, "total": total})
+
+    for position, name in enumerate(INDEX_STAGES, start=1):
+        try:
+            cancellation.checkpoint()
+        except cancellation.RunCancelled:
+            _emit(name, "cancelled", position)
+            return {"job_id": manifest.config.job_id, "stages": stage_status,
+                    "cancelled": True, "media_index": (root / "media_index.sqlite3").is_file(),
+                    "scene_memory": {}}
+        stage = manifest.stage(name)
+        if stage is None:
+            _emit(name, "skipped", position)
+            continue
+        if stage.status == "ready":
+            _emit(name, "ready", position)
+            continue
+        _emit(name, "running", position)
+        try:
+            status = _execute_stage(root, manifest, stage, force=force)
+        except cancellation.RunCancelled:
+            _emit(name, "cancelled", position)
+            return {"job_id": manifest.config.job_id, "stages": stage_status,
+                    "cancelled": True, "media_index": (root / "media_index.sqlite3").is_file(),
+                    "scene_memory": {}}
+        _emit(name, status, position)
+        if status == "failed" and not force:
+            return {"job_id": manifest.config.job_id, "stages": stage_status,
+                    "cancelled": False, "media_index": (root / "media_index.sqlite3").is_file(),
+                    "scene_memory": {}}
+
+    scene_memory: dict = {}
+    cfg = manifest.config
+    scenes_doc = _read_json(root, "scenes.json")
+    scenes = [scene for scene in scenes_doc.get("scenes", []) if isinstance(scene, dict)]
+    if scenes and cfg.content_agent in ("claude", "agy") and cfg.source_video:
+        _emit("scene_memory", "running", total)
+        try:
+            cancellation.checkpoint()
+            memory = index_scene_memory(root, cfg, scenes_doc, scenes)
+        except cancellation.RunCancelled:
+            _emit("scene_memory", "cancelled", total)
+            return {"job_id": cfg.job_id, "stages": stage_status, "cancelled": True,
+                    "media_index": (root / "media_index.sqlite3").is_file(), "scene_memory": {}}
+        except Exception as exc:  # noqa: BLE001 - surfaced in the summary
+            _emit("scene_memory", "failed", total)
+            scene_memory = {"error": str(exc)}
+        else:
+            scene_memory = {
+                "visual_mode": memory["visual_mode"],
+                "identity_mode": memory["identity_mode"],
+                "story_mode": memory["story_mode"],
+                "semantic_mode": memory["semantic_mode"],
+            }
+            _emit("scene_memory", "ready", total)
+    else:
+        _emit("scene_memory", "skipped", total)
+
+    return {
+        "job_id": cfg.job_id,
+        "stages": stage_status,
+        "cancelled": False,
+        "media_index": (root / "media_index.sqlite3").is_file(),
+        "scene_memory": scene_memory,
+    }
+
+
 def job_status(root: Path) -> dict:
     """Return a serialisable summary for CLI/API callers."""
     manifest = load_manifest(root)
@@ -2061,7 +2847,7 @@ def job_status(root: Path) -> dict:
     # Tally stages by status. Zero-fill every known status so the shape is
     # stable for callers (the CLI `status` command prints this verbatim) and
     # sum(counts.values()) always equals the stage count.
-    counts = {status: 0 for status in ("pending", "running", "ready", "failed", "skipped")}
+    counts = {status: 0 for status in ("pending", "running", "ready", "failed", "skipped", "cancelled")}
     for stage in stages:
         counts[stage["status"]] = counts.get(stage["status"], 0) + 1
     return {
@@ -2122,7 +2908,7 @@ def approve_metadata(root: Path) -> dict:
         raise FileNotFoundError(f"{METADATA_NAME} missing - run the metadata stage first")
     meta = json.loads(path.read_text(encoding="utf-8"))
     meta["approved"] = True
-    path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+    _write_json(root, METADATA_NAME, meta)
     return meta
 
 
@@ -2155,7 +2941,7 @@ def update_script(root: Path, fields: dict) -> dict:
     if "notes" in fields and fields["notes"] is not None:
         script["notes"] = str(fields["notes"])
     script["approved"] = False
-    path.write_text(json.dumps(script, ensure_ascii=False, indent=2), encoding="utf-8")
+    _write_json(root, "script.json", script)
     _write_text(root, "script.md", _script_markdown(script))
     invalidate_downstream(root, "script")
     return script
@@ -2177,6 +2963,6 @@ def update_metadata(root: Path, fields: dict) -> dict:
         if key in fields and fields[key] is not None:
             meta[key] = fields[key]
     meta["approved"] = False
-    path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+    _write_json(root, METADATA_NAME, meta)
     invalidate_downstream(root, "metadata")
     return meta

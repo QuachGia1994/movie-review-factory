@@ -200,6 +200,21 @@ def test_transcript_writes_timed_segments_and_srt(tmp_path: Path, monkeypatch: p
     )
 
 
+def test_transcript_skips_when_source_has_no_audio(tmp_path: Path) -> None:
+    source = tmp_path / "silent-sample.mp4"
+    source.touch()
+    create_job(tmp_path, JobConfig(job_id="silent-job", source_video=source))
+    (tmp_path / "ingest.json").write_text(
+        json.dumps({"job_id": "silent-job", "has_audio": False}), encoding="utf-8"
+    )
+
+    from movie_review_factory.pipeline import _transcript
+
+    with pytest.raises(SkipStage, match="no audio track"):
+        _transcript(tmp_path, load_manifest(tmp_path))
+    assert not (tmp_path / "transcript.json").exists()
+
+
 def test_whisper_model_options_use_app_cache_and_offline_flags(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -259,8 +274,7 @@ def test_scenes_indexes_transcript_into_bounded_scenes(
     source = _scenes_job(tmp_path)
     import movie_review_factory.pipeline as pipeline
 
-    # transcript.json as produced by the transcript stage. Segment 4 ends past
-    # the true video duration and must be clamped to the probed bound.
+    # transcript.json as produced by the transcript stage. Segment 4 ends past the true video duration and must be clamped to the probed bound.
     transcript = {
         "job_id": "scenes-job",
         "source_video": str(source),
@@ -277,20 +291,26 @@ def test_scenes_indexes_transcript_into_bounded_scenes(
 
     artifacts, message = pipeline._scenes(tmp_path, load_manifest(tmp_path))
 
-    assert [a.name for a in artifacts] == ["scenes.json"]
-    assert message == "indexed 3 scenes from transcript"
+    assert [a.name for a in artifacts] == ["scenes.json", "media_index.sqlite3"]
+    assert message == "indexed 5 scenes from transcript"
     doc = json.loads((tmp_path / "scenes.json").read_text(encoding="utf-8"))
     assert doc["source_video"] == str(source)
     assert doc["duration_seconds"] == 10.0
-    assert doc["scene_count"] == 3
+    assert doc["scene_count"] == 5
     assert doc["scenes"] == [
         {"index": 1, "start_seconds": 0.0, "end_seconds": 2.0, "segment_count": 2, "text": "A B"},
-        {"index": 2, "start_seconds": 5.0, "end_seconds": 6.0, "segment_count": 1, "text": "C"},
-        {"index": 3, "start_seconds": 9.0, "end_seconds": 10.0, "segment_count": 1, "text": "D"},
+        {"index": 2, "start_seconds": 2.0, "end_seconds": 5.0, "segment_count": 0, "text": ""},
+        {"index": 3, "start_seconds": 5.0, "end_seconds": 6.0, "segment_count": 1, "text": "C"},
+        {"index": 4, "start_seconds": 6.0, "end_seconds": 9.0, "segment_count": 0, "text": ""},
+        {"index": 5, "start_seconds": 9.0, "end_seconds": 10.0, "segment_count": 1, "text": "D"},
     ]
     # Every timestamp stays within the probed video bounds.
     for scene in doc["scenes"]:
         assert 0.0 <= scene["start_seconds"] <= scene["end_seconds"] <= 10.0
+    from movie_review_factory.media_store import MediaStore
+    with MediaStore(tmp_path / "media_index.sqlite3") as store:
+        assert [shot.label for shot in store.list_shots()] == ["A B", "Scene 2", "C", "Scene 4", "D"]
+        assert [segment.text for segment in store.search_transcript("B")] == ["B"]
 
 
 def test_scenes_is_deterministic(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -322,12 +342,54 @@ def test_scenes_without_transcript_produces_single_bounded_scene(
     monkeypatch.setattr(pipeline, "_probe_duration_seconds", lambda src: 12.5)
     artifacts, _ = pipeline._scenes(tmp_path, load_manifest(tmp_path))
 
-    assert [a.name for a in artifacts] == ["scenes.json"]
+    assert [a.name for a in artifacts] == ["scenes.json", "media_index.sqlite3"]
     doc = json.loads((tmp_path / "scenes.json").read_text(encoding="utf-8"))
     assert doc["scene_count"] == 1
     assert doc["scenes"] == [
         {"index": 1, "start_seconds": 0.0, "end_seconds": 12.5, "segment_count": 0, "text": ""},
     ]
+
+
+def test_long_silent_source_has_bounded_scenes_and_distinct_section_ranges() -> None:
+    import movie_review_factory.pipeline as pipeline
+
+    scenes = pipeline._build_scenes([], 95.0)
+    assert [(item["start_seconds"], item["end_seconds"]) for item in scenes] == [
+        (0.0, 30.0), (30.0, 60.0), (60.0, 90.0), (90.0, 95.0),
+    ]
+    sections = [{"duration_seconds": 30}, {"duration_seconds": 30}]
+    ranges = pipeline._assign_source_clips(
+        sections, {"scenes": scenes, "duration_seconds": 95.0},
+    )
+    assert ranges[0] != ranges[1]
+    assert ranges[0]["start_seconds"] < ranges[1]["start_seconds"]
+
+
+def test_ten_minute_silent_source_assigns_distinct_shots_to_sections() -> None:
+    import movie_review_factory.pipeline as pipeline
+
+    scenes = pipeline._build_scenes([], 600.0)
+    assert len(scenes) == 20
+    sections = [{"duration_seconds": 80} for _ in range(6)]
+    assignments = pipeline._assign_source_shots(
+        sections, {"scenes": scenes, "duration_seconds": 600.0},
+    )
+    first = [shot[0]["start_seconds"] for shot in assignments[0]]
+    last = [shot[0]["start_seconds"] for shot in assignments[-1]]
+    assert first and last
+    assert max(first) < min(last)
+
+
+def test_silent_gap_between_speech_remains_selectable() -> None:
+    import movie_review_factory.pipeline as pipeline
+
+    scenes = pipeline._build_scenes([
+        {"start_seconds": 0, "end_seconds": 2, "text": "Opening"},
+        {"start_seconds": 80, "end_seconds": 82, "text": "Return"},
+    ], 95.0)
+    assert any(item["segment_count"] == 0 and item["start_seconds"] >= 2
+               and item["end_seconds"] <= 80 for item in scenes)
+    assert max(item["end_seconds"] - item["start_seconds"] for item in scenes) <= 30
 
 
 def test_create_job_resets_scenes_artifact(tmp_path: Path) -> None:
@@ -561,8 +623,7 @@ def test_create_job_resets_tts_artifacts(tmp_path: Path) -> None:
 # --- alignment stage --------------------------------------------------------
 
 
-# A captions.srt where cue 3 runs past the narration bound (5s) so alignment
-# must clamp it, and cue 4 starts past the bound so it must be dropped.
+# A captions.srt where cue 3 runs past the narration bound (5s) so alignment must clamp it, and cue 4 starts past the bound so it must be dropped.
 _SAMPLE_SRT = (
     "1\n00:00:00,000 --> 00:00:01,000\nXin chào\n\n"
     "2\n00:00:01,000 --> 00:00:02,500\nthế giới\n\n"
@@ -663,8 +724,7 @@ def test_alignment_clamps_and_drops_cues_within_bounds(
     _alignment_job(tmp_path)
     import movie_review_factory.pipeline as pipeline
 
-    # Narration is 5s long: cue 3 (4.0-6.0) clamps to 4.0-5.0, cue 4 (7.0-8.0)
-    # is entirely out of bounds and is dropped.
+    # Narration is 5s long: cue 3 (4.0-6.0) clamps to 4.0-5.0, cue 4 (7.0-8.0) is entirely out of bounds and is dropped.
     monkeypatch.setattr(pipeline, "_probe_duration_seconds", lambda src: 5.0)
 
     artifacts, message = pipeline._alignment(tmp_path, load_manifest(tmp_path))
@@ -782,8 +842,7 @@ def test_align_cues_drops_inverted_and_zero_length_cues() -> None:
 def test_alignment_parses_dot_separator_short_ms_and_multiline_text(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # The regex accepts '.' as the ms separator and 1-3 ms digits; multi-line
-    # cue text must survive as a single cue with lines joined by newlines.
+    # The regex accepts '.' as the ms separator and 1-3 ms digits; multi-line cue text must survive as a single cue with lines joined by newlines.
     srt = (
         "1\n00:00:00.5 --> 00:00:01.5\nline one\ncont\n\n"
         "2\n00:00:02.50 --> 00:00:03.500\nsecond\n"
@@ -1568,6 +1627,127 @@ def test_claude_scene_plan_uses_only_valid_indexed_scene_ranges(
     ]
 
 
+def test_scene_candidates_keep_relevant_distant_scene_and_silent_anchor() -> None:
+    import movie_review_factory.pipeline as pipeline_mod
+
+    scenes = pipeline_mod._build_scenes([], 600.0)
+    scenes[17]["text"] = "hidden lighthouse"
+    sections = [
+        {"title": "lighthouse", "narration": "hidden lighthouse", "duration_seconds": 30},
+        {"title": "quiet ending", "narration": "silence", "duration_seconds": 30},
+    ]
+    result = pipeline_mod._retrieve_scene_candidates(sections, {"scenes": scenes, "duration_seconds": 600.0})
+    assert len(result) == 2
+    assert all(1 <= len(items) <= 12 for items in result)
+    assert 18 in [item["index"] for item in result[0]]
+    assert 1 in [item["index"] for item in result[0]]
+    assert 20 in [item["index"] for item in result[1]]
+
+
+def test_scene_candidates_can_retrieve_visual_match_without_dialogue() -> None:
+    import movie_review_factory.pipeline as pipeline_mod
+
+    scenes = pipeline_mod._build_scenes([], 600.0)
+    scenes[15]["visual_description"] = "a red car races through a tunnel"
+    scenes[15]["visual_tags"] = ["red car", "tunnel"]
+    scenes[15]["visual_actions"] = ["racing"]
+    sections = [{
+        "title": "Red car chase",
+        "narration": "The car races through the tunnel",
+        "duration_seconds": 30,
+    }]
+
+    result = pipeline_mod._retrieve_scene_candidates(
+        sections, {"scenes": scenes, "duration_seconds": 600.0}
+    )
+
+    assert 16 in [item["index"] for item in result[0]]
+
+
+def test_semantic_vectors_can_promote_distant_scene_candidate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import movie_review_factory.pipeline as pipeline_mod
+    import movie_review_factory.semantic_search as semantic_search
+    from movie_review_factory.media_store import MediaStore
+    from movie_review_factory.models import MediaAsset, Shot
+
+    scenes = [
+        {"index": 1, "start_seconds": 0.0, "end_seconds": 10.0, "text": ""},
+        {"index": 2, "start_seconds": 10.0, "end_seconds": 20.0, "text": ""},
+        {"index": 3, "start_seconds": 20.0, "end_seconds": 30.0, "text": ""},
+    ]
+    database = tmp_path / "media_index.sqlite3"
+    with MediaStore(database) as store:
+        store.migrate()
+        store.replace_index(
+            MediaAsset(path=tmp_path / "owned.mp4", duration_seconds=30),
+            [
+                Shot(media_asset_id=1, start_seconds=scene["start_seconds"], end_seconds=scene["end_seconds"], label=f"Scene {scene['index']}")
+                for scene in scenes
+            ],
+            [],
+        )
+        shots = store.list_shots(1)
+        _, unrelated = semantic_search._as_blob([0.0, 1.0])
+        _, wanted = semantic_search._as_blob([1.0, 0.0])
+        store.replace_shot_embeddings([
+            (int(shots[0].id), "quiet room", "test-model", 2, unrelated),
+            (int(shots[1].id), "empty corridor", "test-model", 2, unrelated),
+            (int(shots[2].id), "fast automobile in storm", "test-model", 2, wanted),
+        ])
+
+    _, query = semantic_search._as_blob([1.0, 0.0])
+    monkeypatch.setattr(semantic_search, "model_name", lambda: "test-model")
+    monkeypatch.setattr(semantic_search, "embed_query", lambda text: (2, query))
+
+    lexical = [[scenes[0]]]
+    merged = pipeline_mod._merge_semantic_scene_candidates(
+        [{"title": "Vehicle chase", "narration": "automobile racing during bad weather"}],
+        scenes,
+        database,
+        lexical,
+    )
+
+    assert merged[0][0]["index"] == 3
+    assert {item["index"] for item in merged[0]} == {1, 2, 3}
+    assert all("candidate_score" in item for item in merged[0])
+
+
+def test_claude_scene_plan_limits_context_without_fake_visual_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import movie_review_factory.pipeline as pipeline_mod
+
+    source = tmp_path / "owned.mp4"
+    source.write_bytes(b"owned-video")
+    create_job(tmp_path, JobConfig(job_id="frame-agent", source_video=source, content_agent="claude"))
+    (tmp_path / "script.json").write_text(json.dumps({"sections": [
+        {"title": "Lighthouse", "narration": "lighthouse", "duration_seconds": 60},
+    ]}), encoding="utf-8")
+    scenes = pipeline_mod._build_scenes([], 600.0)
+    scenes[17]["text"] = "lighthouse"
+    (tmp_path / "scenes.json").write_text(json.dumps({
+        "source_video": str(source), "duration_seconds": 600.0, "scenes": scenes,
+    }), encoding="utf-8")
+    def fake_agent(**kwargs: object) -> dict:
+        groups = kwargs["context"]["scene_candidates"]
+        assert len(groups) == 1 and len(groups[0]) <= 12
+        assert 18 in [item["index"] for item in groups[0]]
+        assert all("frame_path" not in item for item in groups[0])
+        assert kwargs["allowed_tools"] == []
+        return {"assignments": [{"shots": [
+            {"start_scene_index": 18, "end_scene_index": 18, "rationale": "transcript match"},
+        ]}], "notes": "transcript evidence only"}
+
+    monkeypatch.setattr(pipeline_mod, "_run_reasoning_agent", fake_agent)
+    pipeline_mod._scene_plan(tmp_path, load_manifest(tmp_path))
+    plan = json.loads((tmp_path / "scene_plan.json").read_text(encoding="utf-8"))
+    assert plan["clips"][0]["source_clip"] == {"start_seconds": 510.0, "end_seconds": 540.0}
+    assert plan["clips"][0]["notes"] == "transcript match"
+    assert not list(tmp_path.glob("scene-evidence-*.jpg"))
+
+
 def test_claude_scene_plan_rejects_unknown_scene_index(tmp_path: Path) -> None:
     from movie_review_factory.pipeline import _agent_scene_assignments
 
@@ -1583,6 +1763,20 @@ def test_claude_scene_plan_rejects_unknown_scene_index(tmp_path: Path) -> None:
             [{"shots": [
                 {"start_scene_index": 1, "end_scene_index": 99, "rationale": "bad"}
             ]}],
+        )
+
+
+def test_claude_scene_plan_rejects_index_outside_section_candidates() -> None:
+    from movie_review_factory.pipeline import _agent_scene_assignments
+
+    scenes = [{"index": i, "start_seconds": (i - 1) * 10.0, "end_seconds": i * 10.0}
+              for i in range(1, 4)]
+    with pytest.raises(ValueError, match="outside.*candidates"):
+        _agent_scene_assignments(
+            [{"title": "first"}],
+            {"duration_seconds": 30.0, "scenes": scenes},
+            [{"shots": [{"start_scene_index": 2, "end_scene_index": 2, "rationale": "guess"}]}],
+            candidates=[[scenes[0], scenes[2]]],
         )
 
 
@@ -1623,15 +1817,18 @@ def test_scene_plan_source_clips_bounded_to_video_duration(
         assert sc["start_seconds"] < sc["end_seconds"]
 
 
+@pytest.mark.parametrize(("aspect_ratio", "dimensions"), [("16:9", (1280, 720)), ("9:16", (720, 1280))])
 def test_thumbnail_stage_generates_three_candidates_and_primary(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    aspect_ratio: str,
+    dimensions: tuple[int, int],
 ) -> None:
     import movie_review_factory.pipeline as pipeline_mod
 
     source = tmp_path / "owned.mp4"
     source.write_bytes(b"video")
-    create_job(tmp_path, JobConfig(job_id="thumb", source_video=source))
+    create_job(tmp_path, JobConfig(job_id="thumb", source_video=source, aspect_ratio=aspect_ratio))
     (tmp_path / "scene_plan.json").write_text(
         json.dumps({
             "clips": [
@@ -1666,7 +1863,8 @@ def test_thumbnail_stage_generates_three_candidates_and_primary(
     assert [Path(call[-1]).name for call in calls] == [
         "thumbnail-1.jpg", "thumbnail-2.jpg", "thumbnail-3.jpg"
     ]
-    assert all("scale=1280:720" in call[call.index("-vf") + 1] for call in calls)
+    width, height = dimensions
+    assert all(f"scale={width}:{height}" in call[call.index("-vf") + 1] for call in calls)
     for name in (
         "thumbnails.json", "thumbnail.jpg",
         "thumbnail-1.jpg", "thumbnail-2.jpg", "thumbnail-3.jpg",
@@ -1678,6 +1876,8 @@ def test_thumbnail_stage_generates_three_candidates_and_primary(
     assert data["primary_candidate"] == "thumbnail-2.jpg"
     assert data["primary_thumbnail"] == "thumbnail.jpg"
     assert data["title_hint"] == "Recap test"
+    assert (data["width"], data["height"]) == dimensions
+    assert all((item["width"], item["height"]) == dimensions for item in data["candidates"])
     assert [item["source_seconds"] for item in data["candidates"]] == [30.0, 50.0, 70.0]
     assert [artifact.name for artifact in artifacts] == [
         "thumbnails.json", "thumbnail-1.jpg", "thumbnail-2.jpg",
@@ -1789,7 +1989,51 @@ def test_load_manifest_upgrades_pre_thumbnail_jobs(tmp_path: Path) -> None:
         "movie_review_factory.pipeline", fromlist=["STAGES"]
     ).STAGES)
     assert upgraded.stage("thumbnail").status == "pending"
+    persisted = json.loads((tmp_path / "manifest.json").read_text(encoding="utf-8"))
+    assert [stage["stage"] for stage in persisted["stages"]] == list(__import__(
+        "movie_review_factory.pipeline", fromlist=["STAGES"]
+    ).STAGES)
     assert validate_job(tmp_path) == []
+
+
+def test_every_pipeline_stage_has_a_registered_handler() -> None:
+    import movie_review_factory.pipeline as pipeline_mod
+
+    assert set(pipeline_mod.STAGE_HANDLERS) == set(pipeline_mod.STAGES)
+
+
+def test_script_and_metadata_mutations_use_atomic_json_writer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import movie_review_factory.pipeline as pipeline_mod
+
+    create_job(tmp_path, JobConfig(job_id="atomic-writes"))
+    run_job(tmp_path, until="metadata")
+    original_write_json = pipeline_mod._write_json
+    writes: list[str] = []
+
+    def tracked_write_json(root: Path, name: str, data: dict) -> object:
+        writes.append(name)
+        return original_write_json(root, name, data)
+
+    monkeypatch.setattr(pipeline_mod, "_write_json", tracked_write_json)
+    pipeline_mod.approve_script(tmp_path)
+    assert writes == ["script.json"]
+
+    writes.clear()
+    pipeline_mod.update_script(tmp_path, {"notes": "revision"})
+    assert writes == ["script.json"]
+
+    run_job(tmp_path, until="metadata")
+    writes.clear()
+    pipeline_mod.approve_metadata(tmp_path)
+    assert writes == [pipeline_mod.METADATA_NAME]
+
+    writes.clear()
+    pipeline_mod.update_metadata(tmp_path, {"title": "Updated"})
+    assert writes == [pipeline_mod.METADATA_NAME]
+
 
 def test_claude_content_agent_drives_research_outline_and_script(
     tmp_path: Path,
@@ -1952,3 +2196,367 @@ def test_claude_script_section_mismatch_marks_stage_failed(
 
     assert manifest.stage("script").status == "failed"
     assert "section count" in manifest.stage("script").message
+
+
+def test_agy_content_agent_drives_research_outline_and_script(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import movie_review_factory.pipeline as pipeline_mod
+
+    calls: list[str] = []
+
+    def fake_agent(**kwargs: object) -> dict:
+        stage = str(kwargs["stage"])
+        calls.append(stage)
+        if stage == "research":
+            return {
+                "brief": "Nghiên cứu sinh qua AGY pool.",
+                "facts": ["Một sự kiện quan trọng."],
+                "sources": [],
+                "uncertainties": [],
+            }
+        if stage == "outline":
+            return {
+                "sections": [
+                    {"title": "Hook", "budget_minutes": 1, "purpose": "Mở vấn đề"},
+                    {"title": "Diễn biến", "budget_minutes": 2, "purpose": "Tóm tắt"},
+                    {"title": "Phân tích", "budget_minutes": 1, "purpose": "Bình luận"},
+                ],
+                "notes": "agy outline",
+            }
+        if stage == "script":
+            return {
+                "sections": [
+                    {"title": "Hook", "narration": "Mở đầu có nội dung thật."},
+                    {"title": "Diễn biến", "narration": "Phần diễn biến có nội dung thật."},
+                    {"title": "Phân tích", "narration": "Phần phân tích có nội dung thật."},
+                ],
+                "notes": "agy script",
+            }
+        raise AssertionError(stage)
+
+    def forbidden(**_: object) -> dict:
+        raise AssertionError("claude runner must not run for agy jobs")
+
+    monkeypatch.setattr(pipeline_mod, "run_agy_json", fake_agent)
+    monkeypatch.setattr(pipeline_mod, "run_claude_json", forbidden)
+
+    create_job(
+        tmp_path,
+        JobConfig(
+            job_id="agy-job",
+            language="vi",
+            target_minutes=5,
+            movie_title="Example Movie",
+            content_agent="agy",
+        ),
+    )
+    manifest = run_job(tmp_path, until="script")
+
+    assert calls == ["research", "outline", "script"]
+    assert manifest.stage("research").message == "research generated by AGY"
+    assert json.loads((tmp_path / "research.json").read_text(encoding="utf-8"))["generator"] == "agy"
+    assert json.loads((tmp_path / "outline.json").read_text(encoding="utf-8"))["generator"] == "agy"
+    script = json.loads((tmp_path / "script.json").read_text(encoding="utf-8"))
+    assert script["generator"] == "agy"
+    assert manifest.stage("script").message.startswith("script generated by AGY")
+
+
+def _fit_context_scenes(count: int = 47, repeats: int = 30) -> list[dict]:
+    return [
+        {
+            "index": index,
+            "start_seconds": index * 10.0,
+            "end_seconds": index * 10.0 + 10.0,
+            "text": f"scene {index} " + "mo ta noi dung canh " * repeats,
+        }
+        for index in range(count)
+    ]
+
+
+def test_fit_agy_context_leaves_small_context_untouched(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import movie_review_factory.pipeline as pipeline_mod
+
+    context = {"movie_title": "Example Movie", "scenes": [{"index": 0, "text": "ngan"}]}
+    original = json.dumps(context, ensure_ascii=False)
+
+    fitted, trimmed = pipeline_mod._fit_agy_context(context, 26000)
+
+    assert fitted is context
+    assert trimmed == 0
+    assert json.dumps(fitted, ensure_ascii=False) == original
+    assert "agy prompt trimmed" not in capsys.readouterr().out
+
+
+def test_fit_agy_context_trims_scenes_before_script_sections(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import movie_review_factory.pipeline as pipeline_mod
+
+    context = {
+        "movie_title": "Example Movie",
+        "language": "vi",
+        "target_minutes": 10,
+        "research": {"brief": "research brief giu nguyen"},
+        "scenes": _fit_context_scenes(),
+        "script_sections": [
+            {
+                "title": f"Section {index}",
+                "budget_minutes": 1.5,
+                "narration": "ke chuyen " * 100,
+                "duration_seconds": 90,
+            }
+            for index in range(6)
+        ],
+    }
+    original = json.dumps(context, ensure_ascii=False)
+    budget = len(original) - 8000
+
+    fitted, trimmed = pipeline_mod._fit_agy_context(context, budget)
+
+    assert len(json.dumps(fitted, ensure_ascii=False)) <= budget
+    assert trimmed > 0
+    # Tier A alone absorbed the cut: scenes keep every index, script and research stay whole.
+    assert len(fitted["scenes"]) == 47
+    assert [scene["index"] for scene in fitted["scenes"]] == [scene["index"] for scene in context["scenes"]]
+    assert all(isinstance(scene["start_seconds"], float) for scene in fitted["scenes"])
+    assert fitted["script_sections"] == context["script_sections"]
+    assert fitted["research"] == context["research"]
+    assert json.dumps(context, ensure_ascii=False) == original
+
+    import re
+
+    line = re.search(r"agy prompt trimmed: (\d+) -> (\d+) chars \((\d+) strings\)", capsys.readouterr().out)
+    assert line is not None
+    assert int(line.group(1)) == len(original)
+    assert int(line.group(2)) == len(json.dumps(fitted, ensure_ascii=False))
+    assert int(line.group(3)) == trimmed
+
+
+def test_fit_agy_context_script_sections_fallback_to_lower_floor() -> None:
+    import movie_review_factory.pipeline as pipeline_mod
+
+    context = {
+        "movie_title": "Example Movie",
+        "script_sections": [
+            {
+                "title": "Section 0",
+                "budget_minutes": 1.5,
+                "narration": "x" * 4000,
+                "duration_seconds": 90,
+            }
+        ],
+        "scene_candidates": [],
+    }
+    original = json.dumps(context, ensure_ascii=False)
+
+    fitted, trimmed = pipeline_mod._fit_agy_context(context, len(original) - 3600)
+    assert len(json.dumps(fitted, ensure_ascii=False)) <= len(original) - 3600
+    assert trimmed == 1
+    assert fitted["script_sections"][0]["narration"] == "x" * 400
+    assert list(fitted["script_sections"][0]) == ["title", "budget_minutes", "narration", "duration_seconds"]
+    assert fitted["script_sections"][0]["title"] == "Section 0"
+    assert fitted["script_sections"][0]["budget_minutes"] == 1.5
+    assert fitted["script_sections"][0]["duration_seconds"] == 90
+    assert fitted["scene_candidates"] == []
+    assert fitted["movie_title"] == "Example Movie"
+
+    deeper, deeper_trimmed = pipeline_mod._fit_agy_context(context, len(original) - 3800)
+    # One floor relaxation (400 -> 300), then the loop stops even though it is still over budget.
+    assert deeper_trimmed == 1
+    assert deeper["script_sections"][0]["narration"] == "x" * 300
+    assert len(json.dumps(deeper, ensure_ascii=False)) > len(original) - 3800
+    assert context["script_sections"][0]["narration"] == "x" * 4000
+
+
+def test_agy_prompt_budget_env_override(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import movie_review_factory.pipeline as pipeline_mod
+
+    monkeypatch.setenv("MRF_AGY_PROMPT_MAX", "12000")
+    assert pipeline_mod._agy_prompt_max() == 12000
+    monkeypatch.setenv("MRF_AGY_PROMPT_MAX", "not-a-number")
+    assert pipeline_mod._agy_prompt_max() == 26000
+    monkeypatch.setenv("MRF_AGY_PROMPT_MAX", "1500")
+    assert pipeline_mod._agy_prompt_max() == 26000
+    monkeypatch.delenv("MRF_AGY_PROMPT_MAX")
+    assert pipeline_mod._agy_prompt_max() == 26000
+
+    monkeypatch.setenv("MRF_AGY_PROMPT_MAX", "8000")
+    captured: dict = {}
+
+    def fake_agent(**kwargs: object) -> dict:
+        captured.update(kwargs)
+        return {"sections": [], "notes": ""}
+
+    monkeypatch.setattr(pipeline_mod, "run_agy_json", fake_agent)
+    create_job(
+        tmp_path,
+        JobConfig(
+            job_id="agy-budget",
+            language="vi",
+            target_minutes=5,
+            movie_title="Example Movie",
+            content_agent="agy",
+        ),
+    )
+    context = {"movie_title": "Example Movie", "scenes": _fit_context_scenes(count=30, repeats=17)}
+    untrimmed = len(json.dumps(context, ensure_ascii=False))
+    pipeline_mod._run_reasoning_agent(
+        root=tmp_path,
+        manifest=pipeline_mod.load_manifest(tmp_path),
+        stage="outline",
+        instruction="outline instruction",
+        context=context,
+        schema={},
+    )
+
+    prompt = str(captured["prompt"])
+    assert len(prompt) <= 8000
+    assert len(prompt) < untrimmed
+
+
+def test_claude_reasoning_agent_keeps_prompt_untrimmed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import movie_review_factory.pipeline as pipeline_mod
+
+    captured: dict = {}
+
+    def fake_agent(**kwargs: object) -> dict:
+        captured.update(kwargs)
+        return {"brief": "claude", "facts": [], "sources": [], "uncertainties": []}
+
+    monkeypatch.setattr(pipeline_mod, "run_claude_json", fake_agent)
+    monkeypatch.setenv("MRF_AGY_PROMPT_MAX", "4000")
+    create_job(
+        tmp_path,
+        JobConfig(
+            job_id="claude-budget",
+            language="vi",
+            target_minutes=5,
+            movie_title="Example Movie",
+            content_agent="claude",
+        ),
+    )
+    context = {
+        "movie_title": "Example Movie",
+        "scenes": _fit_context_scenes(),
+        "script_sections": [
+            {"title": "Section 0", "budget_minutes": 1.5, "narration": "ke chuyen " * 100}
+        ],
+    }
+    pipeline_mod._run_reasoning_agent(
+        root=tmp_path,
+        manifest=pipeline_mod.load_manifest(tmp_path),
+        stage="scene_plan",
+        instruction="scene plan instruction",
+        context=context,
+        schema={},
+    )
+
+    prompt = str(captured["prompt"])
+    assert prompt.endswith(json.dumps(context, ensure_ascii=False))
+    assert len(prompt) > 4000
+    assert "agy prompt trimmed" not in capsys.readouterr().out
+
+
+# --- roadmap #14: run_index (source-only background indexing) ----------------
+
+
+def _seed_indexable_job(tmp_path: Path, job_id: str = "idx", content_agent: str = "scaffold") -> Path:
+    """Create a job with a fake source and a pre-seeded (ready) transcript so
+    run_index can build the scene index deterministically without whisper."""
+    import movie_review_factory.pipeline as pipeline
+
+    source = tmp_path / "source.mp4"
+    source.write_bytes(b"fake-video-bytes")
+    pipeline.create_job(
+        tmp_path,
+        JobConfig(job_id=job_id, source_video=source, content_agent=content_agent),
+    )
+    (tmp_path / "transcript.json").write_text(
+        json.dumps({"segments": [
+            {"start_seconds": 0.0, "end_seconds": 2.0, "text": "a mysterious lighthouse"},
+            {"start_seconds": 2.0, "end_seconds": 4.0, "text": "waves crashing on rocks"},
+        ]}),
+        encoding="utf-8",
+    )
+    manifest = pipeline.load_manifest(tmp_path)
+    # Mark ingest+transcript ready so run_index reaches the scenes stage without
+    # a real video (ingest/whisper are covered by their own tests); run_index's
+    # own orchestration is what these tests exercise.
+    manifest.stage("ingest").mark("ready", "seeded ingest")
+    manifest.stage("transcript").mark("ready", "seeded transcript")
+    pipeline.save_manifest(tmp_path, manifest)
+    return source
+
+
+def test_run_index_builds_media_index_without_running_content(tmp_path: Path, monkeypatch) -> None:
+    import movie_review_factory.pipeline as pipeline
+
+    _seed_indexable_job(tmp_path)
+    monkeypatch.setattr(pipeline, "_probe_duration_seconds", lambda path: 10.0)
+
+    summary = pipeline.run_index(tmp_path)
+
+    assert summary["stages"]["scenes"] == "ready"
+    assert summary["stages"]["scene_memory"] == "skipped"  # scaffold: no AGY memory
+    assert summary["scene_memory"] == {}
+    assert summary["cancelled"] is False
+    assert summary["media_index"] is True
+    assert (tmp_path / "media_index.sqlite3").exists()
+    assert (tmp_path / "scenes.json").exists()
+
+    # Content stages must NOT run: they stay pending after indexing only.
+    by_stage = {s["stage"]: s["status"] for s in pipeline.job_status(tmp_path)["stages"]}
+    assert by_stage["research"] == "pending"
+    assert by_stage["outline"] == "pending"
+    assert by_stage["script"] == "pending"
+    assert by_stage["scene_plan"] == "pending"
+
+
+def test_run_index_reports_bounded_progress_and_is_idempotent(tmp_path: Path, monkeypatch) -> None:
+    import movie_review_factory.pipeline as pipeline
+
+    _seed_indexable_job(tmp_path)
+    monkeypatch.setattr(pipeline, "_probe_duration_seconds", lambda path: 10.0)
+
+    events: list[dict] = []
+    pipeline.run_index(tmp_path, progress=lambda ev: events.append(dict(ev)))
+
+    stages = [e["stage"] for e in events]
+    assert "scenes" in stages
+    assert stages[-1] == "scene_memory"
+    assert all(e["total"] == len(pipeline.INDEX_STAGES) + 1 for e in events)
+    assert all(1 <= e["index"] <= len(pipeline.INDEX_STAGES) + 1 for e in events)
+
+    # A second run is a no-op for already-ready stages (idempotent).
+    again = pipeline.run_index(tmp_path)
+    assert again["stages"]["scenes"] == "ready"
+    assert again["cancelled"] is False
+
+
+def test_run_index_honours_cancellation(tmp_path: Path, monkeypatch) -> None:
+    import threading
+
+    import movie_review_factory.cancellation as cancellation
+    import movie_review_factory.pipeline as pipeline
+
+    _seed_indexable_job(tmp_path)
+    monkeypatch.setattr(pipeline, "_probe_duration_seconds", lambda path: 10.0)
+
+    event = threading.Event()
+    event.set()  # already cancelled: the first checkpoint must stop the run
+    context = cancellation.CancellationContext(event)
+    with cancellation.cancellation_scope(context):
+        summary = pipeline.run_index(tmp_path)
+
+    assert summary["cancelled"] is True

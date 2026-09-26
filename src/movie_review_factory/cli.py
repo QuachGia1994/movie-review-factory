@@ -10,6 +10,7 @@ from .pipeline import (
     create_job,
     job_status,
     manifest_path,
+    run_index,
     run_job,
     validate_job,
 )
@@ -27,7 +28,7 @@ def init_job(
     movie_title: Optional[str] = None,
     content_agent: str = typer.Option(
         "scaffold",
-        help="Content generator for research/outline/script: scaffold or claude.",
+        help="Content generator for research/outline/script: scaffold, claude, or agy.",
     ),
 ):
     config = JobConfig(
@@ -69,6 +70,28 @@ def run(path: Path, force: bool = False, until: Optional[str] = None):
 
 
 @app.command()
+def index(path: Path, force: bool = False):
+    """Index a job's source (transcript, scenes, scene-memory) without content.
+
+    Runs only ingest -> transcript -> scenes plus visual/story/embedding
+    scene-memory (for claude/agy), building media_index.sqlite3. This is the
+    same work the background indexing queue performs after import (roadmap #14);
+    a later ``run`` reuses the cached index.
+    """
+    if not manifest_path(path).exists():
+        typer.echo("ERROR: manifest.json is missing (run init-job first)")
+        raise typer.Exit(1)
+    summary = run_index(path, force=force)
+    for stage, status in summary["stages"].items():
+        typer.echo(f"{stage:<12} {status}")
+    memory = summary.get("scene_memory") or {}
+    if memory:
+        typer.echo("scene_memory  " + ", ".join(f"{key}={value}" for key, value in memory.items()))
+    if any(status == "failed" for status in summary["stages"].values()):
+        raise typer.Exit(1)
+
+
+@app.command()
 def status(path: Path):
     """Show per-stage status for a job."""
     if not manifest_path(path).exists():
@@ -82,6 +105,31 @@ def status(path: Path):
         if s["message"]:
             line += f" - {s['message']}"
         typer.echo(line)
+
+
+@app.command("validate-scenes")
+def validate_scenes_cmd(
+    path: Path,
+    truth: Optional[Path] = typer.Option(
+        None,
+        "--truth",
+        help="Optional JSON ground truth with expected_scene_indexes per script section.",
+    ),
+    output: Optional[Path] = typer.Option(
+        None,
+        "--output",
+        help="Optional output path; defaults to <job>/scene_validation.json.",
+    ),
+):
+    """Compare lexical/visual scoring against semantic+identity scoring without rendering."""
+    from .scene_validation import write_validation_report
+
+    try:
+        report = write_validation_report(path, truth_path=truth, output=output)
+    except (FileNotFoundError, ValueError) as exc:
+        typer.echo(f"ERROR: {exc}")
+        raise typer.Exit(1) from exc
+    typer.echo(f"scene validation report: {report}")
 
 
 @app.command()

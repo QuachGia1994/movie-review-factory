@@ -5,7 +5,39 @@ All notable changes to Movie Review Factory are documented here.
 ## [Unreleased]
 
 ### Added
+- Background indexing queue (roadmap #14): `pipeline.run_index()` runs source-only indexing (ingest → transcript → scenes plus visual/story/embedding scene-memory for the AGY modes) decoupled from content generation, and the local web app now owns a single FIFO worker that indexes imported projects one at a time. Import returns immediately and auto-enqueues indexing (opt out with `MRF_AUTO_INDEX=0`), the dashboard shows live per-stage index progress while other projects stay usable, and Run/Delete/Stop cooperatively pre-empt or cancel a pending index. New `mrf index <job>` CLI command and `POST /jobs/{id}/index` endpoint trigger the same work; a later `run` reuses the cached index. `_scene_plan` now shares the extracted `index_scene_memory` helper, so its behaviour is unchanged.
+- Browser MP4 import with streamed upload progress, per-project source storage, and retry after failed import; direct `final.mp4` export after QA.
+- Project and artifact cards with individual and multi-select Delete actions, Choose all, count-based confirmation, active-job preflight, and partial filesystem-error reporting; external source footage stays untouched.
+- Media intelligence index: the `scenes` stage now writes a per-job `media_index.sqlite3` (SQLite STRICT tables + FTS5 full-text search over dialogue) covering the source asset, bounded scene shots including silent spans, and transcript segments, with idempotent numbered migrations.
+- Media Explorer dashboard panel (clipto-style): full-text search across dialogue and scenes, a browsable full transcript timeline with speaker labels, click-to-seek into the source video at the exact timecode, and on-demand scene thumbnails extracted via FFmpeg and cached per shot.
+- WebVTT transcript export: download the indexed transcript as `transcript.vtt` (web-native captions with speaker voice tags) straight from the Media Explorer, complementing the SRT captions the transcript stage already writes.
+- Transcript-backed chat and deterministic highlight suggestions, with on-demand 9:16 highlight clip export.
+- Persistent visual memory: AGY observations are stored per scene in SQLite/FTS5 with visible descriptions, tags, person labels, and actions; Media Explorer can search and display this visual evidence.
+- Cross-project Library Search for transcript and visual-index matches, with direct project/timecode navigation.
+- True multilingual semantic search using FastEmbed float32 embeddings and cosine similarity for scenes/transcript, with persisted model/dimension metadata and lexical fallback.
+- Anonymous cross-scene person continuity from the AGY pool (`Person 1`, `Person 2`, ...), persisted per shot without real-world identity inference.
+- Auditable scene-selection scoring v2 with semantic, visual, dialogue, anonymous-person, chronology, and diversity components plus repeat/adjacency penalties.
+- `mrf validate-scenes` comparison reports for lexical/visual versus semantic+identity retrieval, with optional per-section ground truth and hit-rate metrics.
+- Normalized story-memory graph storage for person/location/event/object entities, per-scene appearances, and grounded relations extracted through the four-account AGY pool.
+- `content_agent=agy` mode (`--content-agent agy`, CLI help `scaffold | claude | agy`): jobs can run research, outline, script, scene-plan, and chat through the local Aki AGY pool (four loopback role workers, `POST /run`) instead of Claude Code, failing over to the next role on quota exhaustion, a busy worker, or unusable output; the dashboard offers an `AGY pool` option. Overrides: `MRF_AGY_MODEL` (default `gemini-3.7-flash-medium`), `MRF_AGY_EFFORT` (`low|medium|high`, default `medium`), `MRF_AGY_TIMEOUT_SECONDS` (default `130`).
 - Opt-in live faster-whisper validation now proves CPU/int8 transcription, app-owned model caching, deterministic scene generation, and offline cache reuse on owned Vietnamese speech.
+- Per-project cooperative cancellation, Windows Claude process-tree termination, resumable cancelled state, stale-running restart recovery, stop API/dashboard control, and race-safe idempotent stop handling.
+- Incremental embeddings: migration `006_incremental_embeddings.sql` records `content_hash`/`embed_version` per shot/transcript embedding so unchanged records skip the embedder, with `{embedded, skipped, changed}` stats and version-bump re-embedding.
+- Clean-machine release gate `scripts/release_gate.py` with a 13-step checklist (fixture → ingest → transcript → scenes → search → content → tts → alignment → render → qa → export), offline mode, standalone no-repo-src mode, and a shipped VAD-visible speech fixture `data/raw/mrf-gate-speech.mp4` (the bundled sample's music bed scores zero under Silero VAD); `scripts/bench_ann.py` measures search latency for the ANN decision.
+
+### Changed
+- The dashboard now shows the next action after import, draft script, render, or QA; script and metadata fields reload when pipeline artifacts first appear.
+- Thumbnail generation now honors the job aspect ratio (1280x720 for 16:9, 720x1280 for 9:16).
+- Claude content-agent invocation passes tools through a single `--tools` flag (empty for non-research stages) instead of the removed `--allowed-tools` duplicate.
+- Source and final video previews stream with HTTP ranges and scoped media-session authorization; the token-protected dashboard shell opens before the fragment token is read, and malformed byte ranges are rejected before streaming. Media cache is cleared when its source index changes. Dialogue retrieval now ranks real words and returns no citation when no transcript matches.
+- Claude scene retrieval is now visual-index-first and semantic-aware: AGY inspects all bounded scenes, anonymous `Person N` continuity and story-memory links are built before embedding refresh, and scorer v2 reranks the full bounded scene set while keeping the 12-candidate context limit. Cached observations/tracks/story graph provide a grounded fallback when a later AGY pass is unavailable.
+- One-file packaging discovers numbered SQL migrations automatically instead of hard-coding a single migration; the full managed runtime now includes FastEmbed and an app-owned embedding-model cache with offline reuse.
+- Semantic search scores with exact numpy matrix math (chunked, pure-Python fallback when numpy is absent): `search_store` p95 on the real job index drops from ~128ms to ~1.2ms at 383 vectors with unchanged ranking, tie-breaks, and `-1.0` dim-mismatch/zero-norm parity.
+- AGY pool scheduler v2 (`pool_scheduler.py`): bounded retries with backoff (`MRF_AGY_RETRIES`, 0-3), a 300s role cooldown (`MRF_AGY_COOLDOWN_SECONDS`) that skips only the cooled-down role, partial resume via `ScheduleResult`, and per-role quota/health telemetry (status, latency_ms, cooldown_until) written to `%LOCALAPPDATA%\MovieReviewFactory\runtime\pool_health.json`. AGY prompts fit the measured ~26,000-char backend limit (`MRF_AGY_PROMPT_MAX`) with tiered scene/candidate context instead of failing the request.
+
+### Fixed
+- The transcript stage now skips with `source video has no audio track - nothing to transcribe` when the source container has no audio stream, instead of failing inside faster-whisper/PyAV with `tuple index out of range`.
+- Claude content-agent failures surface a bounded `head…tail` diagnostic (≤400 chars, no full stdout flood) and transient HTTP 429/5xx advisor errors are retried with `5×(attempt+1)` backoff instead of failing the stage on the first hiccup.
 
 ## [0.2.0] - 2026-09-23
 

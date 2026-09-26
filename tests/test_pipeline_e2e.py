@@ -88,8 +88,7 @@ def test_end_to_end_real_render_then_publish_gate(tmp_path: Path) -> None:
     )
     create_job(tmp_path, cfg)
 
-    # Text stages first, so script.json exists to approve (the gate TTS/render
-    # and publish require).
+    # Text stages first, so script.json exists to approve (the gate TTS/render and publish require).
     run_job(tmp_path, until="script")
     _approve(tmp_path, "script.json")
 
@@ -105,8 +104,7 @@ def test_end_to_end_real_render_then_publish_gate(tmp_path: Path) -> None:
     assert by_stage["render"].status == "ready", by_stage["render"].message
     final_mp4 = tmp_path / "final.mp4"
     assert final_mp4.exists() and final_mp4.stat().st_size > 0
-    # Real FFprobe QA validated the rendered file (qa raises if any check fails,
-    # so a ready qa stage is proof every check passed).
+    # Real FFprobe QA validated the rendered file (qa raises if any check fails, so a ready qa stage is proof every check passed).
     assert by_stage["qa"].status == "ready", by_stage["qa"].message
     assert (tmp_path / "qa.json").exists()
 

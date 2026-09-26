@@ -15,8 +15,7 @@ from __future__ import annotations
 
 import re
 
-# Canonical stage order lives in pipeline.STAGES; this dict must cover all of
-# them. tests/test_localization.py asserts the two stay in sync.
+# Canonical stage order lives in pipeline.STAGES; this dict must cover all of them. tests/test_localization.py asserts the two stay in sync.
 STAGE_LABELS: dict[str, str] = {
     "ingest": "Nạp nguồn",
     "research": "Nghiên cứu",
@@ -40,6 +39,7 @@ STATUS_LABELS: dict[str, str] = {
     "ready": "Hoàn tất",
     "failed": "Lỗi",
     "skipped": "Bỏ qua",
+    "cancelled": "Đã dừng",
 }
 
 # Short Vietnamese hint per status, used for badge tooltips in the UI.
@@ -49,6 +49,7 @@ STATUS_HINTS: dict[str, str] = {
     "ready": "Đã hoàn tất",
     "failed": "Đã xảy ra lỗi",
     "skipped": "Bỏ qua có chủ đích",
+    "cancelled": "Có thể nhấn Chạy để tiếp tục",
 }
 
 

@@ -7,8 +7,14 @@ __pycache__/
 output/
 jobs/
 data/cache/
-data/raw/
+data/raw/*
+!data/raw/mrf-gate-speech.mp4
+!data/raw/ultracode-smoke-sample.mp4
 *.mp4
 *.mkv
 *.mov
 *.avi
+
+# Ship release-gate fixtures (sample videos ignored above by *.mp4)
+!data/raw/mrf-gate-speech.mp4
+!data/raw/ultracode-smoke-sample.mp4

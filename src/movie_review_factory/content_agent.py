@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import time
 from pathlib import Path
 from typing import Any
+
+from . import cancellation
 
 
 class ContentAgentError(RuntimeError):
@@ -75,6 +78,72 @@ def _extract_structured_output(stdout: str) -> dict[str, Any]:
     raise ContentAgentError("Claude output did not contain structured_output")
 
 
+_API_STATUS_RE = re.compile(r'"api_error_status"\s*:\s*(\d{3})')
+
+
+def _coerce_status(raw: Any) -> int | None:
+    if isinstance(raw, bool):
+        return None
+    if isinstance(raw, int):
+        return raw
+    if isinstance(raw, str) and raw.strip().isdigit():
+        return int(raw.strip())
+    return None
+
+
+def _parse_envelope(stdout: str) -> dict[str, Any] | None:
+    try:
+        envelope = json.loads(stdout)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(envelope, dict):
+        return None
+    return envelope
+
+
+def _api_error_status(stdout: str) -> int | None:
+    """Return the API status from a Claude error envelope, JSON first, regex fallback."""
+    envelope = _parse_envelope(stdout)
+    if envelope is not None:
+        status = _coerce_status(envelope.get("api_error_status"))
+        if status is not None:
+            return status
+    match = _API_STATUS_RE.search(stdout or "")
+    if match:
+        return int(match.group(1))
+    return None
+
+
+def _is_transient_status(status: int | None) -> bool:
+    return status is not None and (status == 429 or 500 <= status < 600)
+
+
+def _api_failure_message(stdout: str) -> str | None:
+    """Surface only the actionable API fields, ignoring usage/telemetry noise."""
+    envelope = _parse_envelope(stdout)
+    if envelope is None:
+        return None
+    status = _coerce_status(envelope.get("api_error_status"))
+    result = envelope.get("result")
+    if status is None and not isinstance(result, str):
+        return None
+    if status is None:
+        return result
+    if isinstance(result, str) and result.strip():
+        return f"API {status}: {result}"
+    return f"API {status}"
+
+
+def _failure_detail(stdout: str, stderr: str) -> str:
+    detail = _api_failure_message(stdout)
+    if detail is None:
+        detail = stderr or stdout
+    detail = detail.replace("\n", " ").strip()
+    if len(detail) > 400:
+        detail = detail[:200] + " ... " + detail[-180:]
+    return detail
+
+
 def _resolve_executable() -> str:
     configured = os.environ.get("MRF_CLAUDE_BIN", "").strip()
     requested = configured or "claude"
@@ -99,6 +168,58 @@ def _effort() -> str:
     return value
 
 
+_OWNED_PROCESSES: dict[int, subprocess.Popen[str]] = {}
+
+
+def _track_process(process: subprocess.Popen[str]) -> None:
+    """Mark a process created here as an eligible Claude-tree target."""
+    pid = getattr(process, "pid", None)
+    if isinstance(pid, int) and pid > 0:
+        _OWNED_PROCESSES[pid] = process
+
+
+def _untrack_process(process: subprocess.Popen[str]) -> None:
+    pid = getattr(process, "pid", None)
+    if isinstance(pid, int) and _OWNED_PROCESSES.get(pid) is process:
+        _OWNED_PROCESSES.pop(pid, None)
+
+
+def _safe_owned_pid(process: subprocess.Popen[str]) -> int | None:
+    """Return the PID only when it is the exact child object created here."""
+    pid = getattr(process, "pid", None)
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        return None
+    if pid in {os.getpid(), os.getppid()}:
+        return None
+    if _OWNED_PROCESSES.get(pid) is not process:
+        return None
+    return pid
+
+
+def _terminate_process_tree(process: subprocess.Popen[str]) -> None:
+    """Terminate only a tracked Claude child tree; safe to call repeatedly."""
+    pid = _safe_owned_pid(process)
+    if pid is None or process.poll() is not None:
+        return
+    if os.name == "nt":
+        subprocess.run(
+            ["taskkill", "/PID", str(pid), "/T", "/F"],
+            capture_output=True,
+            check=False,
+            timeout=10,
+        )
+    else:
+        process.terminate()
+    try:
+        process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        # Revalidate before the direct fallback in case the object was untracked.
+        if _safe_owned_pid(process) is None:
+            return
+        process.kill()
+        process.wait(timeout=5)
+
+
 def run_claude_json(
     *,
     root: Path,
@@ -115,7 +236,7 @@ def run_claude_json(
     """
     executable = _resolve_executable()
     tools = list(dict.fromkeys(allowed_tools or []))
-    tool_spec = ",".join(tools)
+    tool_args = ["--tools", ",".join(tools)] if tools else ["--tools="]
 
     args = [
         executable,
@@ -124,8 +245,7 @@ def run_claude_json(
         "--strict-mcp-config",
         "--mcp-config",
         '{"mcpServers":{}}',
-        "--tools",
-        tool_spec,
+        *tool_args,
         "--output-format",
         "json",
         "--json-schema",
@@ -144,38 +264,76 @@ def run_claude_json(
     model = os.environ.get("MRF_CLAUDE_MODEL", "").strip()
     if model:
         args.extend(["--model", model])
-    if tools:
-        args.extend(["--allowed-tools", tool_spec])
 
     retries = _retry_count()
-    proc = None
+    completed: subprocess.CompletedProcess[str] | None = None
     for attempt in range(retries + 1):
+        cancellation.checkpoint()
+        creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) if os.name == "nt" else 0
+        process: subprocess.Popen[str] | None = None
+        context = cancellation.current_context()
+        attempt_prompt: str | None = prompt
         try:
-            proc = subprocess.run(
+            process = subprocess.Popen(
                 args,
-                input=prompt,
-                capture_output=True,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 text=True,
+                encoding="utf-8",
                 cwd=root,
-                timeout=_timeout_seconds(),
+                creationflags=creationflags,
             )
-            break
-        except subprocess.TimeoutExpired as exc:
-            if attempt >= retries:
-                raise ContentAgentError(
-                    f"Claude content agent timed out during {stage}"
-                ) from exc
-            time.sleep(min(1.0 + attempt, 2.0))
+            _track_process(process)
+            if context and context.register_process:
+                context.register_process(process)
+            deadline = time.monotonic() + _timeout_seconds()
+            while True:
+                cancellation.checkpoint()
+                try:
+                    stdout, stderr = process.communicate(input=attempt_prompt, timeout=0.1)
+                    completed = subprocess.CompletedProcess(args, process.returncode, stdout, stderr)
+                    break
+                except subprocess.TimeoutExpired:
+                    # Same Popen: stdin may already hold the prompt; never re-send.
+                    attempt_prompt = None
+                    if time.monotonic() >= deadline:
+                        _terminate_process_tree(process)
+                        if attempt >= retries:
+                            raise ContentAgentError(
+                                f"Claude content agent timed out during {stage}"
+                            )
+                        cancellation.cancellable_sleep(min(1.0 + attempt, 2.0))
+                        break
+            if completed is not None:
+                if (
+                    completed.returncode != 0
+                    and attempt < retries
+                    and _is_transient_status(_api_error_status(completed.stdout))
+                ):
+                    completed = None
+                    time.sleep(5 * (attempt + 1))
+                    continue
+                break
+        except cancellation.RunCancelled:
+            if process is not None:
+                _terminate_process_tree(process)
+            raise
         except OSError as exc:
             raise ContentAgentError(
                 f"could not launch Claude content agent during {stage}: {exc}"
             ) from exc
+        finally:
+            if process is not None:
+                if context and context.unregister_process:
+                    context.unregister_process(process)
+                _untrack_process(process)
 
-    assert proc is not None
-    if proc.returncode != 0:
-        detail = (proc.stderr or proc.stdout).strip().replace("\n", " ")
+    assert completed is not None
+    if completed.returncode != 0:
         raise ContentAgentError(
-            f"Claude content agent failed during {stage}: {detail[:400]}"
+            f"Claude content agent failed during {stage}: "
+            f"{_failure_detail(completed.stdout, completed.stderr)}"
         )
 
-    return _extract_structured_output(proc.stdout)
+    return _extract_structured_output(completed.stdout)

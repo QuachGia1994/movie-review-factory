@@ -1,5 +1,8 @@
 # Documentation index
 
+- [Media Explorer checkpoint](plan/media-explorer.md) — transcript/visual/vector indexes, anonymous cross-scene person tracks, cross-project Library Search, scene planning, range-streamed playback, and remaining live validation.
+- [Clipto parity roadmap](plan/clipto-roadmap.md) — ordered roadmap for validation, scorer v2, story memory, editing UX, indexing scale, AGY pool scheduling, and clean-Windows release gate.
+
 - [Agent workflow](AGENT_WORKFLOW.md) — reasoning-agent and deterministic media boundaries.
 - [References](REFERENCES.md) — external implementation references.
 - [Completed multi-clip visual plan](plan/done/multiclip-visual-plan.md) — multi-shot scene planning and exact-duration render contract.

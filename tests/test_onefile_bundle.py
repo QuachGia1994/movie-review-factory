@@ -51,11 +51,28 @@ def test_onefile_build_is_deterministic_and_resolves_placeholders() -> None:
     assert b"__MRF_BUNDLE__" not in first_bytes
     assert set(first["embeddedFiles"]) == {
         "movie_review_factory/__init__.py",
+        "movie_review_factory/agy_agent.py",
+        "movie_review_factory/agy_vision.py",
         "movie_review_factory/cli.py",
         "movie_review_factory/content_agent.py",
+        "movie_review_factory/cancellation.py",
+        "movie_review_factory/editor_ops.py",
         "movie_review_factory/localization.py",
+        "movie_review_factory/media_store.py",
+        "movie_review_factory/media_intelligence.py",
+        "movie_review_factory/migrations/__init__.py",
+        "movie_review_factory/migrations/001_media_intelligence.sql",
+        "movie_review_factory/migrations/002_visual_memory.sql",
+        "movie_review_factory/migrations/003_semantic_identity.sql",
+        "movie_review_factory/migrations/004_story_graph.sql",
+        "movie_review_factory/migrations/005_continuity_editor.sql",
+        "movie_review_factory/migrations/006_incremental_embeddings.sql",
         "movie_review_factory/models.py",
         "movie_review_factory/pipeline.py",
+        "movie_review_factory/pool_scheduler.py",
+        "movie_review_factory/scene_scoring.py",
+        "movie_review_factory/scene_validation.py",
+        "movie_review_factory/semantic_search.py",
         "movie_review_factory/webapp.py",
         "pyproject.toml",
     }
@@ -113,7 +130,10 @@ def test_onefile_contains_zero_install_bootstrap_contract() -> None:
     assert "https://api.github.com/repos/astral-sh/uv/releases/latest" in text
     assert "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip" in text
     assert "faster-whisper>=1.1,<2" in text
+    assert "fastembed>=0.7,<1" in text
     assert "edge-tts>=7,<8" in text
+    assert "MRF_EMBED_CACHE" in text
+    assert "MRF_EMBED_OFFLINE" in text
     assert "Node archive checksum mismatch" in text
     assert "uv archive checksum mismatch" in text
     assert "FFmpeg archive checksum mismatch" in text
@@ -261,7 +281,7 @@ def test_full_managed_runtime_bootstraps_then_reopens_without_network(
         [
             str(python_exe),
             "-c",
-            "import pydantic,typer,faster_whisper,edge_tts; print('ok')",
+            "import pydantic,typer,faster_whisper,fastembed,edge_tts; print('ok')",
         ],
         capture_output=True,
         text=True,

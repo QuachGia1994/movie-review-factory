@@ -5,11 +5,13 @@ jobs/smoke-test job, whose approval gate must stay untouched.
 """
 
 import importlib
+import io
 import json
 import os
 import threading
 import time
 import urllib.error
+from datetime import datetime, timezone
 import urllib.request
 from pathlib import Path
 
@@ -17,9 +19,11 @@ import pytest
 from typer.testing import CliRunner
 
 import movie_review_factory.pipeline as pipeline
+import movie_review_factory.semantic_search as semantic_search
 import movie_review_factory.webapp as webapp_mod
 from movie_review_factory.cli import app
-from movie_review_factory.models import JobConfig
+from movie_review_factory.media_store import MediaStore
+from movie_review_factory.models import CONTENT_AGENT_MODES, JobConfig, VisualObservation
 from movie_review_factory.webapp import JobsService, create_server
 
 runner = CliRunner()
@@ -64,6 +68,22 @@ def _job_with_thumbnails(jobs_root: Path, job_id: str = "thumbs") -> Path:
     return root
 
 
+def _job_with_media_index(jobs_root: Path, job_id: str = "media") -> Path:
+    root = jobs_root / job_id
+    source = root / "source.mp4"
+    source.parent.mkdir(parents=True, exist_ok=True)
+    source.write_bytes(b"source-video")
+    pipeline.create_job(root, JobConfig(job_id=job_id, source_video=source))
+    (root / "transcript.json").write_text(json.dumps({"segments": [{"start_seconds": 1.0, "end_seconds": 2.0, "text": "mysterious lighthouse"}]}), encoding="utf-8")
+    original_probe = pipeline._probe_duration_seconds
+    pipeline._probe_duration_seconds = lambda path: 10.0
+    try:
+        pipeline._scenes(root, pipeline.load_manifest(root))
+    finally:
+        pipeline._probe_duration_seconds = original_probe
+    return root
+
+
 def _mark_verified_render(root: Path, *, thumbnail_ready: bool = True) -> None:
     """Provide the publish gate with a verified final render without running media."""
     (root / "final.mp4").write_bytes(b"verified-video")
@@ -89,6 +109,16 @@ def test_create_job_status_is_localized(tmp_path: Path) -> None:
     assert by_stage["publish"]["stage_label"] == "Xuất bản"
     assert by_stage["ingest"]["status_label"] == "Chờ xử lý"
     assert status["approvals"]["metadata_present"] is False
+    assert status["has_media_index"] is False
+
+
+def test_webapp_uses_model_content_agent_modes(tmp_path: Path) -> None:
+    svc = JobsService(tmp_path)
+    for mode in CONTENT_AGENT_MODES:
+        svc.create_job({"job_id": f"mode-{mode}", "content_agent": mode})
+        assert pipeline.load_manifest(tmp_path / f"mode-{mode}").config.content_agent == mode
+    with pytest.raises(ValueError, match="content_agent"):
+        svc.create_job({"job_id": "mode-invalid", "content_agent": "invalid"})
 
 
 def test_create_job_persists_movie_title_and_content_agent(tmp_path: Path) -> None:
@@ -143,8 +173,7 @@ def test_status_remains_readable_while_run_persists_manifest(tmp_path: Path) -> 
 
     deadline = time.time() + 10
     while time.time() < deadline:
-        # Every concurrent read must succeed; discard a potentially stale
-        # snapshot once the worker has finished.
+        # Every concurrent read must succeed; discard a potentially stale snapshot once the worker has finished.
         if not svc.status("demo")["running"]:
             break
         time.sleep(0.01)
@@ -296,6 +325,183 @@ def test_thumbnail_artifacts_are_served_as_images() -> None:
     assert webapp_mod._artifact_kind("thumbnail.jpg") == "image"
 
 
+def test_media_explorer_searches_transcript_and_lists_shots(tmp_path: Path) -> None:
+    svc = JobsService(tmp_path)
+    _job_with_media_index(tmp_path)
+    listing = svc.media_explorer("media")
+    assert listing["present"] is True
+    assert listing["media_href"] == "/api/jobs/media/media/source"
+    assert listing["shots"][0]["start_seconds"] == 1.0
+    assert listing["shots"][0]["thumbnail_href"].endswith("/shots/1/thumbnail")
+    search = svc.media_explorer("media", "lighthouse")
+    assert [item["text"] for item in search["transcript"]] == ["mysterious lighthouse"]
+    assert [item["label"] for item in search["shots"]] == ["mysterious lighthouse"]
+
+
+def test_media_explorer_searches_persisted_visual_memory(tmp_path: Path) -> None:
+    svc = JobsService(tmp_path)
+    root = _job_with_media_index(tmp_path)
+    with MediaStore(root / "media_index.sqlite3") as store:
+        store.replace_visual_observations([
+            VisualObservation(
+                shot_id=1,
+                description="A red car races through a wet tunnel",
+                tags=["red car", "tunnel"],
+                people=[],
+                actions=["racing"],
+            )
+        ])
+
+    result = svc.media_explorer("media", "tunnel")
+
+    assert [item["id"] for item in result["shots"]] == [1]
+    assert result["shots"][0]["visual_description"] == "A red car races through a wet tunnel"
+    assert result["shots"][0]["visual_tags"] == ["red car", "tunnel"]
+    assert result["visual_count"] == 1
+
+
+def test_library_search_finds_visual_and_transcript_across_projects(tmp_path: Path) -> None:
+    svc = JobsService(tmp_path)
+    first = _job_with_media_index(tmp_path, "first")
+    second = _job_with_media_index(tmp_path, "second")
+    with MediaStore(first / "media_index.sqlite3") as store:
+        store.replace_visual_observations([
+            VisualObservation(
+                shot_id=1,
+                description="A red car races through a tunnel",
+                tags=["red car", "tunnel"],
+                actions=["racing"],
+            )
+        ])
+    with MediaStore(second / "media_index.sqlite3") as store:
+        store.replace_visual_observations([
+            VisualObservation(
+                shot_id=1,
+                description="A woman walks beside a lighthouse",
+                tags=["lighthouse"],
+                people=["woman"],
+                actions=["walking"],
+            )
+        ])
+
+    visual = svc.library_search("tunnel")
+    transcript = svc.library_search("lighthouse")
+
+    assert [(item["job_id"], item["kind"]) for item in visual["results"]] == [
+        ("first", "visual")
+    ]
+    assert {item["job_id"] for item in transcript["results"]} == {"first", "second"}
+    assert {item["kind"] for item in transcript["results"]} == {"visual", "transcript"}
+
+
+def test_media_explorer_uses_true_semantic_vector_hits_and_person_tracks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    svc = JobsService(tmp_path)
+    root = _job_with_media_index(tmp_path)
+    with MediaStore(root / "media_index.sqlite3") as store:
+        shots = store.list_shots(1)
+        assert len(shots) >= 2 and shots[0].id is not None and shots[1].id is not None
+        store.replace_person_tracks(
+            [{"label": "Person 1", "description": "red coat", "source": "agy"}],
+            [{"label": "Person 1", "shot_id": int(shots[0].id), "confidence": 0.95, "evidence": "same red coat"}],
+        )
+        _, car_blob = semantic_search._as_blob([1.0, 0.0])
+        _, other_blob = semantic_search._as_blob([0.0, 1.0])
+        store.replace_shot_embeddings([
+            (int(shots[0].id), "red vehicle in storm Person 1 red coat", "test-model", 2, car_blob),
+            (int(shots[1].id), "quiet empty room", "test-model", 2, other_blob),
+        ])
+
+    _, query_blob = semantic_search._as_blob([1.0, 0.0])
+    monkeypatch.setattr(semantic_search, "model_name", lambda: "test-model")
+    monkeypatch.setattr(semantic_search, "embed_query", lambda query: (2, query_blob))
+
+    result = svc.media_explorer("media", "automobile during bad weather")
+
+    assert result["semantic_mode"] == "fastembed"
+    assert result["shots"][0]["id"] == 1
+    assert result["shots"][0]["semantic_score"] == pytest.approx(1.0)
+    assert result["shots"][0]["person_tracks"] == ["Person 1"]
+
+
+def test_scene_reindex_and_invalidation_remove_derived_media_caches(tmp_path: Path) -> None:
+    root = _job_with_media_index(tmp_path)
+    cached = [root / "shot-1.jpg", root / "highlight-h-1.mp4", root / "transcript.vtt"]
+    for path in cached:
+        path.write_bytes(b"old")
+    original_probe = pipeline._probe_duration_seconds
+    pipeline._probe_duration_seconds = lambda path: 10.0
+    try:
+        pipeline._scenes(root, pipeline.load_manifest(root))
+    finally:
+        pipeline._probe_duration_seconds = original_probe
+    assert all(not path.exists() for path in cached)
+    for path in cached:
+        path.write_bytes(b"old")
+    pipeline.invalidate_downstream(root, "transcript")
+    assert all(not path.exists() for path in cached)
+
+
+def test_shot_thumbnail_is_cached(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    svc = JobsService(tmp_path)
+    _job_with_media_index(tmp_path)
+    calls = []
+    monkeypatch.setattr(pipeline.shutil, "which", lambda name: "ffmpeg.exe")
+    def fake_run(command, **kwargs):
+        calls.append(command)
+        Path(command[-1]).write_bytes(b"jpeg")
+    monkeypatch.setattr(pipeline.subprocess, "run", fake_run)
+    first = svc.shot_thumbnail_path("media", 1)
+    second = svc.shot_thumbnail_path("media", 1)
+    assert first == second
+    assert first.read_bytes() == b"jpeg"
+    assert len(calls) == 1
+
+
+def test_media_explorer_browses_full_transcript_without_query(tmp_path: Path) -> None:
+    svc = JobsService(tmp_path)
+    _job_with_media_index(tmp_path)
+    listing = svc.media_explorer("media")
+    # With no query the whole transcript timeline is browsable (clipto-style).
+    assert [item["text"] for item in listing["transcript"]] == ["mysterious lighthouse"]
+    assert listing["transcript_vtt_href"] == "/api/jobs/media/transcript.vtt"
+
+
+def test_transcript_export_renders_webvtt_with_speaker(tmp_path: Path) -> None:
+    from movie_review_factory.media_store import MediaStore
+    from movie_review_factory.models import MediaAsset, Shot, TranscriptSegment
+
+    svc = JobsService(tmp_path)
+    root = tmp_path / "vtt"
+    source = root / "source.mp4"
+    source.parent.mkdir(parents=True, exist_ok=True)
+    source.write_bytes(b"video")
+    pipeline.create_job(root, JobConfig(job_id="vtt", source_video=source))
+    with MediaStore(root / "media_index.sqlite3") as store:
+        store.migrate()
+        store.replace_index(
+            MediaAsset(path=source, duration_seconds=30),
+            [Shot(media_asset_id=1, start_seconds=0, end_seconds=5, label="Opening")],
+            [
+                TranscriptSegment(media_asset_id=1, start_seconds=1.5, end_seconds=3.25, text="Xin chào", speaker="Người dẫn"),
+                TranscriptSegment(media_asset_id=1, start_seconds=3.25, end_seconds=5.0, text="Hẹn gặp lại"),
+            ],
+        )
+    path = svc.transcript_export_path("vtt")
+    assert path.name == "transcript.vtt"
+    text = path.read_text(encoding="utf-8")
+    assert text.startswith("WEBVTT\n")
+    assert "00:00:01.500 --> 00:00:03.250" in text
+    assert "<v Người dẫn>Xin chào" in text
+    assert "Hẹn gặp lại" in text
+
+
+def test_vtt_is_served_as_subtitle_type() -> None:
+    assert webapp_mod._content_type("transcript.vtt") == "text/vtt; charset=utf-8"
+    assert webapp_mod._artifact_kind("transcript.vtt") == "subtitle"
+
+
 def test_thumbnail_service_selects_primary_and_invalidates_publish(tmp_path: Path) -> None:
     svc = JobsService(tmp_path)
     root = _job_with_thumbnails(tmp_path, "thumbs")
@@ -351,6 +557,42 @@ def test_http_index_and_job_lifecycle(tmp_path: Path) -> None:
             html = response.read().decode("utf-8")
         assert "Xưởng Review Phim" in html
         assert "Chọn ảnh bìa" in html
+        assert "Media Explorer" in html
+        assert 'class="media-workspace"' in html
+        assert 'class="sticky-player"' in html
+        assert 'role="tablist"' in html
+        assert 'data-media-filter="transcript"' in html
+        assert 'data-media-filter="scenes"' in html
+        assert 'data-media-filter="highlights"' in html
+        assert 'aria-label="Source media player"' in html
+        assert "prefers-reduced-motion: reduce" in html
+        assert "syncActiveTranscript" in html
+        assert "manualTranscriptScrollUntil" in html
+        assert "event.key === 'Enter' || event.key === ' '" in html
+        assert "↓ VTT" in html
+        assert 'id="sourceFile"' in html
+        assert 'id="sourceRetry"' in html
+        assert 'id="exportCard"' in html
+        assert 'id="deleteDialog"' in html
+        assert 'id="selectAllProjects"' in html
+        assert 'id="deleteSelectedBtn"' in html
+        assert 'id="librarySearch"' in html
+        assert 'id="librarySearchBtn"' in html
+        assert 'id="libraryPerson"' in html
+        assert 'id="librarySceneType"' in html
+        assert 'id="librarySource"' in html
+        assert 'id="libraryDateFrom"' in html
+        assert 'id="libraryDateTo"' in html
+        assert 'id="savedLibrarySearches"' in html
+        assert 'id="editorCard"' in html
+        assert 'id="autoBrollBtn"' in html
+        assert "/api/library-search?" in html
+        assert "/timeline" in html
+        assert "/regenerate" in html
+        assert "Find similar" in html
+        assert "pendingLibrarySeek" in html
+        assert "row.visual_description || row.label" in html
+        assert "className = 'project-card" in html
 
         status_code, created = _post_json(base + "/api/jobs", {"job_id": "demo"})
         assert status_code == 201
@@ -361,6 +603,189 @@ def test_http_index_and_job_lifecycle(tmp_path: Path) -> None:
 
         _, status = _get_json(base + "/api/jobs/demo")
         assert any(s["stage_label"] == "Xuất bản" for s in status["stages"])
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_http_library_search_returns_cross_project_visual_matches(tmp_path: Path) -> None:
+    first = _job_with_media_index(tmp_path, "first")
+    _job_with_media_index(tmp_path, "second")
+    with MediaStore(first / "media_index.sqlite3") as store:
+        store.replace_visual_observations([
+            VisualObservation(
+                shot_id=1,
+                description="A red car races through a wet tunnel",
+                tags=["red car", "tunnel"],
+                actions=["racing"],
+            )
+        ])
+
+    server, base = _serve(tmp_path)
+    try:
+        _, data = _get_json(base + "/api/library-search?q=tunnel")
+        assert data["query"] == "tunnel"
+        assert [(item["job_id"], item["kind"]) for item in data["results"]] == [
+            ("first", "visual")
+        ]
+        assert data["results"][0]["tags"] == ["red car", "tunnel"]
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_library_filters_alias_story_facets_and_saved_searches(tmp_path: Path) -> None:
+    root = _job_with_media_index(tmp_path, "facets")
+    with MediaStore(root / "media_index.sqlite3") as store:
+        store.migrate()
+        store.replace_visual_observations([
+            VisualObservation(
+                shot_id=1,
+                description="Person waits beside a red bag in hospital",
+                tags=["hospital"],
+                actions=["waiting"],
+            )
+        ])
+        store.replace_person_tracks(
+            [{"label": "Person 1", "description": "dark hair", "source": "agy"}],
+            [{
+                "label": "Person 1",
+                "shot_id": 1,
+                "description": "dark hair",
+                "clothing": "red coat",
+                "confidence": 0.91,
+                "evidence": "visible",
+            }],
+        )
+        store.set_person_alias("Person 1", "Nam")
+        store.replace_story_graph(
+            [
+                {"type": "person", "label": "Person 1", "description": "", "source": "agy"},
+                {"type": "location", "label": "Hospital", "description": "", "source": "agy"},
+                {"type": "object", "label": "Red bag", "description": "", "source": "agy"},
+            ],
+            [
+                {"type": "person", "label": "Person 1", "shot_id": 1, "confidence": 0.91, "evidence": ""},
+                {"type": "location", "label": "Hospital", "shot_id": 1, "confidence": 0.95, "evidence": ""},
+                {"type": "object", "label": "Red bag", "shot_id": 1, "confidence": 0.9, "evidence": ""},
+            ],
+            [],
+        )
+
+    svc = JobsService(tmp_path)
+    project_date = datetime.fromtimestamp(
+        pipeline.manifest_path(root).stat().st_mtime,
+        tz=timezone.utc,
+    ).date().isoformat()
+    result = svc.library_search("", {
+        "person": "Nam",
+        "action": "waiting",
+        "location": "hospital",
+        "object": "red bag",
+        "kind": "visual",
+        "source": "agy",
+        "scene_type": "Scene 1",
+        "date_from": project_date,
+        "date_to": project_date,
+        "min_confidence": "0.9",
+    })
+    assert [(item["job_id"], item["kind"]) for item in result["results"]] == [("facets", "visual")]
+    assert result["results"][0]["person_tracks"] == ["Nam"]
+    assert result["results"][0]["locations"] == ["Hospital"]
+    assert result["results"][0]["source"] == "agy"
+    assert result["results"][0]["project_date"] == project_date
+
+    transcript_only = svc.library_search("", {
+        "source": "transcript",
+        "date_from": project_date,
+        "date_to": project_date,
+    })
+    assert transcript_only["results"]
+    assert {item["kind"] for item in transcript_only["results"]} == {"transcript"}
+
+    saved = svc.save_search({
+        "name": "Hospital wait",
+        "query": 'person:"Nam" location:hospital',
+        "kind": "visual",
+        "source": "agy",
+        "date_from": project_date,
+        "date_to": project_date,
+    })
+    assert saved["search"]["name"] == "Hospital wait"
+    assert saved["search"]["source"] == "agy"
+    assert saved["search"]["date_from"] == project_date
+    assert svc.list_saved_searches()["searches"][0]["query"] == 'person:"Nam" location:hospital'
+
+    with pytest.raises(ValueError, match="valid YYYY-MM-DD"):
+        svc.library_search("", {"date_from": "2026-99-99"})
+
+
+def test_http_saved_search_and_continuity_routes(tmp_path: Path) -> None:
+    root = _job_with_media_index(tmp_path, "continuity")
+    with MediaStore(root / "media_index.sqlite3") as store:
+        store.migrate()
+        store.replace_person_tracks(
+            [{"label": "Person 1", "description": "dark hair", "source": "agy"}],
+            [{"label": "Person 1", "shot_id": 1, "confidence": 0.9, "evidence": "visible"}],
+        )
+    server, base = _serve(tmp_path)
+    try:
+        status, saved = _post_json(base + "/api/library-searches", {
+            "name": "Lighthouse",
+            "query": "lighthouse",
+        })
+        assert status == 201
+        _, searches = _get_json(base + "/api/library-searches")
+        assert searches["searches"][0]["name"] == "Lighthouse"
+
+        _, tracks = _get_json(base + "/api/jobs/continuity/person-tracks")
+        assert tracks["tracks"][0]["label"] == "Person 1"
+        _, aliased = _post_json(
+            base + "/api/jobs/continuity/person-tracks/Person%201/alias",
+            {"alias": "Nam"},
+        )
+        assert aliased["track"]["alias"] == "Nam"
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_http_timeline_editor_routes(tmp_path: Path) -> None:
+    root = _job_with_media_index(tmp_path, "editor")
+    (root / "script.json").write_text(json.dumps({
+        "sections": [{"title": "Opening", "narration": "mysterious lighthouse", "duration_seconds": 10}]
+    }), encoding="utf-8")
+    (root / "scene_plan.json").write_text(json.dumps({
+        "total_seconds": 10,
+        "clips": [{
+            "section": "Opening",
+            "section_index": 1,
+            "shot_index": 1,
+            "shot_count": 1,
+            "start_seconds": 0,
+            "duration_seconds": 10,
+            "source_clip": {"start_seconds": 0, "end_seconds": 10},
+            "notes": "",
+        }],
+    }), encoding="utf-8")
+    manifest = pipeline.load_manifest(root)
+    manifest.stage("scene_plan").mark("ready", "ready")
+    pipeline.save_manifest(root, manifest)
+
+    server, base = _serve(tmp_path)
+    try:
+        _, current = _get_json(base + "/api/jobs/editor/timeline")
+        assert current["clips"][0]["locked"] is False
+        _, edited = _post_json(
+            base + "/api/jobs/editor/timeline",
+            {"action": "lock", "clip_index": 0, "locked": True},
+        )
+        assert edited["clips"][0]["locked"] is True
+        _, regen = _post_json(
+            base + "/api/jobs/editor/sections/1/regenerate",
+            {"instruction": "lighthouse"},
+        )
+        assert regen["section_index"] == 1
     finally:
         server.shutdown()
         server.server_close()
@@ -389,6 +814,59 @@ def test_http_artifact_supports_range(tmp_path: Path) -> None:
             assert response.status == 206
             assert response.headers["Accept-Ranges"] == "bytes"
             assert len(response.read()) == 4
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_http_invalid_range_rejected_before_streaming(tmp_path: Path) -> None:
+    _job_with_media_index(tmp_path)
+    server, base = _serve(tmp_path)
+    try:
+        for raw in ("bytes=-1-", "bytes=-5-10", "bytes=0--1", "bytes=-"):
+            request = urllib.request.Request(
+                base + "/api/jobs/media/media/source", headers={"Range": raw},
+            )
+            with pytest.raises(urllib.error.HTTPError) as exc:
+                urllib.request.urlopen(request, timeout=5)
+            assert exc.value.code == 416
+            assert exc.value.headers["Content-Range"] == "bytes */12"
+        tail = urllib.request.Request(
+            base + "/api/jobs/media/media/source", headers={"Range": "bytes=-4"},
+        )
+        with urllib.request.urlopen(tail, timeout=5) as response:
+            assert response.status == 206
+            assert response.read() == b"ideo"
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_http_media_explorer_and_source_routes(tmp_path: Path) -> None:
+    _job_with_media_index(tmp_path)
+    server, base = _serve(tmp_path)
+    try:
+        status, listing = _get_json(base + "/api/jobs/media/media-explorer?q=lighthouse")
+        assert status == 200
+        assert listing["transcript"][0]["text"] == "mysterious lighthouse"
+        with urllib.request.urlopen(base + "/api/jobs/media/media/source", timeout=5) as response:
+            assert response.status == 200
+            assert response.read() == b"source-video"
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_http_transcript_vtt_route(tmp_path: Path) -> None:
+    _job_with_media_index(tmp_path)
+    server, base = _serve(tmp_path)
+    try:
+        with urllib.request.urlopen(base + "/api/jobs/media/transcript.vtt", timeout=5) as response:
+            assert response.status == 200
+            assert response.headers["Content-Type"] == "text/vtt; charset=utf-8"
+            body = response.read().decode("utf-8")
+        assert body.startswith("WEBVTT")
+        assert "mysterious lighthouse" in body
     finally:
         server.shutdown()
         server.server_close()
@@ -554,6 +1032,21 @@ def test_auth_required_when_token_set(tmp_path: Path) -> None:
         _restore_token(server, orig)
 
 
+def test_token_mode_serves_public_shell_then_protects_api(tmp_path: Path) -> None:
+    server, base, orig = _serve_with_token(tmp_path, "s3cr3t")
+    try:
+        with urllib.request.urlopen(base + "/#token=s3cr3t", timeout=5) as response:
+            html = response.read().decode("utf-8")
+            assert response.status == 200
+            assert "Xưởng Review Phim" in html
+            assert "s3cr3t" not in html
+        with pytest.raises(urllib.error.HTTPError) as exc:
+            urllib.request.urlopen(base + "/api/jobs", timeout=5)
+        assert exc.value.code == 401
+    finally:
+        _restore_token(server, orig)
+
+
 def test_auth_passes_with_correct_token(tmp_path: Path) -> None:
     server, base, orig = _serve_with_token(tmp_path, "s3cr3t")
     try:
@@ -563,6 +1056,36 @@ def test_auth_passes_with_correct_token(tmp_path: Path) -> None:
         )
         with urllib.request.urlopen(req, timeout=5) as resp:
             assert resp.status == 200
+    finally:
+        _restore_token(server, orig)
+
+
+def test_authenticated_video_uses_range_streaming_cookie(tmp_path: Path) -> None:
+    _job_with_media_index(tmp_path)
+    server, base, orig = _serve_with_token(tmp_path, "s3cr3t")
+    try:
+        index_request = urllib.request.Request(
+            base + "/api/jobs/media/media-explorer",
+            headers={"Authorization": "Bearer s3cr3t"},
+        )
+        with urllib.request.urlopen(index_request, timeout=5) as response:
+            cookie = response.headers.get("Set-Cookie")
+            assert cookie and "HttpOnly" in cookie and "SameSite=Strict" in cookie
+        source = base + "/api/jobs/media/media/source"
+        with pytest.raises(urllib.error.HTTPError) as exc:
+            urllib.request.urlopen(source, timeout=5)
+        assert exc.value.code == 401
+        stream = urllib.request.Request(
+            source, headers={"Cookie": cookie.split(";", 1)[0], "Range": "bytes=0-3"},
+        )
+        with urllib.request.urlopen(stream, timeout=5) as response:
+            assert response.status == 206
+            assert response.headers["Content-Range"] == "bytes 0-3/12"
+            assert response.read() == b"sour"
+        jobs = urllib.request.Request(base + "/api/jobs", headers={"Cookie": cookie.split(";", 1)[0]})
+        with pytest.raises(urllib.error.HTTPError) as exc:
+            urllib.request.urlopen(jobs, timeout=5)
+        assert exc.value.code == 401
     finally:
         _restore_token(server, orig)
 
@@ -595,6 +1118,193 @@ def test_no_auth_when_token_absent(tmp_path: Path) -> None:
         webapp_mod._DASHBOARD_TOKEN = orig
 
 
+def test_import_video_streams_into_owned_job_and_rejects_invalid_input(tmp_path: Path) -> None:
+    svc = JobsService(tmp_path)
+    svc.create_job({"job_id": "imported"})
+    data = b"clip" * 300_000
+    status = svc.import_video("imported", "scene.mp4", len(data), io.BytesIO(data))
+    source = tmp_path / "imported" / "source.mp4"
+    assert source.read_bytes() == data
+    assert pipeline.load_manifest(source.parent).config.source_video == source
+    assert status["has_source_video"] is True
+    assert "source.mp4" in {a["name"] for a in status["artifacts"]}
+    with pytest.raises(FileExistsError):
+        svc.import_video("imported", "again.mp4", 4, io.BytesIO(b"new!"))
+    assert source.read_bytes() == data
+
+    svc.create_job({"job_id": "empty"})
+    with pytest.raises(ValueError):
+        svc.import_video("empty", "scene.mp4", 0, io.BytesIO())
+    with pytest.raises(ValueError):
+        svc.import_video("empty", "scene.txt", 4, io.BytesIO(b"nope"))
+    with pytest.raises(ValueError):
+        svc.import_video("empty", "scene.mp4", 5, io.BytesIO(b"tiny"))
+    assert not (tmp_path / "empty" / "source.mp4").exists()
+    assert pipeline.load_manifest(tmp_path / "empty").config.source_video is None
+
+
+def test_import_can_retry_when_manifest_save_fails(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    svc = JobsService(tmp_path)
+    svc.create_job({"job_id": "retry"})
+    original = pipeline.save_manifest
+    def fail_once(root, manifest):
+        monkeypatch.setattr(pipeline, "save_manifest", original)
+        raise OSError("disk error")
+    monkeypatch.setattr(pipeline, "save_manifest", fail_once)
+    with pytest.raises(OSError):
+        svc.import_video("retry", "source.mp4", 4, io.BytesIO(b"data"))
+    assert not (tmp_path / "retry" / "source.mp4").exists()
+    assert svc.import_video("retry", "source.mp4", 4, io.BytesIO(b"data"))["has_source_video"]
+
+
+def test_http_import_and_delete_project_are_authenticated(tmp_path: Path) -> None:
+    server, base, orig = _serve_with_token(tmp_path, "s3cr3t")
+    try:
+        headers = {"Authorization": "Bearer s3cr3t"}
+        create = urllib.request.Request(
+            base + "/api/jobs", data=b'{"job_id":"browser"}', method="POST",
+            headers={**headers, "Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(create, timeout=5) as response:
+            assert response.status == 201
+        data = b"owned-movie" * 200_000
+        upload = urllib.request.Request(
+            base + "/api/jobs/browser/source", data=data, method="POST",
+            headers={**headers, "X-Source-Name": "movie.mp4", "Content-Type": "video/mp4"},
+        )
+        with pytest.raises(urllib.error.HTTPError) as exc:
+            urllib.request.urlopen(urllib.request.Request(
+                base + "/api/jobs/browser/source", data=b"tiny", method="POST",
+                headers={"X-Source-Name": "movie.mp4"},
+            ), timeout=5)
+        assert exc.value.code == 401
+        with urllib.request.urlopen(upload, timeout=10) as response:
+            assert response.status == 200
+            assert json.load(response)["has_source_video"] is True
+        assert (tmp_path / "browser" / "source.mp4").read_bytes() == data
+
+        wrong = urllib.request.Request(
+            base + "/api/jobs/browser", data=b'{"confirm":"other"}', method="DELETE",
+            headers={**headers, "Content-Type": "application/json"},
+        )
+        with pytest.raises(urllib.error.HTTPError) as exc:
+            urllib.request.urlopen(wrong, timeout=5)
+        assert exc.value.code == 400
+        assert (tmp_path / "browser" / "manifest.json").exists()
+        delete = urllib.request.Request(
+            base + "/api/jobs/browser", data=b'{"confirm":"browser"}', method="DELETE",
+            headers={**headers, "Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(delete, timeout=5) as response:
+            assert response.status == 200
+            assert json.load(response)["deleted"] is True
+        assert not (tmp_path / "browser").exists()
+        with pytest.raises(urllib.error.HTTPError) as exc:
+            urllib.request.urlopen(delete, timeout=5)
+        assert exc.value.code == 404
+    finally:
+        _restore_token(server, orig)
+
+
+def test_delete_refuses_running_project(tmp_path: Path) -> None:
+    svc = JobsService(tmp_path)
+    svc.create_job({"job_id": "busy"})
+    with svc._lock:
+        svc._runs["busy"] = {"running": True}
+    with pytest.raises(RuntimeError, match="đang chạy"):
+        svc.delete_job("busy", "busy")
+    assert (tmp_path / "busy" / "manifest.json").exists()
+
+
+def test_delete_selected_projects_preflights_all_and_preserves_unselected(tmp_path: Path) -> None:
+    svc = JobsService(tmp_path)
+    for name in ("alpha", "beta", "keep"):
+        svc.create_job({"job_id": name})
+    (tmp_path / "alpha" / "source.mp4").write_bytes(b"owned")
+    result = svc.delete_jobs(["alpha", "beta"], "XOA 2")
+    assert result == {"deleted": ["alpha", "beta"], "failed": None}
+    assert not (tmp_path / "alpha").exists()
+    assert not (tmp_path / "beta").exists()
+    assert (tmp_path / "keep" / "manifest.json").exists()
+
+
+def test_delete_selected_rejects_bad_confirmation_duplicate_missing_or_busy_before_deletion(tmp_path: Path) -> None:
+    svc = JobsService(tmp_path)
+    for name in ("alpha", "beta"):
+        svc.create_job({"job_id": name})
+    with pytest.raises(ValueError):
+        svc.delete_jobs(["alpha", "beta"], "XOA 1")
+    with pytest.raises(ValueError):
+        svc.delete_jobs(["alpha", "alpha"], "XOA 2")
+    with pytest.raises(ValueError):
+        svc.delete_jobs([], "XOA 0")
+    with pytest.raises(FileNotFoundError):
+        svc.delete_jobs(["alpha", "missing"], "XOA 2")
+    with svc._lock:
+        svc._runs["beta"] = {"running": True}
+    with pytest.raises(RuntimeError, match="đang chạy"):
+        svc.delete_jobs(["alpha", "beta"], "XOA 2")
+    assert all((tmp_path / name / "manifest.json").exists() for name in ("alpha", "beta"))
+
+
+def test_bulk_delete_reports_partial_io_failure_and_stops(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    svc = JobsService(tmp_path)
+    for name in ("alpha", "beta", "gamma"):
+        svc.create_job({"job_id": name})
+    original = webapp_mod.shutil.rmtree
+    def remove(root):
+        if root.name == "beta":
+            raise PermissionError("locked")
+        return original(root)
+    monkeypatch.setattr(webapp_mod.shutil, "rmtree", remove)
+    result = svc.delete_jobs(["alpha", "beta", "gamma"], "XOA 3")
+    assert result == {"deleted": ["alpha"], "failed": "beta"}
+    assert (tmp_path / "beta" / "manifest.json").exists()
+    assert (tmp_path / "gamma" / "manifest.json").exists()
+
+
+def test_http_bulk_delete_requires_token_and_count_confirmation(tmp_path: Path) -> None:
+    svc = JobsService(tmp_path)
+    svc.create_job({"job_id": "alpha"})
+    svc.create_job({"job_id": "beta"})
+    server, base, orig = _serve_with_token(tmp_path, "bulk-token")
+    try:
+        body = json.dumps({"job_ids": ["alpha", "beta"], "confirm": "XOA 2"}).encode()
+        unauthorized = urllib.request.Request(
+            base + "/api/jobs", data=body, method="DELETE",
+            headers={"Content-Type": "application/json"},
+        )
+        with pytest.raises(urllib.error.HTTPError) as exc:
+            urllib.request.urlopen(unauthorized, timeout=5)
+        assert exc.value.code == 401
+        authorized = urllib.request.Request(
+            base + "/api/jobs", data=body, method="DELETE",
+            headers={"Content-Type": "application/json", "Authorization": "Bearer bulk-token"},
+        )
+        with urllib.request.urlopen(authorized, timeout=5) as response:
+            assert response.status == 200
+            assert json.load(response)["deleted"] == ["alpha", "beta"]
+        assert not (tmp_path / "alpha").exists()
+        assert not (tmp_path / "beta").exists()
+    finally:
+        _restore_token(server, orig)
+
+
+def test_delete_refuses_symlink(tmp_path: Path) -> None:
+    svc = JobsService(tmp_path)
+    outside = tmp_path.parent / (tmp_path.name + "-external")
+    outside.mkdir()
+    (outside / "manifest.json").write_text("sentinel", encoding="utf-8")
+    link = tmp_path / "link"
+    try:
+        link.symlink_to(outside, target_is_directory=True)
+    except OSError:
+        pytest.skip("Windows symlink privilege unavailable")
+    with pytest.raises(ValueError):
+        svc.delete_job("link", "link")
+    assert (outside / "manifest.json").read_text(encoding="utf-8") == "sentinel"
+
+
 def test_oversized_body_returns_413(tmp_path: Path) -> None:
     server, base = _serve(tmp_path)
     try:
@@ -617,8 +1327,7 @@ def test_unexpected_exception_hides_details(tmp_path: Path) -> None:
     """When auth is on, unhandled exceptions return generic 500 without stack text."""
     server, base, orig = _serve_with_token(tmp_path, "tok")
     try:
-        # Trigger a 500 by pointing at a job that exists structurally but
-        # whose jobs_root we corrupt right after creation.
+        # Trigger a 500 by pointing at a job that exists structurally but whose jobs_root we corrupt right after creation.
         req_create = urllib.request.Request(
             base + "/api/jobs",
             data=json.dumps({"job_id": "boom"}).encode(),
@@ -656,3 +1365,200 @@ def test_auth_header_not_required_on_html_page_without_token(tmp_path: Path) -> 
         server.shutdown()
         server.server_close()
         webapp_mod._DASHBOARD_TOKEN = orig
+
+
+def test_content_agent_select_offers_agy_pool() -> None:
+    assert '<option value="agy">AGY pool (research → outline → script)</option>' in webapp_mod.INDEX_HTML
+
+
+# --- roadmap #14: background indexing queue ---------------------------------
+
+
+def _wait_until(predicate, timeout: float = 5.0, interval: float = 0.02) -> bool:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if predicate():
+            return True
+        time.sleep(interval)
+    return bool(predicate())
+
+
+def _fake_index_summary(job_id: str) -> dict:
+    return {
+        "job_id": job_id,
+        "stages": {"transcript": "ready", "scenes": "ready", "scene_memory": "skipped"},
+        "cancelled": False,
+        "media_index": True,
+        "scene_memory": {},
+    }
+
+
+def _sourced_job(svc: JobsService, jobs_root: Path, job_id: str) -> Path:
+    root = jobs_root / job_id
+    pipeline.create_job(root, JobConfig(job_id=job_id, source_video=(root / "source.mp4")))
+    (root / "source.mp4").write_bytes(b"video-bytes")
+    return root
+
+
+def test_enqueue_index_runs_in_background_and_reports_progress(tmp_path: Path, monkeypatch) -> None:
+    calls: list[str] = []
+    finished = threading.Event()
+
+    def fake_run_index(root, *, force=False, progress=None):
+        calls.append(Path(root).name)
+        if progress is not None:
+            progress({"stage": "scenes", "status": "running", "index": 3, "total": 4})
+        finished.set()
+        return _fake_index_summary(Path(root).name)
+
+    monkeypatch.setattr(pipeline, "run_index", fake_run_index)
+    svc = JobsService(tmp_path)
+    _sourced_job(svc, tmp_path, "job1")
+
+    result = svc.enqueue_index("job1")
+    assert result["queued"] is True and result["already"] is False
+
+    assert finished.wait(5.0)
+    assert calls == ["job1"]
+    # The worker releases the job from the registry once indexing completes.
+    assert _wait_until(lambda: svc.index_state("job1") is None)
+    assert svc.status("job1")["is_indexing"] is False
+
+
+def test_enqueue_index_is_idempotent_while_queued(tmp_path: Path, monkeypatch) -> None:
+    release = threading.Event()
+    started = threading.Event()
+
+    def fake_run_index(root, *, force=False, progress=None):
+        started.set()
+        release.wait(5.0)
+        return _fake_index_summary(Path(root).name)
+
+    monkeypatch.setattr(pipeline, "run_index", fake_run_index)
+    svc = JobsService(tmp_path)
+    _sourced_job(svc, tmp_path, "dup")
+    try:
+        first = svc.enqueue_index("dup")
+        assert started.wait(5.0)
+        second = svc.enqueue_index("dup")
+        assert first["already"] is False
+        assert second["already"] is True
+    finally:
+        release.set()
+    assert _wait_until(lambda: svc.index_state("dup") is None)
+
+
+def test_background_index_processes_jobs_fifo(tmp_path: Path, monkeypatch) -> None:
+    order: list[str] = []
+
+    def fake_run_index(root, *, force=False, progress=None):
+        order.append(Path(root).name)
+        return _fake_index_summary(Path(root).name)
+
+    monkeypatch.setattr(pipeline, "run_index", fake_run_index)
+    svc = JobsService(tmp_path)
+    for name in ("a", "b", "c"):
+        _sourced_job(svc, tmp_path, name)
+    svc.enqueue_index("a")
+    svc.enqueue_index("b")
+    svc.enqueue_index("c")
+
+    assert _wait_until(lambda: len(order) == 3, timeout=5.0)
+    assert order == ["a", "b", "c"]
+
+
+def test_enqueue_index_requires_source_video(tmp_path: Path) -> None:
+    svc = JobsService(tmp_path)
+    pipeline.create_job(tmp_path / "nosrc", JobConfig(job_id="nosrc"))
+    with pytest.raises(RuntimeError):
+        svc.enqueue_index("nosrc")
+
+
+def test_import_auto_enqueues_index_when_enabled(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("MRF_AUTO_INDEX", "1")
+    calls: list[str] = []
+    finished = threading.Event()
+
+    def fake_run_index(root, *, force=False, progress=None):
+        calls.append(Path(root).name)
+        finished.set()
+        return _fake_index_summary(Path(root).name)
+
+    monkeypatch.setattr(pipeline, "run_index", fake_run_index)
+    svc = JobsService(tmp_path)
+    svc.create_job({"job_id": "auto"})
+    data = b"clip" * 1000
+    svc.import_video("auto", "scene.mp4", len(data), io.BytesIO(data))
+
+    assert finished.wait(5.0)
+    assert calls == ["auto"]
+
+
+def test_import_does_not_auto_enqueue_when_disabled(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("MRF_AUTO_INDEX", "0")
+    calls: list[str] = []
+
+    def fake_run_index(root, *, force=False, progress=None):
+        calls.append(Path(root).name)
+        return _fake_index_summary(Path(root).name)
+
+    monkeypatch.setattr(pipeline, "run_index", fake_run_index)
+    svc = JobsService(tmp_path)
+    svc.create_job({"job_id": "manual"})
+    data = b"clip" * 1000
+    svc.import_video("manual", "scene.mp4", len(data), io.BytesIO(data))
+
+    assert not _wait_until(lambda: bool(calls), timeout=0.5)
+    assert svc.index_state("manual") is None
+
+
+def test_active_index_blocks_reimport_and_status_reports_progress(tmp_path: Path, monkeypatch) -> None:
+    release = threading.Event()
+    started = threading.Event()
+
+    def fake_run_index(root, *, force=False, progress=None):
+        started.set()
+        if progress is not None:
+            progress({"stage": "transcript", "status": "running", "index": 2, "total": 4})
+        release.wait(5.0)
+        return _fake_index_summary(Path(root).name)
+
+    monkeypatch.setattr(pipeline, "run_index", fake_run_index)
+    svc = JobsService(tmp_path)
+    _sourced_job(svc, tmp_path, "busy")
+    svc.enqueue_index("busy")
+    try:
+        assert started.wait(5.0)
+        info = svc.status("busy")
+        assert info["is_indexing"] is True
+        assert info["indexing"]["running"] is True
+        assert info["indexing"]["stage"] == "transcript"
+        # A second import of the same (already-indexing) job is refused.
+        with pytest.raises((RuntimeError, FileExistsError)):
+            svc.import_video("busy", "again.mp4", 4, io.BytesIO(b"new!"))
+    finally:
+        release.set()
+    assert _wait_until(lambda: svc.index_state("busy") is None)
+
+
+def test_stop_run_cancels_active_index(tmp_path: Path, monkeypatch) -> None:
+    import movie_review_factory.cancellation as cancellation
+
+    started = threading.Event()
+
+    def fake_run_index(root, *, force=False, progress=None):
+        started.set()
+        while True:
+            cancellation.checkpoint()
+            time.sleep(0.01)
+
+    monkeypatch.setattr(pipeline, "run_index", fake_run_index)
+    svc = JobsService(tmp_path)
+    _sourced_job(svc, tmp_path, "stopme")
+    svc.enqueue_index("stopme")
+
+    assert started.wait(5.0)
+    result = svc.stop_run("stopme")
+    assert result["stopping"] is True
+    assert result.get("indexing") is True
+    assert _wait_until(lambda: svc.index_state("stopme") is None)

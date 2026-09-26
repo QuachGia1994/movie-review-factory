@@ -2,11 +2,13 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Literal
+from typing import Literal, get_args
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
-StageStatus = Literal["pending", "running", "ready", "failed", "skipped"]
+StageStatus = Literal["pending", "running", "ready", "failed", "skipped", "cancelled"]
+ContentAgentMode = Literal["scaffold", "claude", "agy"]
+CONTENT_AGENT_MODES = get_args(ContentAgentMode)
 
 
 class JobConfig(BaseModel):
@@ -16,7 +18,7 @@ class JobConfig(BaseModel):
     aspect_ratio: Literal["16:9", "9:16"] = "16:9"
     source_video: Path | None = None
     movie_title: str | None = None
-    content_agent: Literal["scaffold", "claude"] = "scaffold"
+    content_agent: ContentAgentMode = "scaffold"
 
 
 class Artifact(BaseModel):
@@ -67,3 +69,56 @@ class JobManifest(BaseModel):
         return bool(self.stages) and all(
             s.status in ("ready", "skipped") for s in self.stages
         )
+
+
+class MediaAsset(BaseModel):
+    id: int | None = Field(default=None, ge=1)
+    path: Path
+    duration_seconds: float = Field(gt=0)
+
+
+class Shot(BaseModel):
+    id: int | None = Field(default=None, ge=1)
+    media_asset_id: int = Field(ge=1)
+    start_seconds: float = Field(ge=0)
+    end_seconds: float = Field(gt=0)
+    label: str | None = None
+
+    @model_validator(mode="after")
+    def validate_time_range(self) -> "Shot":
+        if self.end_seconds <= self.start_seconds:
+            raise ValueError("end_seconds must be greater than start_seconds")
+        return self
+
+
+class TranscriptSegment(BaseModel):
+    id: int | None = Field(default=None, ge=1)
+    media_asset_id: int = Field(ge=1)
+    start_seconds: float = Field(ge=0)
+    end_seconds: float = Field(gt=0)
+    text: str = Field(min_length=1)
+    speaker: str | None = None
+
+    @model_validator(mode="after")
+    def validate_time_range(self) -> "TranscriptSegment":
+        if self.end_seconds <= self.start_seconds:
+            raise ValueError("end_seconds must be greater than start_seconds")
+        return self
+
+
+class VisualObservation(BaseModel):
+    shot_id: int = Field(ge=1)
+    description: str = Field(min_length=1, max_length=240)
+    tags: list[str] = Field(default_factory=list)
+    people: list[str] = Field(default_factory=list)
+    actions: list[str] = Field(default_factory=list)
+    source: str = Field(default="agy", min_length=1, max_length=40)
+
+
+class SceneSelection(BaseModel):
+    id: int | None = Field(default=None, ge=1)
+    media_asset_id: int = Field(ge=1)
+    shot_id: int = Field(ge=1)
+    transcript_segment_id: int | None = Field(default=None, ge=1)
+    position: int = Field(ge=0)
+    rationale: str | None = None

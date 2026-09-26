@@ -168,6 +168,7 @@ var CORE_REQUIREMENTS = [
 ];
 var FULL_REQUIREMENTS = CORE_REQUIREMENTS.concat([
   "faster-whisper>=1.1,<2",
+  "fastembed>=0.7,<1",
   "edge-tts>=7,<8"
 ]);
 var UV_RELEASE_API = "https://api.github.com/repos/astral-sh/uv/releases/latest";
@@ -527,7 +528,7 @@ function checkCoreDependencies(py) {
 function checkRuntimeDependencies(py, env) {
   var imports = runtimeProfile() === "core"
     ? "import pydantic, typer"
-    : "import pydantic, typer, faster_whisper, edge_tts";
+    : "import pydantic, typer, faster_whisper, fastembed, edge_tts";
   var result = runSync(
     py.command,
     pythonArgs(py, ["-c", imports]),
@@ -920,8 +921,10 @@ function ensureToolchain() {
   prependEnvPath(childEnv, ffmpegBin);
   childEnv.MRF_FFMPEG_BIN = ffmpegBin;
   childEnv.MRF_WHISPER_CACHE = path.join(appDataRoot(), "models", "whisper");
+  childEnv.MRF_EMBED_CACHE = path.join(appDataRoot(), "models", "embeddings");
   if (noNetwork()) {
     childEnv.MRF_WHISPER_OFFLINE = "1";
+    childEnv.MRF_EMBED_OFFLINE = "1";
     childEnv.HF_HUB_OFFLINE = "1";
   }
   return {
