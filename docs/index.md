@@ -1,5 +1,10 @@
 # Documentation index
 
+- [Creator product identity](biz/creator-product.md) — primary creator, value proposition, rights and validation target.
+- [Creator production roadmap](plan/creator-production-roadmap.md) — full edit, QA, packaging and release gates after media search.
+
+- [Compact project workspace](plan/compact-workspace.md) — project cards, tabbed import-to-export workflow, responsive explorer, and manual QA gate.
+
 - [Media Explorer checkpoint](plan/media-explorer.md) — transcript/visual/vector indexes, anonymous cross-scene person tracks, cross-project Library Search, scene planning, range-streamed playback, and remaining live validation.
 - [Clipto parity roadmap](plan/clipto-roadmap.md) — ordered roadmap for validation, scorer v2, story memory, editing UX, indexing scale, AGY pool scheduling, and clean-Windows release gate.
 

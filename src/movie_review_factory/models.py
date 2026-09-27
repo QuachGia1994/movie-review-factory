@@ -2,13 +2,21 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Literal, get_args
+from typing import Annotated, Literal, get_args
 
 from pydantic import BaseModel, Field, model_validator
 
 StageStatus = Literal["pending", "running", "ready", "failed", "skipped", "cancelled"]
 ContentAgentMode = Literal["scaffold", "claude", "agy"]
 CONTENT_AGENT_MODES = get_args(ContentAgentMode)
+
+
+class CreativeBrief(BaseModel):
+    review_thesis: str = Field(default="", max_length=500)
+    tone: str = Field(default="", max_length=120)
+    target_audience: str = Field(default="", max_length=200)
+    spoiler_policy: Literal["unspecified", "none", "limited", "full"] = "unspecified"
+    forbidden_claims: list[Annotated[str, Field(max_length=300)]] = Field(default_factory=list, max_length=20)
 
 
 class JobConfig(BaseModel):
@@ -18,7 +26,13 @@ class JobConfig(BaseModel):
     aspect_ratio: Literal["16:9", "9:16"] = "16:9"
     source_video: Path | None = None
     movie_title: str | None = None
+    creative_brief: CreativeBrief = Field(default_factory=CreativeBrief)
     content_agent: ContentAgentMode = "scaffold"
+    brand_top_band: float = Field(default=0, ge=0, le=0.2)
+    brand_bottom_band: float = Field(default=0, ge=0, le=0.2)
+    # Optional branded intro/outro cards on the main render (0 = disabled).
+    intro_seconds: float = Field(default=0, ge=0, le=15)
+    outro_seconds: float = Field(default=0, ge=0, le=15)
 
 
 class Artifact(BaseModel):

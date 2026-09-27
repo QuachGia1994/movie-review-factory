@@ -12,18 +12,33 @@ const runtimeFiles = [
   "__init__.py",
   "agy_agent.py",
   "agy_vision.py",
+  "branding.py",
+  "creative_brief.py",
+  "creator_library.py",
+  "chunked_tts.py",
+  "analytics.py",
+  "audio_mix.py",
   "cli.py",
   "content_agent.py",
   "cancellation.py",
   "editor_ops.py",
+  "editorial_qa.py",
+  "media_qa.py",
+  "handoff.py",
   "localization.py",
   "media_store.py",
   "media_intelligence.py",
+  "midroll.py",
+  "narration_alignment.py",
   "models.py",
   "pipeline.py",
   "pool_scheduler.py",
+  "quick_preview.py",
   "scene_scoring.py",
   "scene_validation.py",
+  "short_variants.py",
+  "thumbnail_editor.py",
+  "versions.py",
   "semantic_search.py",
   "webapp.py",
 ];
@@ -32,6 +47,9 @@ const bundle = {};
 for (const name of runtimeFiles) {
   const bytes = fs.readFileSync(path.join(packageRoot, name));
   bundle["movie_review_factory/" + name] = bytes.toString("base64");
+}
+for (const name of ["man-ke.svg", "man-ke.png"]) {
+  bundle["movie_review_factory/assets/" + name] = fs.readFileSync(path.join(packageRoot, "assets", name)).toString("base64");
 }
 const migrationRoot = path.join(packageRoot, "migrations");
 const migrationFiles = fs.readdirSync(migrationRoot)

@@ -1,5 +1,7 @@
 # Clipto parity roadmap
 
+Follow-on production scope and ship acceptance: [creator production roadmap](creator-production-roadmap.md).
+
 Scope: unreleased Movie Review Factory development after persistent visual memory, multilingual vector search, and anonymous AGY person continuity.
 
 ## Target order
@@ -57,7 +59,7 @@ Evidence:
 - four-worker story quota test reached reviewer after simulated advisor/executor/experiment quota exhaustion;
 - rebuilt one-file bundle includes scorer/validation modules and migrations 001–006 plus `pool_scheduler.py`; offline self-test returned `root_ok=true`, `api_ok=true`;
 - live AGY end-to-end run on a real 10-minute job (content_agent=agy): `research`, `outline`, `script`, and `scene_plan` (20 clips) all reached `ready` through the four-role pool after moving the runner prompt from argv to stdin (argv exceeds the 32,767-char Windows limit) and capping prompts at `MRF_AGY_PROMPT_MAX` (26,000 chars; measured AGY tolerance: 29k OK / 32k fail); script approval gate preserved (`tts` skipped until `approved=true`);
-- release gate runs: online `18/18 PASS exit 0`, offline `12 PASS / 6 BOO (network) / 0 FAIL`.
+- Fresh 2026-09-27 release evidence at HEAD `358615ea04946f39c17d755ac3373cb8705b2066`: 461 tests passed / 6 skipped, rebuilt one-file SHA-256 `94c603028d9f5012bd25ddb98d8b9900f622e22b5c8ce2caa90e4b9c2208c7fb`, WSH plus online/offline self-tests passed, online gate `18/18 PASS exit 0`, offline gate `12 PASS / 6 BOO (network) / 0 FAIL`. The host already has Node/Python/FFmpeg, so this is not a clean-machine bootstrap receipt.
 
 Still open:
 - #1 real 8–12 minute licensed/owned movie evaluation; synthetic fixtures prove mechanism only.

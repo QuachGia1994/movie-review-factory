@@ -112,6 +112,15 @@ def test_create_job_status_is_localized(tmp_path: Path) -> None:
     assert status["has_media_index"] is False
 
 
+def test_handoff_api_rejects_unapproved_job_with_existing_video(tmp_path: Path) -> None:
+    svc = JobsService(tmp_path)
+    svc.create_job({"job_id": "review"})
+    (tmp_path / "review" / "final.mp4").write_bytes(b"old-video")
+    with pytest.raises(ValueError, match="handoff blocked"):
+        svc.build_handoff("review")
+    assert not (tmp_path / "review" / "review-handoff.zip").exists()
+
+
 def test_webapp_uses_model_content_agent_modes(tmp_path: Path) -> None:
     svc = JobsService(tmp_path)
     for mode in CONTENT_AGENT_MODES:
@@ -800,6 +809,24 @@ def test_http_missing_job_returns_404(tmp_path: Path) -> None:
     finally:
         server.shutdown()
         server.server_close()
+
+
+@pytest.mark.parametrize("disconnect", [BrokenPipeError, ConnectionResetError, ConnectionAbortedError])
+def test_streaming_stops_cleanly_when_browser_closes_connection(
+    tmp_path: Path, disconnect: type[OSError]
+) -> None:
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    video = tmp_path / "video.mp4"
+    video.write_bytes(b"x" * 100)
+    writer = Mock()
+    writer.write.side_effect = disconnect()
+    handler = SimpleNamespace(
+        headers={}, wfile=writer, send_response=Mock(), send_header=Mock(), end_headers=Mock(),
+    )
+    webapp_mod.MRFRequestHandler._serve_file(handler, video)
+    writer.write.assert_called_once()
 
 
 def test_http_artifact_supports_range(tmp_path: Path) -> None:

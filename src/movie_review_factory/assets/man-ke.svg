@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" fill="none" aria-label="Màn Kể - silhouette người xem phim">
+<rect x="24" y="24" width="464" height="464" rx="112" fill="#11151D"/>
+<rect x="78" y="122" width="356" height="251" rx="28" stroke="#F6F6F4" stroke-width="18"/>
+<path d="M147 173h218M147 207h130" stroke="#66DBC7" stroke-width="16" stroke-linecap="round"/>
+<circle cx="256" cy="280" r="47" fill="#F6F6F4"/>
+<path d="M151 371c13-59 53-91 105-91s92 32 105 91" fill="#F6F6F4"/>
+<path d="M137 402h238" stroke="#66DBC7" stroke-width="16" stroke-linecap="round"/>
+</svg>

@@ -139,15 +139,24 @@ def _clean_terms(value: object, *, limit: int = 12) -> list[str]:
     return terms
 
 
+def _first_json_object_array(text: str) -> list[dict] | None:
+    """Skip AGY rule receipts/fences without combining unrelated brackets."""
+    decoder = json.JSONDecoder()
+    for index, character in enumerate(text):
+        if character != "[":
+            continue
+        try:
+            data, _ = decoder.raw_decode(text, index)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(data, list) and data and all(isinstance(item, dict) for item in data):
+            return data
+    return None
+
+
 def _parse_observations(text: str, expected_ids: set[int]) -> dict[int, dict]:
-    start, end = text.find("["), text.rfind("]")
-    if start < 0 or end < start:
-        raise VisionUnavailable("AGY returned no visual descriptions")
-    try:
-        data = json.loads(text[start:end + 1])
-    except json.JSONDecodeError as exc:
-        raise VisionUnavailable("AGY returned invalid visual descriptions") from exc
-    if not isinstance(data, list):
+    data = _first_json_object_array(text)
+    if data is None:
         raise VisionUnavailable("AGY returned invalid visual descriptions")
     observations: dict[int, dict] = {}
     for item in data:
@@ -292,14 +301,8 @@ def _parse_identity_batch(
     expected_scene_ids: set[int],
     allowed_labels: set[str],
 ) -> list[dict]:
-    start, end = text.find("["), text.rfind("]")
-    if start < 0 or end < start:
-        raise VisionUnavailable("AGY returned no identity tracking result")
-    try:
-        data = json.loads(text[start:end + 1])
-    except json.JSONDecodeError as exc:
-        raise VisionUnavailable("AGY returned invalid identity tracking JSON") from exc
-    if not isinstance(data, list):
+    data = _first_json_object_array(text)
+    if data is None:
         raise VisionUnavailable("AGY returned invalid identity tracking result")
     result: list[dict] = []
     seen_scenes: set[int] = set()

@@ -25,15 +25,17 @@ import os
 import queue
 import re
 import shutil
+import tempfile
 import threading
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 
-from . import cancellation, editor_ops, localization, pipeline, semantic_search
+from . import analytics, audio_mix, branding, cancellation, creative_brief, editor_ops, localization, midroll, pipeline, semantic_search, versions
 from .content_agent import _terminate_process_tree
 from .media_store import MediaStore
+from .creator_library import CreatorLibrary
 from . import media_intelligence
 from .models import CONTENT_AGENT_MODES, JobConfig
 
@@ -78,6 +80,9 @@ _CONTENT_TYPES = {
     ".txt": "text/plain; charset=utf-8",
     ".jpg": "image/jpeg",
     ".jpeg": "image/jpeg",
+    ".png": "image/png",
+    ".svg": "image/svg+xml",
+    ".zip": "application/zip",
 }
 
 _ARTIFACT_KINDS = {
@@ -90,6 +95,7 @@ _ARTIFACT_KINDS = {
     ".txt": "text",
     ".jpg": "image",
     ".jpeg": "image",
+    ".zip": "archive",
 }
 
 
@@ -147,10 +153,14 @@ class JobsService:
 
     def __init__(self, jobs_root: Path):
         self.jobs_root = Path(jobs_root)
+        self.creator_library = CreatorLibrary(self.jobs_root)
         self._runs: dict[str, dict] = {}
+        self._short_exports: dict[str, dict] = {}
+        self._section_previews: dict[str, dict] = {}
         self._uploads: set[str] = set()
         self._deleting: set[str] = set()
         self._lock = threading.Lock()
+        self._version_lock = threading.Lock()
         # Background indexing queue (roadmap #14): a single FIFO worker builds
         # media_index/embeddings/scene-memory for imported jobs one at a time so
         # import returns immediately and other projects stay usable meanwhile.
@@ -194,7 +204,42 @@ class JobsService:
         with self._lock:
             return bool(self._runs.get(job_id, {}).get("running"))
 
+    def _assert_no_preview(self, job_id: str) -> None:
+        with self._lock:
+            if self._section_previews.get(job_id, {}).get("running"):
+                raise RuntimeError("Chờ dựng preview phần hiện tại xong trước khi sửa project.")
+
     # -- read ----------------------------------------------------------------
+
+    def list_creator_series(self) -> dict:
+        return {"series": self.creator_library.list_series()}
+
+    def save_creator_series(self, payload: dict) -> dict:
+        return self.creator_library.save_series(
+            payload.get("series_id"), payload.get("title"), payload.get("entries")
+        )
+
+    def list_creator_briefs(self) -> dict:
+        return {"briefs": self.creator_library.list_briefs()}
+
+    def save_creator_brief(self, payload: dict) -> dict:
+        return self.creator_library.save_brief(payload.get("name"), payload.get("brief"))
+
+    def search_creator_projects(self, query: str) -> dict:
+        return {"projects": self.creator_library.search_projects(query)}
+
+    def list_creator_rights(self, job_id: str) -> dict:
+        self._require_job(job_id)
+        return {"rights": self.creator_library.list_asset_rights(job_id)}
+
+    def save_creator_rights(self, job_id: str, payload: dict) -> dict:
+        self._require_job(job_id)
+        return self.creator_library.record_asset_rights(
+            job_id, payload.get("path"), source=payload.get("source"),
+            usage=payload.get("usage"),
+            permission_status=payload.get("permission_status", "unreviewed"),
+            evidence_note=str(payload.get("evidence_note") or ""),
+        )
 
     def list_jobs(self) -> list[dict]:
         jobs = pipeline.list_jobs(self.jobs_root)
@@ -219,12 +264,34 @@ class JobsService:
             run_state = dict(self._runs.get(job_id, {}))
         run_error = run_state.get("error")
         info["running"] = bool(run_state.get("running"))
+        with self._lock:
+            short_state = dict(self._short_exports.get(
+                job_id, {"running": False, "error": None, "href": None, "srt_href": None}
+            ))
+        if not short_state["running"] and (root / "shorts" / "short-review.mp4").is_file():
+            from .short_variants import short_artifact
+
+            try:
+                short_artifact(root, "short-review.mp4", verify_output=False)
+            except (ValueError, FileNotFoundError):
+                short_state.update(href=None, srt_href=None, error="Video ngắn đã cũ; xuất lại.")
+            else:
+                short_state.update(
+                    href=f"/api/jobs/{job_id}/shorts/short-review.mp4",
+                    srt_href=f"/api/jobs/{job_id}/shorts/short-review.srt",
+                )
+        info["short_export"] = short_state
+        with self._lock:
+            info["section_preview"] = dict(self._section_previews.get(job_id, {"running": False}))
         info["stopping"] = bool(run_state.get("stopping"))
         info["cancelled"] = any(stage["status"] == "cancelled" for stage in info["stages"])
         info["can_stop"] = info["running"] and not info["stopping"]
         with self._lock:
             info["uploading"] = job_id in self._uploads
-        info["has_source_video"] = bool(pipeline.load_manifest(root).config.source_video)
+        cfg = pipeline.load_manifest(root).config
+        info["has_source_video"] = bool(cfg.source_video)
+        info["brand_top_band"] = cfg.brand_top_band
+        info["brand_bottom_band"] = cfg.brand_bottom_band
         info["run_error"] = run_error
         info["run_error_vi"] = localization.localize_message(run_error) if run_error else None
 
@@ -236,6 +303,14 @@ class JobsService:
             "metadata_present": bool(meta),
             "metadata_approved": bool(meta.get("approved")),
         }
+        qa = self._read_json(root, "qa.json")
+        info["qa_findings"] = [
+            {"check": check.get("check"), "message": check.get("message"),
+             "passed": check.get("passed"), "review_required": bool(check.get("review_required")),
+             "value": check.get("value")}
+            for check in qa.get("checks", []) if isinstance(check, dict)
+            and (check.get("passed") is False or check.get("review_required"))
+        ]
         info["artifacts"] = self.list_artifacts(job_id)
         info["has_final_video"] = (root / "final.mp4").exists()
         info["has_thumbnail"] = (root / "thumbnail.jpg").exists()
@@ -273,7 +348,11 @@ class JobsService:
     def get_thumbnails(self, job_id: str) -> dict:
         root = self._require_job(job_id)
         thumbnails = self._read_json(root, "thumbnails.json")
-        return {"present": bool(thumbnails), "thumbnails": thumbnails}
+        return {
+            "present": bool(thumbnails), "thumbnails": thumbnails,
+            "edits": self._read_json(root, "thumbnail_edits.json"),
+            "channel_name": branding.load_settings(self.jobs_root)["name"],
+        }
 
     def person_tracks(self, job_id: str) -> dict:
         root = self._require_job(job_id)
@@ -307,7 +386,11 @@ class JobsService:
     def edit_timeline(self, job_id: str, operation: dict) -> dict:
         if self._is_running(job_id):
             raise RuntimeError("job is running")
-        return editor_ops.edit_timeline(self._require_job(job_id), operation)
+        self._assert_no_preview(job_id)
+        with self._version_lock:
+            root = self._require_job(job_id)
+            versions.create(root, "Trước khi sửa timeline")
+            return editor_ops.edit_timeline(root, operation)
 
     def similar_scenes(self, job_id: str, shot_id: int) -> dict:
         return {
@@ -324,7 +407,12 @@ class JobsService:
     def broll(self, job_id: str, clip_index: int, *, apply: bool = False) -> dict:
         root = self._require_job(job_id)
         if apply:
-            return editor_ops.auto_replace_broll(root, apply=True)
+            if self._is_running(job_id):
+                raise RuntimeError("job is running")
+            self._assert_no_preview(job_id)
+            with self._version_lock:
+                versions.create(root, "Trước khi thay cảnh tự động")
+                return editor_ops.auto_replace_broll(root, apply=True)
         return {
             "clip_index": clip_index,
             "suggestions": editor_ops.broll_suggestions(root, clip_index),
@@ -335,11 +423,15 @@ class JobsService:
     ) -> dict:
         if self._is_running(job_id):
             raise RuntimeError("job is running")
-        return editor_ops.regenerate_section(
-            self._require_job(job_id),
-            section_index,
-            instruction=instruction,
-        )
+        self._assert_no_preview(job_id)
+        with self._version_lock:
+            root = self._require_job(job_id)
+            versions.create(root, "Trước khi tạo lại cảnh")
+            return editor_ops.regenerate_section(
+                root,
+                section_index,
+                instruction=instruction,
+            )
 
     def _search_history_path(self) -> Path:
         return self.jobs_root / ".library-searches.json"
@@ -403,6 +495,7 @@ class JobsService:
                 "present": False,
                 "query": query,
                 "media_href": None,
+                "source_language": None,
                 "transcript_vtt_href": None,
                 "shots": [],
                 "transcript": [],
@@ -479,6 +572,7 @@ class JobsService:
             "present": asset is not None,
             "query": query,
             "media_href": media_href,
+            "source_language": self._read_json(root, "transcript.json").get("language"),
             "transcript_vtt_href": (
                 f"/api/jobs/{job_id}/transcript.vtt" if has_transcript else None
             ),
@@ -852,6 +946,147 @@ class JobsService:
     def chat(self, job_id: str, question: str) -> dict:
         return media_intelligence.answer_chat(self._require_job(job_id), question)
 
+    def build_handoff(self, job_id: str) -> dict:
+        if self._is_running(job_id):
+            raise RuntimeError("Chờ pipeline hoàn tất trước khi đóng gói.")
+        from .handoff import build_handoff
+
+        root = self._require_job(job_id)
+        path = build_handoff(root)
+        return {"name": path.name, "href": f"/api/jobs/{job_id}/artifacts/{path.name}"}
+
+    def list_analytics(self, job_id: str) -> dict:
+        return {"imports": analytics.list_imports(self._require_job(job_id))}
+
+    def import_analytics(self, job_id: str, format_name: str, data: bytes,
+                         cta_seconds: str | None, notes: str) -> dict:
+        root = self._require_job(job_id)
+        if format_name not in ("csv", "json"):
+            raise ValueError("Chỉ nhận file Studio CSV hoặc JSON.")
+        if len(data) > analytics.MAX_EXPORT_BYTES:
+            raise OverflowError("Studio export exceeds 2 MB")
+        if not data:
+            raise ValueError("File Studio rỗng.")
+        if self._is_running(job_id):
+            raise RuntimeError("Chờ pipeline hoàn tất trước khi nhập thống kê.")
+        with tempfile.NamedTemporaryFile(prefix=".studio-", suffix="." + format_name,
+                                         dir=root, delete=False) as stream:
+            path = Path(stream.name)
+            stream.write(data)
+        try:
+            return analytics.import_studio_export(root, path,
+                                                  cta_seconds=cta_seconds or None, notes=notes)
+        finally:
+            path.unlink(missing_ok=True)
+
+    def start_short(self, job_id: str, payload: dict) -> dict:
+        root = self._require_job(job_id)
+        try:
+            start = float(payload["start_seconds"])
+            end = float(payload["end_seconds"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("Nhập mốc đầu và cuối bằng số giây.") from exc
+        state = {"running": True, "error": None, "href": None, "srt_href": None}
+        with self._lock:
+            if (self._runs.get(job_id, {}).get("running") or self._short_exports.get(job_id, {}).get("running")
+                    or self._section_previews.get(job_id, {}).get("running")
+                    or job_id in self._uploads or job_id in self._deleting):
+                raise RuntimeError("Project đang chạy hoặc đang xuất short.")
+            self._short_exports[job_id] = state
+
+        def worker() -> None:
+            error = None
+            try:
+                from .short_variants import build_short
+
+                build_short(root, start, end)
+            except Exception as exc:
+                error = str(exc)
+            finally:
+                with self._lock:
+                    if self._short_exports.get(job_id) is state:
+                        state.update(
+                            running=False, error=error,
+                            href=None if error else f"/api/jobs/{job_id}/shorts/short-review.mp4",
+                            srt_href=None if error else f"/api/jobs/{job_id}/shorts/short-review.srt",
+                        )
+
+        threading.Thread(target=worker, name=f"mrf-short-{job_id}", daemon=True).start()
+        return {"started": True}
+
+    def start_section_preview(self, job_id: str, section_index: int) -> dict:
+        from . import quick_preview
+
+        root = self._require_job(job_id)
+        if isinstance(section_index, bool) or not isinstance(section_index, int) or section_index < 1:
+            raise ValueError("Mục preview phải là số thứ tự phần hợp lệ.")
+        script, _plan, _alignment, _source, _audio = quick_preview._required_inputs(root)
+        if section_index > len(script.get("sections") or []):
+            raise ValueError("Mục preview vượt quá số phần kịch bản.")
+        state = {"running": True, "section_index": section_index, "error": None,
+                 "href": None, "srt_href": None}
+        with self._lock:
+            if (self._runs.get(job_id, {}).get("running")
+                    or self._section_previews.get(job_id, {}).get("running")
+                    or self._short_exports.get(job_id, {}).get("running")
+                    or job_id in self._uploads or job_id in self._deleting or job_id in self._indexing):
+                raise RuntimeError("Project đang xử lý; chờ xong trước khi dựng preview.")
+            self._section_previews[job_id] = state
+
+        def worker() -> None:
+            error = None
+            try:
+                quick_preview.build_section_preview(root, section_index)
+            except Exception as exc:
+                error = str(exc)
+            finally:
+                with self._lock:
+                    if self._section_previews.get(job_id) is state:
+                        state.update(running=False, error=error)
+
+        threading.Thread(target=worker, name=f"mrf-preview-{job_id}-{section_index}", daemon=True).start()
+        return {"started": True, "section_index": section_index}
+
+    def section_preview_state(self, job_id: str, section_index: int) -> dict:
+        from .quick_preview import section_preview_artifact
+
+        root = self._require_job(job_id)
+        if isinstance(section_index, bool) or not isinstance(section_index, int) or section_index < 1:
+            raise ValueError("Mục preview không hợp lệ.")
+        with self._lock:
+            state = dict(self._section_previews.get(job_id, {}))
+        if state.get("running") and state.get("section_index") == section_index:
+            return state
+        result = {"running": False, "section_index": section_index, "error": None,
+                  "href": None, "srt_href": None}
+        try:
+            section_preview_artifact(root, section_index, "mp4")
+            section_preview_artifact(root, section_index, "srt")
+        except (ValueError, FileNotFoundError, OSError):
+            if state.get("section_index") == section_index:
+                result["error"] = state.get("error") or "Preview đã cũ hoặc chưa có; tạo lại để xem."
+        else:
+            prefix = f"/api/jobs/{job_id}/previews/{section_index}/"
+            stamp = (root / "previews" / f"section-{section_index}.mp4").stat().st_mtime_ns
+            result.update(href=prefix + f"mp4?v={stamp}", srt_href=prefix + f"srt?v={stamp}")
+        return result
+
+    def section_preview_path(self, job_id: str, section_index: int, kind: str) -> Path:
+        from .quick_preview import section_preview_artifact
+
+        with self._lock:
+            if self._runs.get(job_id, {}).get("running") or self._section_previews.get(job_id, {}).get("running"):
+                raise RuntimeError("Chờ xử lý xong trước khi tải preview.")
+        return section_preview_artifact(self._require_job(job_id), section_index, kind)
+
+    def short_path(self, job_id: str, name: str) -> Path:
+        from .short_variants import short_artifact
+
+        with self._lock:
+            if self._runs.get(job_id, {}).get("running") or self._short_exports.get(job_id, {}).get("running"):
+                raise RuntimeError("Chờ xử lý xong trước khi tải short.")
+        return short_artifact(self._require_job(job_id), name)
+
     def artifact_path(self, job_id: str, name: str) -> Path:
         root = self._require_job(job_id)
         if not _is_safe_segment(name):
@@ -862,6 +1097,30 @@ class JobsService:
             raise ValueError("đường dẫn artifact không hợp lệ")
         if not path.is_file():
             raise FileNotFoundError(f"không tìm thấy artifact: {name}")
+        if name == "review-handoff.zip":
+            from .handoff import ASSETS
+
+            manifest = pipeline.load_manifest(root)
+            if self._is_running(job_id) or any(
+                not manifest.stage(stage) or manifest.stage(stage).status != "ready"
+                for stage in ("script", "scene_plan", "alignment", "render", "qa", "metadata", "thumbnail")
+            ):
+                raise ValueError("Gói xuất đã hết hiệu lực; kiểm tra QA rồi đóng gói lại.")
+            script = self._read_json(root, "script.json")
+            metadata = self._read_json(root, pipeline.METADATA_NAME)
+            qa = self._read_json(root, "qa.json")
+            if not (script.get("approved") and metadata.get("approved") and qa.get("passed")):
+                raise ValueError("Gói xuất yêu cầu kịch bản, metadata và QA đã duyệt.")
+            inputs = [root / source for source, _ in ASSETS]
+            inputs += [root / name for name in ("script.json", "scene_plan.json", "qa.json")]
+            if any(not item.is_file() or item.stat().st_mtime_ns > path.stat().st_mtime_ns for item in inputs):
+                raise ValueError("Gói xuất đã cũ; vui lòng đóng gói lại.")
+            from .analytics import _current_receipt
+
+            try:
+                _current_receipt(root)
+            except ValueError as exc:
+                raise ValueError("Gói xuất đã hết hiệu lực; vui lòng đóng gói lại.") from exc
         return path
 
     # -- write ---------------------------------------------------------------
@@ -884,7 +1143,10 @@ class JobsService:
             aspect_ratio=str(payload.get("aspect_ratio") or "16:9"),
             source_video=Path(source_video) if source_video else None,
             movie_title=str(payload.get("movie_title") or "").strip() or None,
+            creative_brief=payload.get("creative_brief") or {},
             content_agent=content_agent,
+            brand_top_band=float(payload.get("brand_top_band") or 0),
+            brand_bottom_band=float(payload.get("brand_bottom_band") or 0),
         )
         pipeline.create_job(root, config)
         return self.status(job_id)
@@ -896,8 +1158,10 @@ class JobsService:
         if size <= 0:
             raise ValueError("video rỗng hoặc thiếu Content-Length")
         with self._lock:
-            if self._runs.get(job_id, {}).get("running") or job_id in self._uploads or job_id in self._deleting or job_id in self._indexing:
-                raise RuntimeError("job đang chạy hoặc đang tải video")
+            if (self._runs.get(job_id, {}).get("running") or self._short_exports.get(job_id, {}).get("running")
+                    or self._section_previews.get(job_id, {}).get("running")
+                    or job_id in self._uploads or job_id in self._deleting or job_id in self._indexing):
+                raise RuntimeError("job đang chạy hoặc đang tải video hay đang xuất short")
             if pipeline.load_manifest(root).config.source_video or (root / "source.mp4").exists():
                 raise FileExistsError("job đã có video nguồn")
             self._uploads.add(job_id)
@@ -957,7 +1221,9 @@ class JobsService:
             self._preempt_index(job_id)
         with self._lock:
             for job_id in job_ids:
-                if self._runs.get(job_id, {}).get("running") or job_id in self._uploads or job_id in self._deleting or job_id in self._indexing:
+                if (self._runs.get(job_id, {}).get("running") or self._short_exports.get(job_id, {}).get("running")
+                        or self._section_previews.get(job_id, {}).get("running")
+                        or job_id in self._uploads or job_id in self._deleting or job_id in self._indexing):
                     raise RuntimeError("project đang chạy hoặc đang tải video: " + job_id)
                 self._require_job(job_id)
             self._deleting.update(job_ids)
@@ -971,6 +1237,7 @@ class JobsService:
                         failed = job_id
                         break
                     self._runs.pop(job_id, None)
+                    self._section_previews.pop(job_id, None)
                     deleted.append(job_id)
             finally:
                 self._deleting.difference_update(job_ids)
@@ -984,8 +1251,10 @@ class JobsService:
         event = threading.Event()
         state = {"running": True, "stopping": False, "error": None, "until": until, "event": event, "process": None}
         with self._lock:
-            if self._runs.get(job_id, {}).get("running") or job_id in self._uploads or job_id in self._deleting or job_id in self._indexing:
-                raise RuntimeError("job đang chạy hoặc đang tải video")
+            if (self._runs.get(job_id, {}).get("running") or self._short_exports.get(job_id, {}).get("running")
+                    or self._section_previews.get(job_id, {}).get("running")
+                    or job_id in self._uploads or job_id in self._deleting or job_id in self._indexing):
+                raise RuntimeError("job đang chạy hoặc đang xuất short hoặc đang tải video")
             self._runs[job_id] = state
 
         def register(process) -> None:
@@ -1014,6 +1283,30 @@ class JobsService:
         threading.Thread(target=worker, name=f"mrf-run-{job_id}", daemon=True).start()
         return {"started": True, "until": until}
 
+    def rerender_brand(self, job_id: str, payload: dict) -> dict:
+        root = self._require_job(job_id)
+        with self._lock:
+            if (self._runs.get(job_id, {}).get("running") or self._short_exports.get(job_id, {}).get("running")
+                    or self._section_previews.get(job_id, {}).get("running")
+                    or job_id in self._uploads or job_id in self._deleting):
+                raise RuntimeError("Project đang chạy; thử lại khi hoàn thành.")
+            manifest = pipeline.load_manifest(root)
+            if not self._read_json(root, "script.json").get("approved"):
+                raise ValueError("Duyệt kịch bản mới trước khi dựng lại video.")
+            if not (root / "scene_plan.json").exists() or not (root / "narration.mp3").exists():
+                raise ValueError("Cần có scene plan và giọng đọc trước khi dựng lại.")
+            versions.create(root, "Trước khi dựng lại nhận diện kênh")
+            top = float(payload.get("top_band", 0))
+            bottom = float(payload.get("bottom_band", 0))
+            manifest.config.brand_top_band = top
+            manifest.config.brand_bottom_band = bottom
+            for stage in manifest.stages:
+                if stage.stage in ("render", "qa"):
+                    stage.status = "pending"
+                    stage.message = ""
+            pipeline.save_manifest(root, manifest)
+        return self.start_run(job_id)
+
     def stop_run(self, job_id: str) -> dict:
         self._require_job(job_id)
         with self._lock:
@@ -1025,6 +1318,8 @@ class JobsService:
                     if not index_state.get("running"):
                         self._release_index(job_id)
                     return {"stopping": True, "already_stopped": False, "indexing": True}
+                if state and state.get("event") is not None and state["event"].is_set():
+                    return {"stopping": True, "already_stopped": True}
                 return {"stopping": False, "already_stopped": True}
             state["stopping"] = True
             state["event"].set()
@@ -1174,9 +1469,39 @@ class JobsService:
         return {"approved": True, "metadata": meta}
 
     def update_metadata(self, job_id: str, fields: dict) -> dict:
+        with self._version_lock:
+            root = self._require_job(job_id)
+            if self._is_running(job_id):
+                raise RuntimeError("job is running")
+            versions.create(root, "Trước khi sửa metadata")
+            meta = pipeline.update_metadata(root, fields)
+            return {"approved": bool(meta.get("approved")), "metadata": meta}
+
+    def get_audio_mix(self, job_id: str) -> dict:
         root = self._require_job(job_id)
-        meta = pipeline.update_metadata(root, fields)
-        return {"approved": bool(meta.get("approved")), "metadata": meta}
+        config = self._read_json(root, "audio_mix.json")
+        return {"audio_mix": config or {"voice_gain_db": 0, "music": None, "effects": []}}
+
+    def update_audio_mix(self, job_id: str, config: dict) -> dict:
+        self._assert_no_preview(job_id)
+        with self._version_lock:
+            root = self._require_job(job_id)
+            if self._is_running(job_id):
+                raise RuntimeError("job is running")
+            if set(config) - {"voice_gain_db", "music", "effects"}:
+                raise ValueError("Cấu hình âm thanh có trường không hợp lệ.")
+            normalized = {
+                "voice_gain_db": config.get("voice_gain_db", 0),
+                "music": config.get("music"),
+                "effects": config.get("effects", []),
+            }
+            audio_mix.build_audio_mix(normalized, overlay_count=0, duration_seconds=None)
+            if self.get_audio_mix(job_id)["audio_mix"] == normalized:
+                return {"changed": False, "audio_mix": normalized}
+            versions.create(root, "Trước khi sửa âm thanh")
+            pipeline._write_json(root, "audio_mix.json", normalized)
+            pipeline.invalidate_downstream(root, "alignment")
+            return {"changed": True, "audio_mix": normalized}
 
     def get_script(self, job_id: str) -> dict:
         root = self._require_job(job_id)
@@ -1184,19 +1509,132 @@ class JobsService:
         return {"present": bool(script), "script": script}
 
     def update_script(self, job_id: str, fields: dict) -> dict:
+        with self._version_lock:
+            root = self._require_job(job_id)
+            if self._is_running(job_id):
+                raise RuntimeError("job is running")
+            self._assert_no_preview(job_id)
+            versions.create(root, "Trước khi sửa kịch bản")
+            script = pipeline.update_script(root, fields)
+            return {"approved": False, "script": script}
+
+    def tag_script(self, job_id: str, fields: dict) -> dict:
+        self._assert_no_preview(job_id)
+        with self._version_lock:
+            root = self._require_job(job_id)
+            if self._is_running(job_id):
+                raise RuntimeError("job is running")
+            script = self._read_json(root, "script.json")
+            if not script:
+                raise FileNotFoundError("script.json missing")
+            if not all(key in fields for key in ("section_index", "start", "end", "kind")):
+                raise ValueError("Thiếu thông tin đoạn lời dẫn hoặc loại nhãn")
+            refs = fields.get("evidence_refs") or []
+            if not isinstance(refs, list) or not all(isinstance(ref, str) for ref in refs):
+                raise ValueError("evidence_refs phải là danh sách mốc nguồn")
+            updated = creative_brief.tag_script_span(
+                script,
+                int(fields["section_index"]),
+                int(fields["start"]),
+                int(fields["end"]),
+                str(fields["kind"]),
+                refs,
+            )
+            if updated != script:
+                versions.create(root, "Trước khi gắn nhãn kịch bản")
+                updated = pipeline.update_script(root, {"sections": updated["sections"]})
+            return {"approved": bool(updated.get("approved")), "script": updated}
+
+    def list_versions(self, job_id: str) -> dict:
+        return {"versions": versions.list_versions(self._require_job(job_id))}
+
+    def create_version(self, job_id: str, name: str) -> dict:
+        if self._is_running(job_id):
+            raise RuntimeError("job is running")
+        with self._version_lock:
+            return versions.create(self._require_job(job_id), name)
+
+    def restore_version(self, job_id: str, version_id: str, kind: str) -> dict:
+        if self._is_running(job_id):
+            raise RuntimeError("job is running")
+        self._assert_no_preview(job_id)
+        with self._version_lock:
+            return versions.restore(self._require_job(job_id), version_id, kind)
+
+    def version_artifact(self, job_id: str, version_id: str, name: str) -> Path:
+        return versions.artifact_path(self._require_job(job_id), version_id, name)
+
+    def edit_thumbnail(self, job_id: str, headline: str, channel_name: str) -> dict:
+        from .thumbnail_editor import render_thumbnail_variants
+
         root = self._require_job(job_id)
-        script = pipeline.update_script(root, fields)
-        return {"approved": False, "script": script}
+        if self._is_running(job_id):
+            raise RuntimeError("Chờ pipeline hoàn tất trước khi sửa ảnh bìa.")
+        return render_thumbnail_variants(root, headline=headline, channel_name=channel_name)
 
     def select_thumbnail(self, job_id: str, candidate: str) -> dict:
         root = self._require_job(job_id)
+        if self._is_running(job_id):
+            raise RuntimeError("Chờ pipeline hoàn tất trước khi chọn ảnh bìa.")
         thumbnails = pipeline.select_thumbnail(root, candidate)
         return {
             "selected": thumbnails.get("primary_candidate", ""),
             "thumbnails": thumbnails,
         }
 
+    def get_midroll(self, job_id: str) -> dict:
+        root = self._require_job(job_id)
+        draft = self._read_json(root, "midroll-draft.json")
+        script = self._read_json(root, "script.json")
+        staged = next((s for s in script.get("sections", []) if isinstance(s, dict) and s.get("midroll")), None)
+        return {"draft": draft, "staged": staged, "approved": bool(script.get("approved"))}
+
+    def generate_midroll(self, job_id: str) -> dict:
+        from .agy_agent import run_agy_json
+        root = self._require_job(job_id)
+        manifest = pipeline.load_manifest(root)
+        script = self._read_json(root, "script.json")
+        plan = self._read_json(root, "scene_plan.json")
+        if manifest.config.content_agent != "agy":
+            raise ValueError("CTA giữa video cần project dùng AGY.")
+        if not script.get("approved") or any(s.get("midroll") for s in script.get("sections", []) if isinstance(s, dict)):
+            raise ValueError("Kịch bản cần được duyệt và chưa có CTA.")
+        schema = {"type": "object", "properties": {"line": {"type": "string"}},
+                  "required": ["line"], "additionalProperties": False}
+        midpoint = len(script["sections"]) // 2
+        brand_name = branding.load_settings(self.jobs_root)["name"]
+        previous = script["sections"][midpoint - 1]["title"]
+        following = script["sections"][midpoint]["title"]
+        prompt = (
+            "Viết một lời thoại CTA bằng tiếng Việt, 25–40 từ, một hoặc hai câu, "
+            "hài hước tự nhiên theo chi tiết của phim. Nhắc bấm thích và đăng ký "
+            f"kênh {brand_name} để không bỏ lỡ phần tiếp theo. Chèn ở 50% video giữa "
+            f"'{previous}' và '{following}' của '{manifest.config.movie_title}'. "
+            "Không bịa sự kiện, không lặp nguyên văn thoại phim. Trả JSON đúng schema."
+        )
+        result = run_agy_json(stage="midroll", prompt=prompt, schema=schema)
+        line = str(result.get("line") or "").strip()
+        render = self._read_json(root, "render.json")
+        _, _, at = midroll.prepare(script, plan, line, 10, render.get("narration_duration_seconds"))
+        draft = {"line": line, "start_seconds": at, "duration_seconds": 10, "generator": "agy"}
+        pipeline._write_json(root, "midroll-draft.json", draft)
+        return draft
+
+    def stage_midroll(self, job_id: str, payload: dict) -> dict:
+        root = self._require_job(job_id)
+        with self._version_lock, self._lock:
+            if self._runs.get(job_id, {}).get("running") or job_id in self._uploads or job_id in self._deleting:
+                raise RuntimeError("Project đang chạy; thử lại sau.")
+            draft = self._read_json(root, "midroll-draft.json")
+            if not draft:
+                raise ValueError("Hãy tạo câu CTA bằng AGY trước.")
+            line = str(payload.get("line") or draft.get("line") or "").strip()
+            versions.create(root, "Trước khi chèn CTA")
+            result = midroll.stage(root, line, float(draft.get("duration_seconds") or 10))
+        return result
+
     def approve_script(self, job_id: str) -> dict:
+        self._assert_no_preview(job_id)
         root = self._require_job(job_id)
         script = pipeline.approve_script(root)
         return {"approved": True, "script": script}
@@ -1363,7 +1801,10 @@ class MRFRequestHandler(BaseHTTPRequestHandler):
                 chunk = handle.read(min(65536, remaining))
                 if not chunk:
                     break
-                self.wfile.write(chunk)
+                try:
+                    self.wfile.write(chunk)
+                except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                    return  # Browser stopped reading after a seek or navigation.
                 remaining -= len(chunk)
 
     # -- auth ----------------------------------------------------------------
@@ -1383,7 +1824,7 @@ class MRFRequestHandler(BaseHTTPRequestHandler):
             return True
         route = urlparse(self.path).path
         media_route = re.fullmatch(
-            r"/api/jobs/[A-Za-z0-9._-]+/(?:media/source|artifacts/final\.mp4)", route
+            r"/api/jobs/[A-Za-z0-9._-]+/(?:media/source|artifacts/(?:final\.mp4|review-handoff\.zip))", route
         )
         if self.command != "GET" or not media_route:
             return False
@@ -1454,8 +1895,29 @@ class MRFRequestHandler(BaseHTTPRequestHandler):
     def _route_get(self, parts: list[str], query: dict[str, list[str]]) -> None:
         # parts: [] | ["jobs"] | ["jobs", id] | ["jobs", id, "artifacts"] |
         #        ["jobs", id, "artifacts", name] | ["jobs", id, "metadata"]
+        if parts == ["brand"]:
+            self._send_json(200, {**branding.load_settings(self.service.jobs_root), "logo_url": "/api/brand/logo"})
+            return
+        if parts == ["brand", "logo"]:
+            self._serve_file(branding.logo_path(self.service.jobs_root))
+            return
+        if parts == ["brand", "logo.svg"]:
+            self._serve_file(branding.ASSETS / "man-ke.svg")
+            return
         if parts == ["jobs"]:
             self._send_json(200, {"jobs": self.service.list_jobs()})
+            return
+        if parts == ["creator-library", "search"]:
+            self._send_json(200, self.service.search_creator_projects((query.get("q") or [""])[0]))
+            return
+        if parts == ["creator-library", "series"]:
+            self._send_json(200, self.service.list_creator_series())
+            return
+        if parts == ["creator-library", "briefs"]:
+            self._send_json(200, self.service.list_creator_briefs())
+            return
+        if len(parts) == 3 and parts[0] == "jobs" and parts[2] == "rights":
+            self._send_json(200, self.service.list_creator_rights(parts[1]))
             return
         if parts == ["library-search"]:
             search = (query.get("q") or [""])[0].strip()
@@ -1475,14 +1937,38 @@ class MRFRequestHandler(BaseHTTPRequestHandler):
         if len(parts) == 2 and parts[0] == "jobs":
             self._send_json(200, self.service.status(parts[1]))
             return
+        if len(parts) == 3 and parts[0] == "jobs" and parts[2] == "analytics":
+            self._send_json(200, self.service.list_analytics(parts[1]))
+            return
+        if len(parts) == 3 and parts[0] == "jobs" and parts[2] == "versions":
+            self._send_json(200, self.service.list_versions(parts[1]))
+            return
+        if len(parts) == 6 and parts[0] == "jobs" and parts[2] == "versions" and parts[4] == "artifacts":
+            self._serve_file(self.service.version_artifact(parts[1], parts[3], parts[5]))
+            return
         if len(parts) == 3 and parts[0] == "jobs" and parts[2] == "artifacts":
             self._send_json(200, {"artifacts": self.service.list_artifacts(parts[1])})
             return
         if len(parts) == 4 and parts[0] == "jobs" and parts[2] == "artifacts":
             self._serve_file(self.service.artifact_path(parts[1], parts[3]))
             return
+        if len(parts) == 4 and parts[0] == "jobs" and parts[2] == "shorts":
+            self._serve_file(self.service.short_path(parts[1], parts[3]))
+            return
+        if len(parts) == 4 and parts[0] == "jobs" and parts[2] == "previews":
+            self._send_json(200, self.service.section_preview_state(parts[1], int(parts[3])))
+            return
+        if len(parts) == 5 and parts[0] == "jobs" and parts[2] == "previews":
+            self._serve_file(self.service.section_preview_path(parts[1], int(parts[3]), parts[4]))
+            return
+        if len(parts) == 3 and parts[0] == "jobs" and parts[2] == "audio-mix":
+            self._send_json(200, self.service.get_audio_mix(parts[1]))
+            return
         if len(parts) == 3 and parts[0] == "jobs" and parts[2] == "metadata":
             self._send_json(200, self.service.get_metadata(parts[1]))
+            return
+        if len(parts) == 3 and parts[0] == "jobs" and parts[2] == "midroll":
+            self._send_json(200, self.service.get_midroll(parts[1]))
             return
         if len(parts) == 3 and parts[0] == "jobs" and parts[2] == "script":
             self._send_json(200, self.service.get_script(parts[1]))
@@ -1526,8 +2012,31 @@ class MRFRequestHandler(BaseHTTPRequestHandler):
         self._send_json(404, {"error": "not found", "error_vi": "không tìm thấy"})
 
     def _route_post(self, parts: list[str]) -> None:
+        if parts == ["brand"]:
+            name = self._read_body().get("name")
+            self._send_json(200, branding.save_name(self.service.jobs_root, name))
+            return
+        if parts == ["brand", "logo"]:
+            try:
+                size = int(self.headers.get("Content-Length") or "0")
+            except ValueError as exc:
+                raise ValueError("Content-Length không hợp lệ") from exc
+            if size <= 0 or size > 2_000_000:
+                raise ValueError("Logo PNG cần dung lượng 1 byte–2 MB.")
+            branding.save_logo(self.service.jobs_root, self.rfile.read(size))
+            self._send_json(200, {"logo_url": "/api/brand/logo"})
+            return
         if parts == ["jobs"]:
             self._send_json(201, self.service.create_job(self._read_body()))
+            return
+        if parts == ["creator-library", "series"]:
+            self._send_json(201, self.service.save_creator_series(self._read_body()))
+            return
+        if parts == ["creator-library", "briefs"]:
+            self._send_json(201, self.service.save_creator_brief(self._read_body()))
+            return
+        if len(parts) == 3 and parts[0] == "jobs" and parts[2] == "rights":
+            self._send_json(201, self.service.save_creator_rights(parts[1], self._read_body()))
             return
         if parts == ["library-searches"]:
             self._send_json(201, self.service.save_search(self._read_body()))
@@ -1540,6 +2049,41 @@ class MRFRequestHandler(BaseHTTPRequestHandler):
             filename = self.headers.get("X-Source-Name") or ""
             self._send_json(200, self.service.import_video(parts[1], filename, length, self.rfile))
             return
+        if len(parts) == 3 and parts[0] == "jobs" and parts[2] == "versions":
+            self._send_json(201, self.service.create_version(parts[1], str(self._read_body().get("name") or "")))
+            return
+        if len(parts) == 5 and parts[0] == "jobs" and parts[2] == "versions" and parts[4] == "restore":
+            self._send_json(200, self.service.restore_version(parts[1], parts[3], str(self._read_body().get("kind") or "")))
+            return
+        if len(parts) == 3 and parts[0] == "jobs" and parts[2] == "handoff":
+            self._send_json(200, self.service.build_handoff(parts[1]))
+            return
+        if len(parts) == 3 and parts[0] == "jobs" and parts[2] == "analytics":
+            try:
+                length = int(self.headers.get("Content-Length") or "0")
+            except ValueError as exc:
+                raise ValueError("Content-Length không hợp lệ") from exc
+            if length > analytics.MAX_EXPORT_BYTES:
+                raise OverflowError("Studio export exceeds 2 MB")
+            if length <= 0:
+                raise ValueError("File Studio rỗng.")
+            content = self.rfile.read(length)
+            if len(content) != length:
+                raise ValueError("File Studio tải lên không đầy đủ.")
+            self._send_json(201, self.service.import_analytics(
+                parts[1], self.headers.get("X-Studio-Format") or "", content,
+                self.headers.get("X-Studio-CTA-Seconds"),
+                unquote(self.headers.get("X-Studio-Notes") or "")))
+            return
+        if len(parts) == 3 and parts[0] == "jobs" and parts[2] == "shorts":
+            self._send_json(202, self.service.start_short(parts[1], self._read_body()))
+            return
+        if len(parts) == 4 and parts[0] == "jobs" and parts[2] == "previews":
+            self._send_json(202, self.service.start_section_preview(parts[1], int(parts[3])))
+            return
+        if len(parts) == 3 and parts[0] == "jobs" and parts[2] == "brand-render":
+            self._send_json(202, self.service.rerender_brand(parts[1], self._read_body()))
+            return
         if len(parts) == 3 and parts[0] == "jobs" and parts[2] == "run":
             self._send_json(202, self.service.start_run(parts[1]))
             return
@@ -1549,17 +2093,34 @@ class MRFRequestHandler(BaseHTTPRequestHandler):
         if len(parts) == 3 and parts[0] == "jobs" and parts[2] == "stop":
             self._send_json(202, self.service.stop_run(parts[1]))
             return
+        if len(parts) == 3 and parts[0] == "jobs" and parts[2] == "audio-mix":
+            self._send_json(200, self.service.update_audio_mix(parts[1], self._read_body()))
+            return
         if len(parts) == 3 and parts[0] == "jobs" and parts[2] == "metadata":
             self._send_json(200, self.service.update_metadata(parts[1], self._read_body()))
             return
         if len(parts) == 4 and parts[0] == "jobs" and parts[2] == "metadata" and parts[3] == "approve":
             self._send_json(200, self.service.approve_metadata(parts[1]))
             return
+        if len(parts) == 4 and parts[0] == "jobs" and parts[2] == "midroll" and parts[3] == "draft":
+            self._send_json(200, self.service.generate_midroll(parts[1]))
+            return
+        if len(parts) == 4 and parts[0] == "jobs" and parts[2] == "midroll" and parts[3] == "stage":
+            self._send_json(200, self.service.stage_midroll(parts[1], self._read_body()))
+            return
         if len(parts) == 3 and parts[0] == "jobs" and parts[2] == "script":
             self._send_json(200, self.service.update_script(parts[1], self._read_body()))
             return
+        if len(parts) == 4 and parts[0] == "jobs" and parts[2] == "script" and parts[3] == "tag":
+            self._send_json(200, self.service.tag_script(parts[1], self._read_body()))
+            return
         if len(parts) == 4 and parts[0] == "jobs" and parts[2] == "script" and parts[3] == "approve":
             self._send_json(200, self.service.approve_script(parts[1]))
+            return
+        if len(parts) == 4 and parts[0] == "jobs" and parts[2] == "thumbnails" and parts[3] == "edit":
+            body = self._read_body()
+            self._send_json(200, self.service.edit_thumbnail(
+                parts[1], str(body.get("headline") or ""), str(body.get("channel_name") or "")))
             return
         if len(parts) == 4 and parts[0] == "jobs" and parts[2] == "thumbnails" and parts[3] == "select":
             body = self._read_body()
@@ -1685,6 +2246,7 @@ INDEX_HTML = """<!DOCTYPE html>
   .project-toolbar input, .project-check input { width: auto; }
   .project-check { display: inline-flex; align-items: center; gap: 6px; margin: 0; }
   .delete-targets { max-height: 140px; overflow: auto; overflow-wrap: anywhere; color: var(--text-dim); }
+  .delete-actions { margin-top: 12px; }
   .project-card, .artifact-card { border: 1px solid var(--line); border-radius: 10px; background: var(--panel-raised); padding: 10px; }
   .project-card.active { border-color: var(--accent); background: #1c2438; }
   .project-card .open-project { display: block; width: 100%; padding: 2px; text-align: left; border: 0; background: transparent; }
@@ -1785,23 +2347,308 @@ INDEX_HTML = """<!DOCTYPE html>
   .chat-answer { min-height: 22px; margin-top: 7px; padding: 8px 10px; border-radius: 8px; background: #121722; }
   @media (max-width: 1100px) { .media-workspace { grid-template-columns: 1fr; } .player-pane { border-right: 0; border-bottom: 1px solid var(--line); } .sticky-player { position: static; } .media-list { max-height: 560px; } }
   @media (max-width: 620px) { .media-topbar { align-items: flex-start; flex-direction: column; } .media-workspace { min-height: 0; } .player-pane { padding: 10px; } .highlight-grid { grid-template-columns: 1fr; } .media-result { grid-template-columns: 96px minmax(0, 1fr); } .media-result img { width: 96px; } .search-field { flex-wrap: wrap; } .search-field input { flex-basis: 100%; } }
+  /* Compact project workspace: one task visible at a time. */
+  body { background: #10141c; font-size: 14px; }
+  header { padding: 11px 20px; }
+  .layout { grid-template-columns: minmax(250px, 290px) minmax(0, 1fr); gap: 12px; max-width: 1800px; margin: auto; padding: 12px; }
+  aside, main, #detail { min-width: 0; }
+  aside .card { margin-bottom: 10px; }
+  summary { cursor: pointer; font-weight: 650; }
+  .create-panel > summary, .library-panel > summary { list-style-position: inside; }
+  .create-panel form, .library-panel > .search-field { margin-top: 10px; }
+  .advanced-fields { margin-top: 10px; padding: 9px; border: 1px solid var(--line); border-radius: 8px; }
+  .project-list { max-height: min(48dvh, 450px); overflow: auto; overscroll-behavior: contain; }
+  .project-card { padding: 8px; }
+  .project-card .card-actions { margin-top: 3px; }
+  .project-card progress { height: 6px; }
+  .workspace-tabs { display: flex; gap: 5px; overflow-x: auto; margin-bottom: 10px; padding: 4px; border: 1px solid var(--line); border-radius: 10px; background: var(--panel); }
+  .workspace-tabs button { flex: 1; white-space: nowrap; min-width: max-content; background: transparent; border: 0; color: var(--text-dim); }
+  .workspace-tabs button[aria-selected="true"] { background: #283755; color: #fff; }
+  .workspace-view[hidden], [hidden] { display: none !important; }
+  .next-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  .next-row .action-note { flex: 1; min-width: 180px; margin-top: 8px; }
+  .stages-panel { margin-top: 10px; color: var(--text-dim); }
+  .stages-panel #stages { margin-top: 8px; }
+  .extras-panel { margin-top: 12px; }
+  .extras-panel .highlight-section { margin-top: 10px; }
+  .media-workspace { min-height: 0; }
+  .media-topbar { padding: 9px 12px; }
+  .player-pane { padding: 10px; }
+  .source-frame video { max-height: 52dvh; }
+  .media-list { max-height: min(62dvh, 650px); }
+  #view-review-form { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 320px), 1fr)); gap: 10px; align-items: start; }
+  #view-review-form .card { min-width: 0; }
+  @media (max-width: 820px) {
+    .layout { grid-template-columns: 1fr; }
+    .project-list { max-height: 210px; }
+    .media-list { max-height: 380px; }
+    .source-frame video { max-height: 32dvh; }
+    .workspace-tabs button { padding: 8px; }
+  }
+  @media (max-width: 430px) {
+    .layout { padding: 8px; gap: 8px; }
+    .card { padding: 10px; margin-bottom: 8px; }
+    .project-list { max-height: 180px; }
+    .stage { flex-wrap: wrap; }
+    .stage .name { width: auto; }
+    .next-row > button, .next-row > a { flex: 1; text-align: center; }
+  }
   @media (prefers-reduced-motion: reduce) { *, *::before, *::after { scroll-behavior: auto !important; transition-duration: .01ms !important; animation-duration: .01ms !important; animation-iteration-count: 1 !important; } }
 </style>
+<style>
+  /* ============================================================
+     Visual upgrade — modern token-based design system.
+     Layered as an override after the base sheet, so every existing
+     class/id keeps working; only the visual treatment changes. Adds a
+     real light theme selectable via [data-theme] (see header toggle).
+     ============================================================ */
+  :root{
+    color-scheme: dark;
+    --space-1:4px; --space-2:8px; --space-3:12px; --space-4:16px; --space-6:24px; --space-8:32px;
+    --r-sm:8px; --r-md:12px; --r-lg:16px; --r-pill:999px;
+    --bg-base:#0a0c11; --panel:#14171f; --panel-raised:#1b1f29; --field-bg:#0e1016;
+    --line:#242a36; --line-strong:#333a48;
+    --text:#e7e9f0; --text-dim:#9aa3b4; --text-muted:#6c7484;
+    --accent:#6366f1; --accent-hover:#7c83f6; --accent-contrast:#ffffff;
+    --accent-soft:rgba(99,102,241,.16); --ring:rgba(99,102,241,.5);
+    --ok:#34d399; --ok-soft:rgba(16,185,129,.16); --ok-line:rgba(16,185,129,.34);
+    --warn:#fbbf24; --warn-soft:rgba(245,158,11,.15); --warn-line:rgba(245,158,11,.32);
+    --err:#fb7185; --err-soft:rgba(244,63,94,.15); --err-line:rgba(244,63,94,.34);
+    --shadow-1:0 1px 2px rgba(0,0,0,.4); --shadow-2:0 8px 24px rgba(0,0,0,.36); --shadow-3:0 20px 50px rgba(0,0,0,.5);
+    --gap:16px;
+  }
+  :root[data-theme="light"]{
+    color-scheme: light;
+    --bg-base:#f5f7fb; --panel:#ffffff; --panel-raised:#ffffff; --field-bg:#f1f4f9;
+    --line:#e4e8f0; --line-strong:#cdd5e1;
+    --text:#0f172a; --text-dim:#526078; --text-muted:#8a94a6;
+    --accent:#4f46e5; --accent-hover:#4338ca; --accent-contrast:#ffffff;
+    --accent-soft:rgba(79,70,229,.10); --ring:rgba(79,70,229,.35);
+    --ok:#059669; --ok-soft:rgba(5,150,105,.12); --ok-line:rgba(5,150,105,.28);
+    --warn:#b45309; --warn-soft:rgba(180,83,9,.12); --warn-line:rgba(180,83,9,.28);
+    --err:#e11d48; --err-soft:rgba(225,29,72,.10); --err-line:rgba(225,29,72,.26);
+    --shadow-1:0 1px 2px rgba(16,24,40,.06); --shadow-2:0 8px 24px rgba(16,24,40,.10); --shadow-3:0 24px 48px rgba(16,24,40,.16);
+  }
+  body{ background:var(--bg-base); color:var(--text); font-size:14px; -webkit-font-smoothing:antialiased;
+        background-image:radial-gradient(1100px 520px at 100% -8%, var(--accent-soft), transparent 62%); background-attachment:fixed; }
+  .layout{ max-width:1820px; }
+  header{ position:sticky; top:0; z-index:30; display:flex; align-items:center; justify-content:space-between; gap:var(--space-4);
+          padding:12px 22px; border-bottom:1px solid var(--line);
+          background:var(--panel); background:color-mix(in srgb, var(--panel) 85%, transparent);
+          -webkit-backdrop-filter:saturate(1.2) blur(10px); backdrop-filter:saturate(1.2) blur(10px); }
+  header h1{ font-size:16px; letter-spacing:.01em; }
+  header .sub{ color:var(--text-dim); font-size:12px; }
+  .brand{ display:flex; align-items:center; gap:12px; min-width:0; }
+  .brand-mark{ display:grid; place-items:center; width:38px; height:38px; border-radius:11px; font-size:19px; flex:none;
+               background:linear-gradient(135deg, var(--accent), #a855f7); box-shadow:0 6px 18px var(--accent-soft); }
+  .brand-text{ min-width:0; }
+  .theme-toggle{ display:inline-flex; align-items:center; gap:8px; flex:none; padding:7px 13px; border-radius:var(--r-pill);
+                 background:var(--panel-raised); border:1px solid var(--line-strong); color:var(--text); font-size:12.5px; font-weight:650; }
+  .theme-toggle:hover{ border-color:var(--accent); color:var(--accent); }
+  .theme-toggle-icon{ font-size:14px; line-height:1; }
+  .card{ background:var(--panel); border:1px solid var(--line); border-radius:var(--r-md); padding:var(--space-4); box-shadow:var(--shadow-1); }
+  aside .card{ background:var(--panel); }
+  .card h2, .media-title h2{ letter-spacing:.01em; }
+  .muted, .notice{ color:var(--text-dim); }
+  .advanced-fields{ background:var(--field-bg); border-color:var(--line); border-radius:var(--r-sm); }
+  input, select, textarea{ background:var(--field-bg); color:var(--text); border:1px solid var(--line-strong); border-radius:var(--r-sm);
+                           padding:8px 10px; transition:border-color .15s, box-shadow .15s; }
+  input::placeholder, textarea::placeholder{ color:var(--text-muted); }
+  input:focus, select:focus, textarea:focus{ outline:none; border-color:var(--accent); box-shadow:0 0 0 3px var(--ring); }
+  button{ background:var(--panel-raised); color:var(--text); border:1px solid var(--line-strong); border-radius:var(--r-sm);
+          padding:8px 13px; font-weight:650; letter-spacing:.01em;
+          transition:background .15s, border-color .15s, transform .06s, box-shadow .15s, filter .15s; }
+  button:hover{ border-color:var(--accent); }
+  button:active{ transform:translateY(1px); }
+  button.primary, button.primary:hover{ background:linear-gradient(135deg, var(--accent), #7c83f6); border-color:transparent;
+                                        color:var(--accent-contrast); box-shadow:0 6px 18px var(--accent-soft); }
+  button.primary:hover{ filter:brightness(1.06); }
+  .button-link{ background:linear-gradient(135deg, var(--accent), #7c83f6); border-radius:var(--r-sm); box-shadow:0 6px 18px var(--accent-soft); }
+  button.danger, .danger{ color:var(--err); border-color:var(--err-line); background:var(--err-soft); }
+  button.danger:hover{ border-color:var(--err); }
+  button:disabled{ opacity:.45; }
+  :focus-visible{ outline:2px solid var(--accent); outline-offset:2px; }
+  .badge{ display:inline-flex; align-items:center; gap:6px; font-weight:650; border:1px solid transparent; font-variant-numeric:tabular-nums; }
+  .badge::before{ content:""; width:6px; height:6px; border-radius:50%; background:currentColor; flex:none; }
+  .badge.pending{ background:var(--panel-raised); color:var(--text-dim); border-color:var(--line); }
+  .badge.running{ background:var(--warn-soft); color:var(--warn); border-color:var(--warn-line); }
+  .badge.ready{ background:var(--ok-soft); color:var(--ok); border-color:var(--ok-line); }
+  .badge.failed{ background:var(--err-soft); color:var(--err); border-color:var(--err-line); }
+  .badge.skipped{ background:var(--panel-raised); color:var(--text-muted); border-color:var(--line); }
+  .badge.running::before{ animation:mrfpulse 1.2s ease-in-out infinite; }
+  @keyframes mrfpulse{ 0%,100%{opacity:1} 50%{opacity:.3} }
+  .progress{ background:var(--field-bg); border-color:var(--line); }
+  .progress > div{ background:linear-gradient(90deg, var(--accent), #7c83f6); }
+  progress.upload-progress, .project-card progress{ accent-color:var(--accent); }
+  .project-card{ background:var(--panel); border:1px solid var(--line); border-radius:var(--r-sm);
+                 transition:border-color .15s, background .15s, transform .12s; }
+  .project-card:hover{ border-color:var(--line-strong); }
+  .project-card.active{ border-color:var(--accent); background:var(--accent-soft); }
+  .project-card .open-project{ color:var(--text); }
+  .project-card .open-project:hover{ color:var(--accent); }
+  .stage{ border-bottom-color:var(--line); }
+  .stage .name{ font-variant-numeric:tabular-nums; }
+  .workspace-tabs, .media-tabs{ background:var(--field-bg); border:1px solid var(--line); border-radius:var(--r-md); }
+  .workspace-tabs button, .media-tab{ border-radius:var(--r-sm); font-weight:650; transition:background .15s, color .15s; }
+  .workspace-tabs button[aria-selected="true"], .media-tab[aria-selected="true"]{ background:var(--panel); color:var(--text); box-shadow:var(--shadow-1); }
+  .media-shell, .browser-pane{ background:var(--panel); }
+  .player-pane{ background:var(--bg-base); border-right-color:var(--line); }
+  .media-topbar, .media-searchbar, .chat-box{ border-color:var(--line); }
+  .media-title p, .player-hint, .highlight-card p{ color:var(--text-dim); }
+  .result-copy{ color:var(--text); }
+  .media-result:hover{ border-color:var(--line-strong); background:var(--panel-raised); }
+  .media-result.active{ border-color:var(--accent); background:var(--accent-soft); }
+  .media-result.active::before{ background:var(--accent); }
+  .highlight-card, .timeline-card, .track-card{ background:var(--panel); border-color:var(--line); border-radius:var(--r-sm); }
+  .timeline-card.locked{ border-color:var(--warn-line); background:var(--warn-soft); }
+  .time-chip{ color:var(--accent); background:var(--accent-soft); }
+  .speaker-chip{ color:#c4b5fd; background:rgba(139,92,246,.16); }
+  .kind-chip{ color:var(--text-dim); background:var(--panel-raised); }
+  .seek-button{ color:var(--accent); background:var(--accent-soft); border-color:var(--line-strong); }
+  .source-frame{ border-color:var(--line); box-shadow:var(--shadow-2); }
+  .state-panel{ background:var(--panel); border-color:var(--line); color:var(--text-dim); }
+  .chat-answer{ background:var(--field-bg); }
+  .thumb-item{ background:var(--panel); border-color:var(--line); border-radius:var(--r-sm); }
+  .thumb-item.selected{ border-color:var(--accent); background:var(--accent-soft); }
+  .artifact-card{ background:var(--panel); }
+  .artifact-card a, .arts a{ color:var(--accent); }
+  .action-note{ background:var(--field-bg); border-color:var(--line); border-radius:var(--r-sm); color:var(--text-dim); }
+  .gate{ background:var(--warn-soft); border-color:var(--warn-line); }
+  .ok{ color:var(--ok); } .warn{ color:var(--warn); } .err{ color:var(--err); }
+  code{ background:var(--field-bg); border:1px solid var(--line); }
+  dialog{ background:var(--panel); color:var(--text); border:1px solid var(--line); border-radius:var(--r-lg); box-shadow:var(--shadow-3); }
+  dialog::backdrop{ background:rgba(6,8,12,.6); -webkit-backdrop-filter:blur(4px); backdrop-filter:blur(4px); }
+  *{ scrollbar-width:thin; scrollbar-color:var(--line-strong) transparent; }
+  ::-webkit-scrollbar{ width:10px; height:10px; }
+  ::-webkit-scrollbar-thumb{ background:var(--line-strong); border-radius:999px; border:2px solid transparent; background-clip:padding-box; }
+  ::-webkit-scrollbar-thumb:hover{ background:var(--text-muted); }
+  @media (max-width:560px){ header{ flex-wrap:wrap; padding:10px 14px; } .theme-toggle-label{ display:none; } }
+</style>
+<style>
+  /* ============================================================
+     Horizontal control bar (top-nav) — turns the vertical sidebar
+     (Create / Project / Library) into a compact toolbar so the
+     workspace spans the full width for a pro, wide-canvas feel.
+     Pure CSS over the existing markup; ids/behaviour unchanged.
+     ============================================================ */
+  .layout{ display:block; max-width:none; padding:14px 18px; }
+  aside{ display:flex; align-items:flex-start; gap:12px; flex-wrap:wrap; margin-bottom:14px; }
+  aside > .card{ margin:0; padding:10px 12px; }
+  aside > .card > summary{ list-style:none; display:flex; align-items:center; gap:8px; font-weight:700; font-size:13px; white-space:nowrap; }
+  aside > .card > summary::-webkit-details-marker{ display:none; }
+  aside > .card > summary::before{ content:"▸"; color:var(--text-muted); font-size:11px; transition:transform .15s; }
+  aside > .card[open] > summary::before{ transform:rotate(90deg); }
+  /* Create + Library act as compact dropdown triggers */
+  .create-panel, .library-panel, .brand-panel{ position:relative; flex:0 0 auto; }
+  .brand-fields{ position:absolute; top:calc(100% + 8px); left:0; width:310px; max-width:92vw; z-index:46; padding:14px; background:var(--panel); border:1px solid var(--line); border-radius:var(--r-md); box-shadow:var(--shadow-3); }
+  .brand-preview{ display:flex; align-items:center; gap:10px; margin:8px 0; }
+  .brand-preview img{ width:52px; height:52px; object-fit:contain; background:#11151d; border-radius:12px; }
+  .brand-fields input[type=file]{ max-width:100%; }
+
+  .create-panel > summary::after{ content:"＋"; color:var(--accent); font-weight:800; margin-left:2px; }
+  .create-panel > form{ position:absolute; top:calc(100% + 8px); left:0; width:340px; max-width:92vw; z-index:45;
+    background:var(--panel); border:1px solid var(--line); border-radius:var(--r-md); box-shadow:var(--shadow-3);
+    padding:14px; max-height:72vh; overflow:auto; }
+  .library-panel[open]{ flex:1 1 320px; max-width:560px; }
+  /* Project switcher: takes remaining width, scrolls horizontally as chips */
+  .project-panel{ flex:1 1 460px; min-width:0; }
+  .project-panel > summary{ margin-bottom:8px; }
+  .project-panel .project-toolbar{ margin-bottom:8px; }
+  .project-panel .project-list{ display:flex; flex-direction:row; align-items:stretch; gap:8px;
+    max-height:none; overflow-x:auto; overflow-y:hidden; padding-bottom:6px; scroll-snap-type:x proximity; }
+  .project-panel .project-card{ flex:0 0 216px; scroll-snap-align:start; }
+  /* Full-width workspace */
+  main, #detail{ width:100%; }
+  #view-review-form{ grid-template-columns:repeat(auto-fit, minmax(min(100%, 360px), 1fr)); }
+  @media (max-width:860px){
+    aside{ flex-direction:column; align-items:stretch; }
+    .create-panel, .library-panel, .project-panel, .brand-panel{ flex:1 1 auto; width:100%; max-width:none; }
+    .brand-fields{ position:static; width:auto; max-width:none; box-shadow:none; margin-top:10px; }
+    .create-panel > form{ position:static; width:auto; max-width:none; max-height:none; box-shadow:none; padding:0; border:0; background:transparent; }
+    .project-panel .project-list{ flex-direction:column; overflow-x:hidden; overflow-y:auto; max-height:220px; }
+  }
+  /* Review/export player (“Duyệt & xuất”): a constrained 16:9 preview that fits
+     the desktop viewport, so the whole video is visible without scrolling.
+     Fixed at the component root (not an inline per-screen hack); object-fit keeps
+     the aspect ratio without distortion even when max-height clamps the box. */
+  #video{
+    display:block; width:100%; max-width:1040px; height:auto; aspect-ratio:16/9;
+    max-height:calc(100dvh - 260px); object-fit:contain; margin:10px auto 0;
+    background:#000; border-radius:10px;
+  }
+  @media (max-width:860px){ #video{ max-height:56dvh; } }
+</style>
+<script>
+  (function(){
+    try{
+      var t = localStorage.getItem('mrf-theme');
+      if(!t){ t = (window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches) ? 'light' : 'dark'; }
+      document.documentElement.setAttribute('data-theme', t);
+    }catch(e){ document.documentElement.setAttribute('data-theme','dark'); }
+  })();
+</script>
 </head>
 <body>
 <header>
-  <h1>Xưởng Review Phim — Bảng điều khiển</h1>
-  <div class="sub">Chạy cục bộ · Không tự động xuất bản · Duyệt thủ công trước khi bàn giao</div>
+  <div class="brand">
+    <span class="brand-mark" aria-hidden="true">🎬</span>
+    <div class="brand-text">
+      <h1>Xưởng Review Phim</h1>
+      <div class="sub">Import → khám phá → biên tập → duyệt và xuất</div>
+    </div>
+  </div>
+  <button id="themeToggle" class="theme-toggle" type="button" title="Đổi giao diện sáng/tối" aria-label="Đổi giao diện sáng/tối" aria-pressed="false">
+    <span class="theme-toggle-icon" aria-hidden="true">🌙</span>
+    <span class="theme-toggle-label">Tối</span>
+  </button>
 </header>
+<script>
+  (function(){
+    var btn = document.getElementById('themeToggle');
+    if(!btn){ return; }
+    function sync(){
+      var cur = document.documentElement.getAttribute('data-theme') || 'dark';
+      var icon = btn.querySelector('.theme-toggle-icon');
+      var label = btn.querySelector('.theme-toggle-label');
+      if(icon){ icon.textContent = cur === 'light' ? '☀️' : '🌙'; }
+      if(label){ label.textContent = cur === 'light' ? 'Sáng' : 'Tối'; }
+      btn.setAttribute('aria-pressed', cur === 'light' ? 'true' : 'false');
+    }
+    sync();
+    btn.addEventListener('click', function(){
+      var next = (document.documentElement.getAttribute('data-theme') === 'light') ? 'dark' : 'light';
+      document.documentElement.setAttribute('data-theme', next);
+      try{ localStorage.setItem('mrf-theme', next); }catch(e){}
+      sync();
+    });
+  })();
+</script>
 <div class="layout">
   <aside>
-    <div class="card">
-      <h2>Tạo job mới</h2>
+    <details class="card create-panel" id="createPanel">
+      <summary>Tạo project mới</summary>
       <form id="createForm">
-        <label>Mã job (job_id)</label>
-        <input name="job_id" placeholder="vd: review-abc" required>
+        <label for="sourceFile">Video MP4</label>
+        <input id="sourceFile" type="file" accept=".mp4,video/mp4">
+        <label for="newJobId">Mã project</label>
+        <input id="newJobId" name="job_id" placeholder="vd: review-abc" required>
         <label>Tên phim / truy vấn nghiên cứu</label>
         <input name="movie_title" placeholder="vd: The Matrix (1999)">
+        <details class="advanced-fields"><summary>Định hướng review</summary>
+          <label for="briefTemplateSelect">Mẫu brief dùng lại</label>
+          <select id="briefTemplateSelect"><option value="">Chọn mẫu để điền form…</option></select>
+          <button id="applyBriefTemplate" type="button">Áp dụng mẫu</button>
+          <label for="briefTemplateName">Lưu các trường bên dưới thành mẫu mới</label>
+          <input id="briefTemplateName" maxlength="200" placeholder="Tên mẫu brief">
+          <button id="saveBriefTemplate" type="button">Lưu mẫu brief</button>
+          <span id="briefTemplateMsg" class="notice" role="status"></span>
+          <label>Luận điểm chính</label><textarea name="review_thesis" rows="2" maxlength="500" placeholder="Điều bạn muốn người xem nhớ sau video"></textarea>
+          <label>Giọng kể</label><input name="tone" maxlength="120" placeholder="Hài hước, phân tích, giàu cảm xúc...">
+          <label>Khán giả</label><input name="target_audience" maxlength="200" placeholder="Người mới xem hay fan lâu năm">
+          <label>Mức tiết lộ nội dung</label><select name="spoiler_policy"><option value="unspecified">Chưa chọn</option><option value="none">Không spoiler</option><option value="limited">Spoiler hạn chế</option><option value="full">Review toàn bộ</option></select>
+          <label>Điều không được khẳng định (mỗi dòng một ý)</label><textarea name="forbidden_claims" rows="2" placeholder="Không đoán danh tính nhân vật..."></textarea>
+        </details>
+        <details class="advanced-fields"><summary>Tùy chọn dựng video</summary>
         <label>Ngôn ngữ</label>
         <input name="language" value="vi">
         <label>Bộ tạo nội dung</label>
@@ -1814,30 +2661,52 @@ INDEX_HTML = """<!DOCTYPE html>
         <input name="target_minutes" type="number" value="10" min="1" max="60" step="0.5">
         <label>Tỷ lệ khung hình</label>
         <select name="aspect_ratio"><option>16:9</option><option>9:16</option></select>
-        <label for="sourceFile">Chọn video MP4 để import</label>
-        <input id="sourceFile" type="file" accept=".mp4,video/mp4">
+        <label>Che dải watermark phía trên (0–20% chiều cao)</label>
+        <input name="brand_top_band" type="number" value="0" min="0" max="0.2" step="0.01">
+        <label>Che dải tiêu đề cũ phía dưới (0–20% chiều cao)</label>
+        <input name="brand_bottom_band" type="number" value="0" min="0" max="0.2" step="0.01">
+        </details>
         <details><summary class="muted">Hoặc nhập đường dẫn cục bộ</summary>
           <label for="sourcePath">Đường dẫn video trên máy chạy ứng dụng</label>
           <input id="sourcePath" name="source_video" placeholder="data\\raw\\....mp4">
         </details>
         <div class="row" style="margin-top:10px">
-          <button class="primary" type="submit">Tạo job</button>
+          <button class="primary" type="submit">Tạo project</button>
         </div>
         <progress id="uploadProgress" class="upload-progress" max="100" value="0" hidden></progress>
         <div id="createMsg" class="notice" role="status"></div>
       </form>
-    </div>
-    <div class="card">
-      <h2>Project</h2>
+    </details>
+    <details class="card brand-panel" id="brandPanel">
+      <summary>Thương hiệu</summary>
+      <div class="brand-fields">
+        <div class="brand-preview"><img id="brandPreview" alt="Logo kênh"><strong id="brandPreviewName">Màn Kể</strong></div>
+        <label for="brandName">Tên kênh</label>
+        <input id="brandName" maxlength="40" value="Màn Kể" autocomplete="off">
+        <button id="saveBrandName" type="button">Lưu tên kênh</button>
+        <label for="brandLogo">Thay logo PNG nền trong suốt (tối đa 2 MB)</label>
+        <input id="brandLogo" type="file" accept="image/png,.png">
+        <button id="saveBrandLogo" type="button">Lưu logo</button>
+        <div id="brandMsg" class="notice" role="status"></div>
+        <label for="brandTopBand">Che dải chữ cũ phía trên (tỷ lệ 0–0,2)</label>
+        <input id="brandTopBand" type="number" min="0" max="0.2" step="0.01" value="0">
+        <label for="brandBottomBand">Che dải tiêu đề cũ phía dưới (tỷ lệ 0–0,2)</label>
+        <input id="brandBottomBand" type="number" min="0" max="0.2" step="0.01" value="0">
+        <button id="brandRenderBtn" type="button" disabled>Dựng lại video đang chọn</button>
+        <small class="muted">Tên và logo lưu dùng chung; dải che theo từng project. <a href="/api/brand/logo.svg" download="man-ke.svg">Tải SVG gốc</a>.</small>
+      </div>
+    </details>
+    <details class="card project-panel" id="projectPanel" open>
+      <summary>Project</summary>
       <div class="project-toolbar">
         <label><input id="selectAllProjects" type="checkbox"> Chọn tất cả</label>
         <button id="deleteSelectedBtn" class="danger" type="button" disabled>Xóa đã chọn (0)</button>
       </div>
       <div id="bulkMsg" class="notice" role="status"></div>
       <div id="jobList" class="project-list" aria-live="polite">Đang tải…</div>
-    </div>
-    <div class="card">
-      <h2>Tìm trong thư viện</h2>
+    </details>
+    <details class="card library-panel">
+      <summary>Tìm trong thư viện</summary>
       <div class="search-field" role="search">
         <label class="sr-only" for="librarySearch">Tìm lời thoại hoặc nội dung hình ảnh trong mọi project</label>
         <input id="librarySearch" type="search" maxlength="200" placeholder='vd: xe đỏ person:"Person 1" location:hospital'>
@@ -1866,7 +2735,20 @@ INDEX_HTML = """<!DOCTYPE html>
         <select id="savedLibrarySearches" aria-label="Saved library searches"><option value="">Tìm kiếm đã lưu…</option></select>
       </div>
       <div id="libraryResults" class="project-list muted" aria-live="polite">Nhập từ khóa hoặc bộ lọc để tìm xuyên mọi project.</div>
-    </div>
+    </details>
+    <details class="card" id="creatorLibraryPanel">
+      <summary>Thư viện project và series</summary>
+      <label for="creatorProjectSearch">Tìm tên phim, brief, tiêu đề, mô tả, tag</label>
+      <div class="row"><input id="creatorProjectSearch" type="search" maxlength="200" placeholder="Tìm project"><button id="creatorProjectSearchBtn" type="button">Tìm</button></div>
+      <div id="creatorProjectResults" class="project-list notice" role="status"></div>
+      <label for="seriesId">Mã series</label><input id="seriesId" maxlength="100" placeholder="vd: review-ben-10">
+      <label for="seriesTitle">Tên series</label><input id="seriesTitle" maxlength="200" placeholder="Review thế giới Ben 10">
+      <label for="seriesEntries">Phim theo thứ tự (mỗi dòng: tên phim | mã project, mã tùy chọn)</label>
+      <textarea id="seriesEntries" rows="3" placeholder="Ben 10 Alien Swarm | ben-review&#10;Phần tiếp theo"></textarea>
+      <button id="saveSeriesBtn" type="button">Lưu kế hoạch series</button>
+      <div id="seriesMsg" class="notice" role="status"></div>
+      <div id="seriesList" class="project-list notice"></div>
+    </details>
   </aside>
   <main>
     <div id="empty" class="card muted">Chọn video MP4 và tạo project để bắt đầu, hoặc mở một project đã có.</div>
@@ -1876,12 +2758,12 @@ INDEX_HTML = """<!DOCTYPE html>
           <h2 id="jobTitle" style="margin:0"></h2>
           <div class="row">
             <button id="runBtn" class="primary">Chạy pipeline</button>
-            <button id="stopBtn" class="danger" style="display:none">Dừng project</button>
+            <button id="stopBtn" class="danger" hidden>Dừng project</button>
             <button id="refreshBtn">Làm mới</button>
             <button id="deleteBtn" class="danger" type="button">Xóa project</button>
           </div>
         </div>
-        <div id="nextAction" class="action-note" role="status"></div>
+        <div class="next-row"><div id="nextAction" class="action-note" role="status"></div><button id="reviewAction" type="button" hidden>Mở phần duyệt</button><a id="quickDownload" class="button-link" download="final.mp4" hidden>Tải MP4</a></div>
         <div class="notice">Chạy đến bước ảnh bìa. Duyệt kịch bản trước khi tạo giọng đọc; xuất bản là bước riêng.</div>
         <div id="sourceRetryCard" hidden>
           <label for="sourceRetry">Project chưa có video: chọn MP4 để import</label>
@@ -1892,13 +2774,16 @@ INDEX_HTML = """<!DOCTYPE html>
         <div style="margin-top:10px" class="progress"><div id="progBar"></div></div>
         <div id="progText" class="muted" style="margin-top:6px"></div>
         <div id="runErr" class="err" style="margin-top:6px"></div>
+        <details class="stages-panel"><summary>Tiến trình các bước</summary><div id="stages"></div></details>
       </div>
 
-      <div class="card">
-        <h2>Tiến trình các bước</h2>
-        <div id="stages"></div>
-      </div>
-
+      <nav class="workspace-tabs" role="tablist" aria-label="Khu vực làm việc">
+        <button type="button" role="tab" id="tab-explore" aria-controls="view-explore" aria-selected="true" data-view="explore">Khám phá</button>
+        <button type="button" role="tab" id="tab-edit" aria-controls="view-edit" aria-selected="false" data-view="edit" tabindex="-1">Biên tập</button>
+        <button type="button" role="tab" id="tab-review" aria-controls="view-review" aria-selected="false" data-view="review" tabindex="-1">Duyệt &amp; xuất</button>
+        <button type="button" role="tab" id="tab-files" aria-controls="view-files" aria-selected="false" data-view="files" tabindex="-1">Tệp</button>
+      </nav>
+      <section id="view-review" class="workspace-view" role="tabpanel" aria-labelledby="tab-review" hidden>
       <div class="card" id="videoCard" style="display:none">
         <h2>Xem trước bản dựng cuối</h2>
         <video id="video" controls preload="metadata"></video>
@@ -1907,8 +2792,68 @@ INDEX_HTML = """<!DOCTYPE html>
         <h2>Xuất video</h2>
         <div class="muted">Bản MP4 đã vượt qua bước kiểm tra chất lượng.</div>
         <a id="downloadFinal" class="button-link" download="final.mp4">Tải final.mp4</a>
+        <button id="handoffBtn" type="button">Đóng gói bàn giao</button>
+        <span id="handoffMsg" class="muted" role="status"></span>
+        <details>
+          <summary>Video ngắn 9:16 từ bản review</summary>
+          <div class="muted">Chọn 3–60 giây lời bình trong video cuối đã duyệt.</div>
+          <div class="filter-grid">
+            <label for="shortStart">Mốc đầu (giây)<input id="shortStart" type="number" min="0" step="0.1"></label>
+            <label for="shortEnd">Mốc cuối (giây)<input id="shortEnd" type="number" min="0" step="0.1"></label>
+            <button id="shortMarkStart" type="button">Lấy mốc đầu từ video</button>
+            <button id="shortMarkEnd" type="button">Lấy mốc cuối từ video</button>
+          </div>
+          <div class="row">
+            <button id="shortExportBtn" type="button">Xuất video ngắn</button>
+            <a id="shortDownload" hidden download="short-review.mp4">Tải MP4 9:16</a>
+            <a id="shortSrtDownload" hidden download="short-review.srt">Tải phụ đề SRT</a>
+          </div>
+          <span id="shortExportMsg" class="muted" role="status"></span>
+        </details>
+        <details id="analyticsPanel">
+          <summary>Học từ số liệu YouTube Studio</summary>
+          <p class="muted">Sau khi tải gói bàn giao và đăng video thủ công, nhập CSV/JSON retention đã đo. Số liệu gắn với đúng phiên bản xuất; không dự đoán lượt xem.</p>
+          <label for="studioExport">File Studio (CSV/JSON, tối đa 2 MB)</label>
+          <input id="studioExport" type="file" accept=".csv,.json,text/csv,application/json">
+          <div class="filter-grid">
+            <label for="analyticsCTA">Mốc bắt đầu CTA trong video cuối (giây, nếu có)<input id="analyticsCTA" type="number" min="0" step="0.1"></label>
+            <label for="analyticsNotes">Ghi chú rút kinh nghiệm<textarea id="analyticsNotes" maxlength="2000" rows="2"></textarea></label>
+          </div>
+          <button id="analyticsUploadBtn" type="button">Nhập số liệu đã đo</button>
+          <span id="analyticsMsg" role="status" class="muted"></span>
+          <div id="analyticsResults" role="status" class="muted"></div>
+        </details>
       </div>
-
+      <details id="rightsPanel" class="card">
+        <summary>Nguồn và quyền sử dụng tài sản</summary>
+        <p class="muted">Ghi chú do creator xác nhận; chưa kiểm chứng tự động quyền sử dụng.</p>
+        <label for="rightsAssetPath">Đường dẫn tài sản</label><input id="rightsAssetPath" maxlength="200" placeholder="Video nguồn, nhạc hoặc logo">
+        <label for="rightsSource">Nguồn tài sản</label><input id="rightsSource" maxlength="200" placeholder="Người cung cấp hoặc kho tài sản">
+        <label for="rightsUsage">Cách dùng</label><input id="rightsUsage" maxlength="200" placeholder="Trích cảnh review">
+        <label for="rightsStatus">Tình trạng quyền</label>
+        <select id="rightsStatus"><option value="unreviewed">Chưa duyệt</option><option value="permitted">Có quyền theo ghi chú</option><option value="restricted">Hạn chế sử dụng</option></select>
+        <label for="rightsEvidence">Ghi chú căn cứ / giấy phép</label><textarea id="rightsEvidence" rows="2" maxlength="1000"></textarea>
+        <button id="saveRightsBtn" type="button">Lưu ghi chú quyền</button>
+        <div id="rightsMsg" class="notice" role="status"></div>
+        <div id="rightsList" class="project-list notice"></div>
+      </details>
+      <details id="versionsPanel" class="card">
+        <summary>Phiên bản và khôi phục</summary>
+        <div class="muted">Lưu mốc trước khi sửa. Bản MP4 đạt QA trước đó vẫn có thể tải về.</div>
+        <label for="versionName">Tên phiên bản</label>
+        <input id="versionName" type="text" maxlength="100" placeholder="Ví dụ: Trước khi sửa đoạn kết">
+        <button id="saveVersionBtn" type="button">Lưu phiên bản</button>
+        <label for="versionSelect">Phiên bản đã lưu</label>
+        <select id="versionSelect" aria-label="Phiên bản đã lưu"></select>
+        <label for="versionKind">Khôi phục phần</label>
+        <select id="versionKind"><option value="script">Kịch bản</option><option value="scene_plan">Cảnh</option><option value="captions">Phụ đề</option><option value="metadata">Thông tin đăng</option><option value="final">Video đã QA</option></select>
+        <button id="restoreVersionBtn" type="button">Khôi phục</button>
+        <a id="versionDownload" hidden download="final.mp4">Tải bản MP4 cũ</a>
+        <span id="versionMsg" class="muted" role="status"></span>
+      </details>
+      <div id="qaFindings" class="card muted" role="status" hidden></div>
+      </section>
+      <section id="view-explore" class="workspace-view" role="tabpanel" aria-labelledby="tab-explore">
       <section class="card media-shell" id="mediaExplorerCard" style="display:none" aria-labelledby="mediaExplorerTitle">
         <div class="media-topbar">
           <div class="media-title">
@@ -1923,9 +2868,10 @@ INDEX_HTML = """<!DOCTYPE html>
           <div class="player-pane">
             <div class="sticky-player">
               <div class="source-frame">
-                <video id="sourceVideo" controls preload="metadata" aria-label="Source media player"><track id="sourceCaptions" kind="subtitles" srclang="vi" label="Vietnamese" default></video>
+                <video id="sourceVideo" controls preload="metadata" aria-label="Source media player"><track id="sourceCaptions" kind="subtitles" srclang="und" label="Lời thoại nguồn" default></video>
               </div>
               <div class="player-hint"><span>Click a transcript row or scene to seek</span><span id="playerTime" aria-live="off">00:00</span></div>
+              <details class="extras-panel"><summary>Highlights và hỏi đáp video</summary>
               <section class="highlight-section" aria-labelledby="highlightsHeading">
                 <div class="section-heading"><h3 id="highlightsHeading">Smart highlights</h3><span class="muted">Vertical-ready picks</span></div>
                 <div id="highlightResults" class="highlight-grid"><div class="state-panel">Loading highlights…</div></div>
@@ -1935,6 +2881,7 @@ INDEX_HTML = """<!DOCTYPE html>
                 <div class="search-field"><label class="sr-only" for="chatQuestion">Question about this video</label><input id="chatQuestion" maxlength="500" placeholder="What happens after the lighthouse scene?"><button id="chatAskBtn" type="button">Ask</button></div>
                 <div id="chatAnswer" class="chat-answer notice" aria-live="polite">Ask a question to find grounded moments.</div>
               </section>
+              </details>
             </div>
           </div>
           <div class="browser-pane">
@@ -1953,34 +2900,98 @@ INDEX_HTML = """<!DOCTYPE html>
         </div>
       </section>
 
+      </section>
+      <section id="view-edit" class="workspace-view" role="tabpanel" aria-labelledby="tab-edit" hidden>
+      <details class="card" id="audioPanel">
+        <summary>Âm thanh</summary>
+        <p class="muted">Mặc định chỉ dùng lời đọc. Nhạc và hiệu ứng phải có ghi chú quyền sử dụng; nhạc tự hạ khi có lời đọc. Không lấy tiếng phim nguồn.</p>
+        <label for="audioVoiceGain">Lời đọc (dB)</label>
+        <input id="audioVoiceGain" type="number" min="-12" max="12" step="0.5" value="0">
+        <label for="audioMusicPath">Tệp nhạc nền trên máy (để trống nếu không dùng)</label>
+        <input id="audioMusicPath" type="text" placeholder="Đường dẫn tệp âm thanh">
+        <label for="audioMusicRights">Quyền sử dụng nhạc nền</label>
+        <input id="audioMusicRights" type="text" placeholder="Ví dụ: tự sáng tác hoặc giấy phép sử dụng">
+        <label for="audioMusicGain">Nhạc nền (dB)</label>
+        <input id="audioMusicGain" type="number" min="-36" max="0" step="0.5" value="-18">
+        <label for="audioEffectPath">Tệp hiệu ứng (để trống nếu không dùng)</label>
+        <input id="audioEffectPath" type="text" placeholder="Đường dẫn tệp âm thanh">
+        <label for="audioEffectRights">Quyền sử dụng hiệu ứng</label>
+        <input id="audioEffectRights" type="text" placeholder="Ví dụ: tự thu âm">
+        <label for="audioEffectTime">Vị trí hiệu ứng (giây)</label>
+        <input id="audioEffectTime" type="number" min="0" step="0.1" value="0">
+        <label for="audioEffectGain">Hiệu ứng (dB)</label>
+        <input id="audioEffectGain" type="number" min="-36" max="0" step="0.5" value="-12">
+        <button id="audioSaveBtn" type="button">Lưu âm thanh</button>
+        <div id="audioMsg" class="notice" role="status"></div>
+      </details>
       <div class="card" id="editorCard" style="display:none">
         <div class="row" style="justify-content:space-between">
           <h2 style="margin:0">Timeline &amp; Continuity</h2>
           <button id="autoBrollBtn" type="button">Auto B-roll lặp cảnh</button>
         </div>
         <div class="muted">Khóa clip để giữ nguyên; trim/replace chỉ làm mất hiệu lực các bước sau scene plan.</div>
+        <details id="sectionPreviewPanel">
+          <summary>Xem nhanh một phần · 540p</summary>
+          <p class="muted">Chọn phần để dựng thử từ các cảnh đã chọn, giọng đọc và phụ đề có mốc thời gian. Không dựng lại toàn bộ video.</p>
+          <div class="row"><label for="sectionPreviewSelect">Phần cần xem <select id="sectionPreviewSelect"></select></label>
+            <button id="sectionPreviewBtn" type="button">Dựng nhanh phần này</button>
+            <a id="sectionPreviewDownload" hidden download="section-preview.mp4">Tải MP4</a>
+            <a id="sectionPreviewSrt" hidden download="section-preview.srt">Tải SRT</a></div>
+          <video id="sectionPreviewVideo" controls preload="metadata" style="width:100%;max-height:440px" hidden aria-label="Xem trước phần đã chọn"></video>
+          <div id="sectionPreviewMsg" class="notice" role="status"></div>
+        </details>
         <div id="continuityTracks" class="continuity-grid"></div>
         <div id="timelineList" class="timeline-list"></div>
         <div id="editorMsg" class="notice" role="status"></div>
       </div>
 
+      </section>
+      <section id="view-review-content" class="workspace-view" hidden>
       <div class="card" id="thumbnailCard" style="display:none">
         <h2>Chọn ảnh bìa</h2>
         <div class="muted">Chọn một trong các frame đã tạo. Ảnh được chọn sẽ trở thành <code>thumbnail.jpg</code>.</div>
         <div id="thumbnailGrid" class="thumb-grid" style="margin-top:10px"></div>
-        <div id="thumbnailMsg" class="notice"></div>
+        <details id="thumbnailEditor" style="margin-top:12px">
+          <summary>Tạo ảnh bìa với chữ và thương hiệu</summary>
+          <p class="muted">Ba phương án trên ảnh có sẵn. Chữ nằm trong vùng an toàn; xem bản thu nhỏ trước khi chọn. Thay ảnh sẽ cần duyệt lại metadata và gói xuất.</p>
+          <div class="filter-grid">
+            <label for="thumbnailHeadline">Dòng chính (tối đa 64 ký tự)<input id="thumbnailHeadline" maxlength="64" placeholder="BEN 10: AI ĐANG ĐIỀU KHIỂN THỜI GIAN?"></label>
+            <label for="thumbnailChannel">Tên kênh trên ảnh<input id="thumbnailChannel" maxlength="40"></label>
+          </div>
+          <button id="thumbnailEditBtn" type="button">Tạo 3 phương án</button>
+          <div id="thumbnailVariantGrid" class="thumb-grid" style="margin-top:10px"></div>
+        </details>
+        <div id="thumbnailMsg" class="notice" role="status"></div>
       </div>
 
-      <div class="card">
-        <h2>Tệp project</h2>
-        <div id="artifacts" class="artifact-grid muted"></div>
-      </div>
-
+      </section>
+      <section id="view-files" class="workspace-view" role="tabpanel" aria-labelledby="tab-files" hidden>
+        <div class="card"><h2>Tệp project</h2><div id="artifacts" class="artifact-grid muted"></div></div>
+      </section>
+      <section id="view-review-form" class="workspace-view" hidden>
       <div class="card">
         <h2>Kịch bản &amp; Duyệt</h2>
+        <details id="midrollPanel">
+          <summary>CTA giữa video · AGY</summary>
+          <p class="muted">AGY viết câu hài ngắn tại ranh giới gần 50% video. Bạn duyệt câu trong kịch bản trước khi dựng lại.</p>
+          <button id="midrollDraftBtn" type="button">AGY viết câu CTA</button>
+          <label for="midrollLine">Lời thoại (có thể chỉnh sửa)</label>
+          <textarea id="midrollLine" rows="3" maxlength="250" placeholder="Câu CTA sẽ hiện ở đây"></textarea>
+          <div class="row"><button id="midrollStageBtn" type="button" disabled>Chèn vào kịch bản</button></div>
+          <div id="midrollMsg" class="notice" role="status"></div>
+        </details>
         <div id="scriptState" class="muted"></div>
         <label>Nội dung các phần (JSON sections)</label>
         <textarea id="scriptSections" rows="8"></textarea>
+        <details><summary>Gắn nhãn lời dẫn và nguồn chứng cứ</summary>
+          <label>Phần lời dẫn đã lưu</label><select id="tagSection"></select>
+          <label>Bôi đen đoạn cần gắn nhãn</label><textarea id="tagNarration" rows="4" readonly></textarea>
+          <div class="row"><select id="tagKind"><option value="plot_recap">Kể lại tình tiết</option><option value="opinion">Nhận xét riêng</option></select>
+          <input id="tagEvidence" placeholder="scene:1 hoặc transcript:2"></div>
+          <button id="tagScriptBtn" type="button" disabled>Gắn nhãn đoạn đã chọn</button>
+          <div class="muted">Mốc chỉ xác nhận nguồn có tồn tại; người làm review cần đối chiếu nội dung.</div>
+          <div id="tagScriptMsg" class="notice" role="status"></div>
+        </details>
         <div class="row" style="margin-top:10px">
           <button id="saveScriptBtn" disabled>Lưu kịch bản</button>
           <button id="approveScriptBtn" class="primary" disabled>Duyệt kịch bản</button>
@@ -2020,6 +3031,7 @@ INDEX_HTML = """<!DOCTYPE html>
           <div id="pubMsg" class="notice"></div>
         </div>
       </div>
+      </section>
     </div>
   </main>
 </div>
@@ -2030,7 +3042,7 @@ INDEX_HTML = """<!DOCTYPE html>
     <div id="deleteTargets" class="delete-targets"></div>
     <label id="deleteConfirmLabel" for="deleteConfirm">Nhập đúng mã project để xác nhận</label>
     <input id="deleteConfirm" autocomplete="off" required>
-    <div class="row"><button type="button" id="cancelDelete">Hủy</button><button id="confirmDelete" class="danger" type="submit" disabled>Xóa project</button></div>
+    <div class="row delete-actions"><button type="button" id="cancelDelete">Hủy</button><button id="confirmDelete" class="danger" type="submit" disabled>Xóa project</button></div>
     <div id="deleteMsg" class="err" role="alert"></div>
   </form>
 </dialog>
@@ -2038,6 +3050,38 @@ INDEX_HTML = """<!DOCTYPE html>
 const $ = (id) => document.getElementById(id);
 let current = null;
 let poller = null;
+let editorLoaded = null;
+function setWorkspaceView(view) {
+  for (const tab of document.querySelectorAll('.workspace-tabs [role="tab"]')) {
+    const active = tab.dataset.view === view;
+    tab.setAttribute('aria-selected', String(active));
+    tab.tabIndex = active ? 0 : -1;
+  }
+  for (const name of ['explore', 'edit', 'review', 'files']) $('view-' + name).hidden = name !== view;
+  $('view-review-content').hidden = view !== 'review';
+  $('view-review-form').hidden = view !== 'review';
+}
+document.querySelectorAll('.workspace-tabs [role="tab"]').forEach(tab => {
+  tab.addEventListener('click', () => setWorkspaceView(tab.dataset.view));
+  tab.addEventListener('keydown', event => {
+    const tabs = [...document.querySelectorAll('.workspace-tabs [role="tab"]')];
+    const i = tabs.indexOf(tab);
+    const target = event.key === 'ArrowRight' ? tabs[(i + 1) % tabs.length]
+      : event.key === 'ArrowLeft' ? tabs[(i + tabs.length - 1) % tabs.length]
+      : event.key === 'Home' ? tabs[0] : event.key === 'End' ? tabs[tabs.length - 1] : null;
+    if (target) { event.preventDefault(); target.focus(); setWorkspaceView(target.dataset.view); }
+  });
+});
+$('reviewAction').onclick = () => { setWorkspaceView('review'); $('scriptSections').focus(); };
+$('sourceFile').onchange = () => {
+  const input = $('newJobId');
+  if (input.value.trim()) return;
+  const file = $('sourceFile').files[0];
+  if (file) input.value = file.name.replace(/[.]mp4$/i, '').normalize('NFKD')
+    .replace(/[\\u0300-\\u036f]/g, '').toLowerCase().replace(/[^a-z0-9_-]+/g, '-')
+    .replace(/^-+|-+$/g, '').slice(0, 64) || 'video-project';
+};
+
 const selectedProjects = new Set();
 let projectJobs = [];
 let thumbnailObjectUrls = [];
@@ -2068,11 +3112,54 @@ async function api(method, path, body) {
   return data;
 }
 
-function uploadVideo(id, file) {
+async function loadBrand() {
+  const brand = await api('GET', '/api/brand');
+  $('brandName').value = brand.name;
+  $('brandPreviewName').textContent = brand.name;
+  $('brandPreview').src = brand.logo_url + '?v=' + Date.now();
+}
+$('saveBrandName').onclick = async () => {
+  try {
+    const brand = await api('POST', '/api/brand', {name: $('brandName').value});
+    $('brandPreviewName').textContent = brand.name;
+    $('brandMsg').textContent = 'Đã lưu tên kênh cho các lần dựng tiếp theo.';
+  } catch (error) { $('brandMsg').textContent = error.message; }
+};
+$('saveBrandLogo').onclick = async () => {
+  const file = $('brandLogo').files[0];
+  if (!file || file.type !== 'image/png' || file.size > 2000000) {
+    $('brandMsg').textContent = 'Chọn PNG nền trong suốt, tối đa 2 MB.'; return;
+  }
+  try {
+    const headers = {'Content-Type':'image/png'};
+    if (_tok) headers.Authorization = 'Bearer ' + _tok;
+    const response = await fetch('/api/brand/logo', {method:'POST', headers, body:file});
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.error_vi || result.error);
+    $('brandPreview').src = result.logo_url + '?v=' + Date.now();
+    $('brandMsg').textContent = 'Đã lưu logo cho các lần dựng tiếp theo.';
+  } catch (error) { $('brandMsg').textContent = error.message; }
+};
+$('brandRenderBtn').onclick = async () => {
+  if (!current) return;
+  $('brandRenderBtn').disabled = true;
+  try {
+    await api('POST', '/api/jobs/' + encodeURIComponent(current) + '/brand-render',
+      {top_band:Number($('brandTopBand').value), bottom_band:Number($('brandBottomBand').value)});
+    $('brandMsg').textContent = 'Đang dựng lại video với tên, logo và dải che đã chọn.';
+    loadStatus();
+  } catch (error) {
+    $('brandMsg').textContent = error.message;
+    $('brandRenderBtn').disabled = false;
+  }
+};
+loadBrand().catch(error => { $('brandMsg').textContent = error.message; });
+
+function uploadVideo(id, file, retry = false) {
   if (!file || !/[.]mp4$/i.test(file.name) || file.size <= 0) return Promise.reject(new Error('Chọn video MP4 không rỗng.'));
   const progress = $('uploadProgress');
-  progress.hidden = false; progress.value = 0;
-  $('createMsg').textContent = 'Đang import video ' + file.name + '…';
+  if (!retry) { progress.hidden = false; progress.value = 0; }
+  $(retry ? 'sourceRetryMsg' : 'createMsg').textContent = 'Đang import video ' + file.name + '…';
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
     xhr.open('POST', '/api/jobs/' + encodeURIComponent(id) + '/source');
@@ -2080,7 +3167,11 @@ function uploadVideo(id, file) {
     xhr.setRequestHeader('X-Source-Name', encodeURIComponent(file.name));
     xhr.setRequestHeader('Content-Type', 'video/mp4');
     xhr.upload.onprogress = event => {
-      if (event.lengthComputable) progress.value = Math.round(event.loaded * 100 / event.total);
+      if (event.lengthComputable) {
+        const percent = Math.round(event.loaded * 100 / event.total);
+        if (retry) $('sourceRetryMsg').textContent = 'Đang import video ' + percent + '%…';
+        else progress.value = percent;
+      }
     };
     xhr.onload = () => {
       progress.hidden = true;
@@ -2316,6 +3407,8 @@ async function renderMediaExplorer(query = '') {
   const video = $('sourceVideo');
   if (video.dataset.src !== data.media_href) { video.dataset.src = data.media_href; video.src = data.media_href; }
   const track = $('sourceCaptions'); track.removeAttribute('src');
+  track.srclang = data.source_language || 'und';
+  track.label = 'Lời thoại nguồn' + (data.source_language ? ' (' + data.source_language + ')' : '');
   if (data.transcript_vtt_href) { const captions = await authFetch(data.transcript_vtt_href); if (captions.startsWith('blob:')) mediaObjectUrls.push(captions); track.src = captions; track.default = true; track.addEventListener('load', () => { if (track.track) track.track.mode = 'showing'; }, {once:true}); }
   mediaExplorerData.transcript = Array.isArray(data.transcript) ? data.transcript : [];
   mediaExplorerData.shots = Array.isArray(data.shots) ? data.shots : [];
@@ -2349,6 +3442,42 @@ async function timelineAction(body) {
   await loadStatus();
 }
 
+async function refreshSectionPreview() {
+  if (!current || !$('sectionPreviewSelect').value) return;
+  const index = $('sectionPreviewSelect').value;
+  const state = await api('GET', '/api/jobs/' + encodeURIComponent(current) + '/previews/' + index);
+  $('sectionPreviewBtn').disabled = !!state.running;
+  $('sectionPreviewMsg').textContent = state.running ? 'Đang dựng phần ' + index + '…'
+    : state.error ? state.error
+    : state.href ? 'Bản xem nhanh đã sẵn sàng.' : 'Chưa có bản xem nhanh cho phần này.';
+  $('sectionPreviewDownload').hidden = !state.href;
+  $('sectionPreviewSrt').hidden = !state.srt_href;
+  const video = $('sectionPreviewVideo');
+  video.hidden = !state.href;
+  if (state.href) {
+    $('sectionPreviewDownload').href = state.href;
+    $('sectionPreviewSrt').href = state.srt_href;
+    if (video.dataset.src !== state.href) { video.dataset.src = state.href; video.src = state.href; }
+  } else if (video.dataset.src) { video.pause(); video.removeAttribute('src'); video.load(); video.dataset.src = ''; }
+}
+$('sectionPreviewSelect').onchange = () => refreshSectionPreview().catch(showError);
+$('sectionPreviewBtn').onclick = async () => {
+  if (!current) return;
+  const index = $('sectionPreviewSelect').value;
+  $('sectionPreviewBtn').disabled = true;
+  try {
+    await api('POST', '/api/jobs/' + encodeURIComponent(current) + '/previews/' + index, {});
+    $('sectionPreviewVideo').pause();
+    $('sectionPreviewVideo').removeAttribute('src');
+    $('sectionPreviewVideo').dataset.src = '';
+    $('sectionPreviewVideo').hidden = true;
+    $('sectionPreviewDownload').hidden = true;
+    $('sectionPreviewSrt').hidden = true;
+    $('sectionPreviewMsg').textContent = 'Đang dựng phần ' + index + '…';
+    await loadStatus();
+  } catch (error) { $('sectionPreviewMsg').textContent = error.message; $('sectionPreviewBtn').disabled = false; }
+};
+
 async function renderEditor() {
   const card = $('editorCard');
   let timelineData, tracksData;
@@ -2364,6 +3493,19 @@ async function renderEditor() {
     return;
   }
   card.style.display = '';
+  const selector = $('sectionPreviewSelect');
+  const previousSection = selector.value;
+  const sectionRows = [...new Map((timelineData.clips || [])
+    .filter(clip => Number.isInteger(clip.section_index) && clip.section_index > 0)
+    .map(clip => [clip.section_index, clip.section || 'Phần ' + clip.section_index])).entries()];
+  selector.replaceChildren();
+  for (const [index, title] of sectionRows) {
+    const option = document.createElement('option'); option.value = String(index);
+    option.textContent = index + ' · ' + title; selector.appendChild(option);
+  }
+  if (sectionRows.some(([index]) => String(index) === previousSection)) selector.value = previousSection;
+  $('sectionPreviewPanel').hidden = !sectionRows.length;
+  if (sectionRows.length) refreshSectionPreview().catch(showError);
   const trackBox = $('continuityTracks');
   trackBox.replaceChildren();
   for (const track of tracksData.tracks || []) {
@@ -2490,7 +3632,9 @@ async function renderThumbnails() {
   const card = $('thumbnailCard');
   const grid = $('thumbnailGrid');
   const message = $('thumbnailMsg');
+  const variantGrid = $('thumbnailVariantGrid');
   clearThumbnailObjectUrls();
+  variantGrid.replaceChildren();
 
   let result;
   try {
@@ -2498,7 +3642,7 @@ async function renderThumbnails() {
   } catch (e) {
     card.style.display = '';
     grid.replaceChildren();
-    message.innerHTML = '<span class="err">Lỗi tải ảnh bìa: ' + e.message + '</span>';
+    message.textContent = 'Lỗi tải ảnh bìa: ' + e.message;
     return;
   }
 
@@ -2514,6 +3658,13 @@ async function renderThumbnails() {
   card.style.display = '';
   grid.replaceChildren();
   message.textContent = '';
+  const edits = result.edits || {};
+  const headlineField = $('thumbnailHeadline');
+  if (headlineField.dataset.job !== current) {
+    headlineField.value = edits.headline || '';
+    $('thumbnailChannel').value = edits.channel_name || result.channel_name || '';
+    headlineField.dataset.job = current;
+  }
 
   for (const candidate of candidates) {
     if (!candidate || typeof candidate.file !== 'string') continue;
@@ -2555,7 +3706,57 @@ async function renderThumbnails() {
     item.append(img, meta, button);
     grid.appendChild(item);
   }
+
+  const edited = Array.isArray(edits.variants) ? edits.variants.slice() : [];
+  if (doc.primary_candidate && doc.primary_candidate.startsWith('thumbnail-edit-')
+      && !edited.some(item => item.file === doc.primary_candidate)) {
+    edited.unshift({file: doc.primary_candidate, preview_file: doc.primary_candidate,
+      layout: 'Bản đã chọn trước đây'});
+  }
+  for (const variant of edited) {
+    if (!variant || typeof variant.file !== 'string' || typeof variant.preview_file !== 'string') continue;
+    const item = document.createElement('div');
+    item.className = 'thumb-item' + (variant.file === doc.primary_candidate ? ' selected' : '');
+    const img = document.createElement('img');
+    img.alt = 'Ảnh bìa thu nhỏ · ' + (variant.layout || '');
+    const href = '/api/jobs/' + encodeURIComponent(current) + '/artifacts/' + encodeURIComponent(variant.preview_file);
+    const resolved = await authFetch(href);
+    if (resolved.startsWith('blob:')) thumbnailObjectUrls.push(resolved);
+    img.src = resolved;
+    const label = document.createElement('div');
+    label.className = 'muted';
+    label.textContent = (variant.layout || '') + ' · 320×180';
+    const button = document.createElement('button');
+    const selected = variant.file === doc.primary_candidate;
+    button.textContent = selected ? 'Đang dùng' : 'Chọn ảnh này';
+    button.disabled = selected;
+    button.onclick = async () => {
+      try {
+        await api('POST', '/api/jobs/' + encodeURIComponent(current) + '/thumbnails/select',
+          {candidate: variant.file});
+        await loadStatus();
+        $('thumbnailMsg').textContent = 'Đã thay ảnh bìa; hãy xem lại và duyệt metadata trước khi xuất.';
+      } catch (error) { $('thumbnailMsg').textContent = error.message; }
+    };
+    item.append(img, label, button);
+    variantGrid.appendChild(item);
+  }
 }
+$('thumbnailEditBtn').onclick = async () => {
+  if (!current) return;
+  const button = $('thumbnailEditBtn');
+  button.disabled = true;
+  $('thumbnailMsg').textContent = 'Đang tạo ba phương án ảnh bìa…';
+  try {
+    await api('POST', '/api/jobs/' + encodeURIComponent(current) + '/thumbnails/edit', {
+      headline: $('thumbnailHeadline').value,
+      channel_name: $('thumbnailChannel').value,
+    });
+    await renderThumbnails();
+    $('thumbnailMsg').textContent = 'Đã tạo ba phương án. Xem bản thu nhỏ rồi chọn một ảnh.';
+  } catch (error) { $('thumbnailMsg').textContent = error.message; }
+  finally { button.disabled = false; }
+};
 
 function librarySearchState() {
   return {
@@ -2682,6 +3883,7 @@ async function loadJobs() {
     const el = $('jobList');
     if (!jobs.length) {
       el.textContent = 'Chưa có project. Chọn video MP4 để tạo project đầu tiên.';
+      if (!current) { $('createPanel').open = true; $('projectPanel').open = false; }
       syncProjectSelection();
       return;
     }
@@ -2746,6 +3948,10 @@ function selectJob(id) {
   clearThumbnailObjectUrls();
   clearMediaObjectUrls();
   mediaLoaded = null;
+  editorLoaded = null;
+  setWorkspaceView('explore');
+  $('createPanel').open = false;
+  if (matchMedia('(max-width: 820px)').matches) $('projectPanel').open = false;
   current = id;
   $('empty').style.display = 'none';
   $('detail').style.display = '';
@@ -2753,9 +3959,102 @@ function selectJob(id) {
   delete $('video').dataset.src;
   $('video').load();
   scriptLoaded = null; metaLoaded = null;
+  $('versionsPanel').open = false;
+  $('analyticsPanel').open = false;
+  $('analyticsResults').replaceChildren();
+  $('analyticsMsg').textContent = '';
+  $('versionSelect').replaceChildren();
+  $('versionMsg').textContent = '';
   loadStatus();
+  loadMidroll();
+  loadAudioMix();
+  loadRights();
   loadJobs();
 }
+
+let otherAudioEffects = [];
+async function loadAudioMix() {
+  const jobId = current;
+  if (!jobId) return;
+  try {
+    const data = await api('GET', '/api/jobs/' + encodeURIComponent(jobId) + '/audio-mix');
+    if (current !== jobId) return;
+    const mix = data.audio_mix || {};
+    $('audioVoiceGain').value = mix.voice_gain_db ?? 0;
+    $('audioMusicPath').value = mix.music?.path || '';
+    $('audioMusicRights').value = mix.music?.rights_note || '';
+    $('audioMusicGain').value = mix.music?.gain_db ?? -18;
+    otherAudioEffects = (mix.effects || []).slice(1);
+    const effect = mix.effects?.[0] || {};
+    $('audioEffectPath').value = effect.path || '';
+    $('audioEffectRights').value = effect.rights_note || '';
+    $('audioEffectTime').value = effect.at_seconds ?? 0;
+    $('audioEffectGain').value = effect.gain_db ?? -12;
+    $('audioMsg').textContent = otherAudioEffects.length
+      ? 'Các hiệu ứng còn lại được giữ nguyên khi lưu.' : '';
+  } catch (error) { $('audioMsg').textContent = error.message; }
+}
+$('audioSaveBtn').onclick = async () => {
+  if (!current) return;
+  const musicPath = $('audioMusicPath').value.trim();
+  const effectPath = $('audioEffectPath').value.trim();
+  const data = {
+    voice_gain_db: Number($('audioVoiceGain').value),
+    music: musicPath ? {path: musicPath, rights_note: $('audioMusicRights').value.trim(),
+      gain_db: Number($('audioMusicGain').value)} : null,
+    effects: effectPath ? [{path: effectPath, rights_note: $('audioEffectRights').value.trim(),
+      at_seconds: Number($('audioEffectTime').value), gain_db: Number($('audioEffectGain').value)}, ...otherAudioEffects] : otherAudioEffects,
+  };
+  $('audioSaveBtn').disabled = true;
+  try {
+    const result = await api('POST', '/api/jobs/' + encodeURIComponent(current) + '/audio-mix', data);
+    $('audioMsg').textContent = result.changed
+      ? 'Đã lưu. Chạy tiếp để dựng lại video và kiểm tra chất lượng.' : 'Âm thanh không thay đổi.';
+    await loadStatus();
+  } catch (error) { $('audioMsg').textContent = error.message; }
+  finally { $('audioSaveBtn').disabled = false; }
+};
+
+async function loadMidroll() {
+  if (!current) return;
+  try {
+    const state = await api('GET', '/api/jobs/' + encodeURIComponent(current) + '/midroll');
+    $('midrollLine').value = state.staged?.narration || state.draft?.line || '';
+    $('midrollDraftBtn').disabled = !!state.staged || !state.approved;
+    $('midrollStageBtn').disabled = !!state.staged || !state.draft;
+    $('midrollMsg').textContent = state.staged
+      ? (state.approved ? 'CTA đã duyệt; chạy pipeline để tạo bản video mới.' : 'CTA đã chèn. Kiểm tra kịch bản và bấm Duyệt kịch bản.')
+      : state.draft ? ('AGY đã soạn câu cho mốc ' + Math.round(state.draft.start_seconds) + ' giây.') : '';
+  } catch (error) { $('midrollMsg').textContent = error.message; }
+}
+$('midrollDraftBtn').onclick = async () => {
+  $('midrollDraftBtn').disabled = true;
+  $('midrollMsg').textContent = 'AGY đang viết câu CTA…';
+  try {
+    const draft = await api('POST', '/api/jobs/' + encodeURIComponent(current) + '/midroll/draft', {});
+    $('midrollLine').value = draft.line;
+    $('midrollStageBtn').disabled = false;
+    $('midrollMsg').textContent = 'Đã soạn câu cho mốc ' + Math.round(draft.start_seconds) + ' giây. Đọc lại trước khi chèn.';
+  } catch (error) {
+    $('midrollMsg').textContent = error.message;
+  } finally { $('midrollDraftBtn').disabled = false; }
+};
+$('midrollStageBtn').onclick = async () => {
+  $('midrollStageBtn').disabled = true;
+  try {
+    const staged = await api('POST', '/api/jobs/' + encodeURIComponent(current) + '/midroll/stage',
+      {line:$('midrollLine').value});
+    $('midrollMsg').textContent = 'Đã chèn tại ' + Math.round(staged.start_seconds)
+      + ' giây. Hãy duyệt kịch bản rồi chạy pipeline. Bản MP4 cũ đã được lưu riêng.';
+    scriptLoaded = null;
+    await loadStatus();
+    await loadMidroll();
+    setWorkspaceView('review');
+  } catch (error) {
+    $('midrollMsg').textContent = error.message;
+    $('midrollStageBtn').disabled = false;
+  }
+};
 
 function badge(stage) {
   return `<span class="badge ${stage.status}" title="${stage.status_hint||''}">${stage.status_label}</span>`;
@@ -2776,7 +4075,13 @@ async function loadStatus() {
     + (s.is_indexing ? ` · đang lập chỉ mục nền${s.indexing && s.indexing.stage ? ` (${s.indexing.stage} ${s.indexing.done}/${s.indexing.total})` : ''}…` : '');
   $('runErr').textContent = s.run_error_vi ? ('Lỗi chạy: ' + s.run_error_vi) : '';
   $('runBtn').disabled = !!s.running || !!s.uploading || !s.has_source_video;
+  $('stopBtn').hidden = !s.running;
+  $('stopBtn').disabled = !s.can_stop;
   $('deleteBtn').disabled = !!s.running || !!s.uploading;
+  $('brandRenderBtn').disabled = !!s.running || !s.has_source_video;
+  $('audioSaveBtn').disabled = !!s.running;
+  if (document.activeElement !== $('brandTopBand')) $('brandTopBand').value = s.brand_top_band ?? 0;
+  if (document.activeElement !== $('brandBottomBand')) $('brandBottomBand').value = s.brand_bottom_band ?? 0;
   $('sourceRetryCard').hidden = !!s.has_source_video;
   const scriptStage = s.stages.find(stage => stage.stage === 'script');
   const renderStage = s.stages.find(stage => stage.stage === 'render');
@@ -2789,8 +4094,33 @@ async function loadStatus() {
     : scriptStage?.status === 'ready' && !s.approvals.script_approved ? 'Rà soát và duyệt kịch bản, rồi chạy tiếp để tạo video.'
     : renderStage?.status === 'failed' ? 'Bước dựng video lỗi: xem thông báo ở tiến trình rồi chạy lại.'
     : 'Chạy pipeline để tạo kịch bản và các tệp cần thiết.';
-  $('exportCard').hidden = !(s.has_final_video && qaStage?.status === 'ready');
+  const readyForDownload = !!(s.has_final_video && qaStage?.status === 'ready');
+  $('exportCard').hidden = !readyForDownload;
+  $('reviewAction').hidden = !(scriptStage?.status === 'ready' && !s.approvals.script_approved);
+  $('quickDownload').hidden = !readyForDownload;
   $('downloadFinal').href = '/api/jobs/' + encodeURIComponent(current) + '/artifacts/final.mp4';
+  $('quickDownload').href = $('downloadFinal').href;
+  $('handoffBtn').disabled = !readyForDownload || !s.approvals.script_approved || !s.approvals.metadata_approved || !!s.running;
+  const shortState = s.short_export || {};
+  $('shortExportBtn').disabled = !readyForDownload || !s.approvals.script_approved || !!s.running || !!shortState.running;
+  $('shortMarkStart').disabled = !readyForDownload;
+  $('shortMarkEnd').disabled = !readyForDownload;
+  $('shortExportMsg').textContent = shortState.running ? 'Đang xuất video ngắn…'
+    : shortState.error ? 'Không xuất được: ' + shortState.error
+    : shortState.href ? 'Video ngắn đã sẵn sàng.' : '';
+  $('shortDownload').hidden = !shortState.href;
+  $('shortSrtDownload').hidden = !shortState.srt_href;
+  if (shortState.href) $('shortDownload').href = shortState.href;
+  if (shortState.srt_href) $('shortSrtDownload').href = shortState.srt_href;
+  const qaFindings = $('qaFindings');
+  qaFindings.replaceChildren();
+  qaFindings.hidden = !(s.qa_findings || []).length;
+  for (const finding of s.qa_findings || []) {
+    const row = document.createElement('p');
+    row.textContent = (finding.review_required ? 'Cần xem lại: ' : 'Lỗi QA: ')
+      + finding.check + ' — ' + (finding.message || JSON.stringify(finding.value));
+    qaFindings.appendChild(row);
+  }
 
   $('stages').innerHTML = s.stages.map(st =>
     `<div class="stage"><div class="name">${st.stage_label}</div>${badge(st)}`
@@ -2807,13 +4137,21 @@ async function loadStatus() {
     }
   } else { vc.style.display = 'none'; }
 
-  const mediaState = current + ':' + Boolean(s.has_media_index);
+  // Refresh after background indexing or pipeline scene memory completes.
+  // Both can add AGY observations after the media index file first appears.
+  const scenePlanStage = s.stages.find(stage => stage.stage === 'scene_plan');
+  const mediaState = current + ':' + Boolean(s.has_media_index) + ':'
+    + Boolean(s.is_indexing) + ':' + (scenePlanStage?.updated_at || '');
   if (mediaLoaded !== mediaState) {
     mediaLoaded = mediaState;
     await renderMediaExplorer();
   }
-  if (s.has_media_index) await renderEditor();
-  else $('editorCard').style.display = 'none';
+  const planStage = s.stages.find(stage => stage.stage === 'scene_plan');
+  const editorState = current + ':' + (planStage?.status || '') + ':' + (planStage?.updated_at || '');
+  if (s.has_media_index && editorLoaded !== editorState) {
+    await renderEditor();
+    editorLoaded = editorState;
+  } else if (!s.has_media_index) { editorLoaded = null; $('editorCard').style.display = 'none'; }
 
   if (s.has_thumbnail) {
     await renderThumbnails();
@@ -2831,7 +4169,7 @@ async function loadStatus() {
     const card = document.createElement('div'); card.className = 'artifact-card';
     const link = document.createElement('a'); link.href = item.href;
     link.textContent = item.name; link.download = item.name;
-    if (_tok && item.kind !== 'video') link.onclick = async event => {
+    if (_tok && item.kind !== 'video' && item.kind !== 'archive') link.onclick = async event => {
       event.preventDefault();
       const resolved = await authFetch(item.href);
       const tmp = document.createElement('a');
@@ -2844,28 +4182,47 @@ async function loadStatus() {
 
   renderMeta(s.approvals);
   if (poller) { clearInterval(poller); poller = null; }
-  if (s.running || s.is_indexing) { poller = setInterval(loadStatus, 1500); }
+  if (s.running || s.is_indexing || s.section_preview?.running) { poller = setInterval(loadStatus, 1500); }
+  if ($('sectionPreviewPanel').open && $('sectionPreviewSelect').value) {
+    refreshSectionPreview().catch(showError);
+  }
 }
 
 let metaLoaded = null;
 let scriptLoaded = null;
+let tagSections = [];
+function showTagSection() {
+  const section = tagSections[Number($('tagSection').value)];
+  $('tagNarration').value = section ? section.narration || '' : '';
+}
+$('tagSection').onchange = showTagSection;
 async function renderMeta(approvals) {
   $('scriptState').innerHTML = approvals.script_present
     ? (approvals.script_approved ? '<span class="ok">Kịch bản đã được duyệt.</span>'
         : '<span class="warn">Kịch bản chưa được duyệt.</span>')
     : '<span class="muted">Chưa có kịch bản (chạy pipeline tới bước Kịch bản).</span>';
-  if (!approvals.script_present) { scriptLoaded = null; $('scriptSections').value = ''; }
-  else if (scriptLoaded !== current) {
+  if (!approvals.script_present) {
+    scriptLoaded = null; tagSections = []; $('scriptSections').value = '';
+    $('tagSection').replaceChildren(); $('tagNarration').value = '';
+  } else if (scriptLoaded !== current) {
     try {
       const { present, script } = await api('GET', '/api/jobs/' + encodeURIComponent(current) + '/script');
       if (present && script.sections !== undefined) {
         $('scriptSections').value = JSON.stringify(script.sections, null, 2);
+        tagSections = script.sections;
+        $('tagSection').replaceChildren(...tagSections.map((section, index) => {
+          const option = document.createElement('option');
+          option.value = String(index); option.textContent = section.title || 'Phần ' + (index + 1);
+          return option;
+        }));
+        showTagSection();
         scriptLoaded = current;
       }
     } catch (e) { $('scriptMsg').textContent = 'Không tải được kịch bản: ' + e.message; }
   }
   $('saveScriptBtn').disabled = !approvals.script_present;
   $('approveScriptBtn').disabled = !approvals.script_present;
+  $('tagScriptBtn').disabled = !approvals.script_present;
 
   $('metaState').innerHTML = approvals.metadata_present
     ? (approvals.metadata_approved ? '<span class="ok">Siêu dữ liệu đã được duyệt.</span>'
@@ -2894,6 +4251,14 @@ $('createForm').onsubmit = async (e) => {
   const file = $('sourceFile').files[0];
   const fd = new FormData(e.target);
   const payload = Object.fromEntries(fd.entries());
+  payload.creative_brief = {
+    review_thesis: String(payload.review_thesis || '').trim(),
+    tone: String(payload.tone || '').trim(),
+    target_audience: String(payload.target_audience || '').trim(),
+    spoiler_policy: payload.spoiler_policy || 'unspecified',
+    forbidden_claims: String(payload.forbidden_claims || '').split('\\n').map(item => item.trim()).filter(Boolean)
+  };
+  for (const key of ['review_thesis', 'tone', 'target_audience', 'spoiler_policy', 'forbidden_claims']) delete payload[key];
   if (file && payload.source_video) { $('createMsg').textContent = 'Chọn file MP4 hoặc đường dẫn, không dùng cả hai.'; return; }
   if (file && (!/[.]mp4$/i.test(file.name) || !file.size)) { $('createMsg').textContent = 'Chọn video MP4 không rỗng.'; return; }
   const submit = e.target.querySelector('[type="submit"]');
@@ -2917,7 +4282,7 @@ $('sourceRetryBtn').onclick = async () => {
   const id = current;
   $('sourceRetryBtn').disabled = true;
   try {
-    await uploadVideo(id, file);
+    await uploadVideo(id, file, true);
     $('sourceRetryMsg').textContent = 'Đã import video.';
     await loadStatus(); await loadJobs();
   } catch (err) { $('sourceRetryMsg').textContent = err.message; }
@@ -2960,12 +4325,13 @@ $('deleteForm').onsubmit = async event => {
     dialog.close();
     for (const id of deleted) selectedProjects.delete(id);
     if (deleted.includes(current)) {
-      current = null; mediaLoaded = null; scriptLoaded = null; metaLoaded = null;
+      current = null; mediaLoaded = null; editorLoaded = null; scriptLoaded = null; metaLoaded = null;
       if (poller) { clearInterval(poller); poller = null; }
       clearThumbnailObjectUrls(); clearMediaObjectUrls();
       $('sourceVideo').removeAttribute('src'); $('sourceVideo').load();
       $('video').removeAttribute('src'); delete $('video').dataset.src; $('video').load();
       $('detail').style.display = 'none'; $('empty').style.display = '';
+      $('projectPanel').open = true;
     }
     $('bulkMsg').textContent = result.failed
       ? 'Đã xóa ' + deleted.length + ' project; không xóa được ' + result.failed + '. Kiểm tra project còn lại.'
@@ -2975,11 +4341,152 @@ $('deleteForm').onsubmit = async event => {
 };
 
 $('stopBtn').onclick = async () => { await api('POST', '/api/jobs/' + encodeURIComponent(current) + '/stop', {}); await loadStatus(); };
+let savedVersions = [];
+async function loadVersions() {
+  if (!current) return;
+  const project = current;
+  const selected = $('versionSelect').value;
+  const data = await api('GET', '/api/jobs/' + encodeURIComponent(project) + '/versions');
+  if (current !== project) return;
+  savedVersions = data.versions;
+  $('versionSelect').replaceChildren();
+  for (const item of savedVersions) {
+    const option = document.createElement('option');
+    option.value = item.id;
+    option.textContent = item.name + ' · ' + new Date(item.created_at).toLocaleString('vi-VN');
+    $('versionSelect').appendChild(option);
+  }
+  if (savedVersions.some(item => item.id === selected)) $('versionSelect').value = selected;
+  updateVersionSelection();
+}
+function updateVersionSelection() {
+  const item = savedVersions.find(entry => entry.id === $('versionSelect').value);
+  $('restoreVersionBtn').disabled = !item;
+  $('versionDownload').hidden = !item?.passing_final;
+  if (item?.passing_final) $('versionDownload').href = '/api/jobs/' + encodeURIComponent(current) + '/versions/' + item.id + '/artifacts/final.mp4';
+  for (const option of $('versionKind').options) {
+    const required = {script: 'script.json', scene_plan: 'scene_plan.json', captions: 'aligned.srt', metadata: 'youtube_metadata.json', final: 'final.mp4'}[option.value];
+    option.disabled = !item?.files?.includes(required) || (option.value === 'final' && !item.passing_final);
+  }
+  if ($('versionKind').selectedOptions[0]?.disabled) {
+    const available = Array.from($('versionKind').options).find(option => !option.disabled);
+    if (available) $('versionKind').value = available.value;
+  }
+}
+$('versionsPanel').addEventListener('toggle', () => {
+  if ($('versionsPanel').open) loadVersions().catch(error => { $('versionMsg').textContent = error.message; });
+});
+$('versionSelect').onchange = updateVersionSelection;
+$('saveVersionBtn').onclick = async () => {
+  const button = $('saveVersionBtn');
+  button.disabled = true;
+  try {
+    await api('POST', '/api/jobs/' + encodeURIComponent(current) + '/versions', {name: $('versionName').value.trim()});
+    await loadVersions();
+    $('versionName').value = '';
+    $('versionMsg').textContent = 'Đã lưu phiên bản.';
+  } catch (error) { $('versionMsg').textContent = error.message; }
+  finally { button.disabled = false; }
+};
+$('restoreVersionBtn').onclick = async () => {
+  const button = $('restoreVersionBtn');
+  button.disabled = true;
+  try {
+    await api('POST', '/api/jobs/' + encodeURIComponent(current) + '/versions/' + $('versionSelect').value + '/restore', {kind: $('versionKind').value});
+    scriptLoaded = null; metaLoaded = null; editorLoaded = null;
+    await Promise.all([loadVersions(), loadStatus()]);
+    $('versionMsg').textContent = 'Đã khôi phục. Nếu nội dung thay đổi, duyệt lại trước khi dựng.';
+  } catch (error) { $('versionMsg').textContent = error.message; }
+  finally { button.disabled = false; }
+};
+$('shortMarkStart').onclick = () => { $('shortStart').value = $('video').currentTime.toFixed(1); };
+$('shortMarkEnd').onclick = () => { $('shortEnd').value = $('video').currentTime.toFixed(1); };
+$('shortExportBtn').onclick = async () => {
+  const button = $('shortExportBtn');
+  button.disabled = true;
+  $('shortExportMsg').textContent = 'Đang bắt đầu xuất video ngắn…';
+  try {
+    await api('POST', '/api/jobs/' + encodeURIComponent(current) + '/shorts', {
+      start_seconds: Number($('shortStart').value),
+      end_seconds: Number($('shortEnd').value),
+    });
+    await loadStatus();
+  } catch (error) {
+    $('shortExportMsg').textContent = error.message;
+    button.disabled = false;
+  }
+};
+function renderAnalytics(imports) {
+  const panel = $('analyticsResults');
+  panel.replaceChildren();
+  if (!imports.length) { panel.textContent = 'Chưa nhập số liệu cho project này.'; return; }
+  const report = imports[0];
+  const m = report.measurements || {};
+  const shown = [
+    'Bản xuất: ' + String(report.approved_revision_sha256 || '').slice(0, 12),
+    'Impressions: ' + (report.impressions ?? 'Chưa có'),
+    'CTR Studio: ' + (report.ctr_percent == null ? 'Chưa có' : report.ctr_percent + '%'),
+    'Rơi ở intro: ' + (m.intro_drop_percentage_points == null ? 'Thiếu mẫu quanh giây 30' : m.intro_drop_percentage_points + ' điểm %'),
+    'Rơi quanh CTA: ' + (m.cta_drop_percentage_points == null ? 'Thiếu mốc hoặc mẫu gần CTA' : m.cta_drop_percentage_points + ' điểm %'),
+    'Ghi chú: ' + (report.notes || 'Chưa có'),
+    'Kết quả thử thumbnail/tiêu đề: ' + (report.test_results || []).map(item => item.variant + ': ' + item.result).join('; '),
+    'Số lần nhập: ' + imports.length,
+  ];
+  for (const line of shown) {
+    const row = document.createElement('div');
+    row.textContent = line;
+    panel.appendChild(row);
+  }
+}
+async function loadAnalytics() {
+  if (!current) return;
+  const project = current;
+  const data = await api('GET', '/api/jobs/' + encodeURIComponent(project) + '/analytics');
+  if (current === project) renderAnalytics(data.imports || []);
+}
+$('analyticsPanel').addEventListener('toggle', () => {
+  if ($('analyticsPanel').open) loadAnalytics().catch(error => { $('analyticsMsg').textContent = error.message; });
+});
+$('analyticsUploadBtn').onclick = async () => {
+  const file = $('studioExport').files[0];
+  if (!file || file.size < 1 || file.size > 2000000 || !/[.](csv|json)$/i.test(file.name)) {
+    $('analyticsMsg').textContent = 'Chọn file CSV/JSON từ Studio, dung lượng 1 byte–2 MB.'; return;
+  }
+  const button = $('analyticsUploadBtn');
+  button.disabled = true;
+  try {
+    const headers = {'X-Studio-Format': file.name.split('.').pop().toLowerCase(),
+                     'X-Studio-Notes': encodeURIComponent($('analyticsNotes').value)};
+    if ($('analyticsCTA').value.trim()) headers['X-Studio-CTA-Seconds'] = $('analyticsCTA').value.trim();
+    if (_tok) headers['Authorization'] = 'Bearer ' + _tok;
+    const response = await fetch('/api/jobs/' + encodeURIComponent(current) + '/analytics',
+                                 {method: 'POST', headers, body: file});
+    const payload = await response.json();
+    if (!response.ok) throw new Error(payload.error_vi || payload.error || 'Không nhập được số liệu.');
+    $('analyticsMsg').textContent = 'Đã lưu số liệu cho đúng phiên bản bàn giao.';
+    await loadAnalytics();
+  } catch (error) { $('analyticsMsg').textContent = error.message; }
+  finally { button.disabled = false; }
+};
+$('handoffBtn').onclick = async () => {
+  const button = $('handoffBtn');
+  button.disabled = true;
+  $('handoffMsg').textContent = 'Đang kiểm tra và đóng gói…';
+  try {
+    const result = await api('POST', '/api/jobs/' + encodeURIComponent(current) + '/handoff', {});
+    const link = document.createElement('a');
+    link.href = result.href; link.download = result.name;
+    document.body.appendChild(link); link.click(); link.remove();
+    $('handoffMsg').textContent = 'Đã tạo gói video, phụ đề, ảnh bìa, thông tin đăng và mã kiểm tra.';
+    await loadStatus();
+  } catch (error) { $('handoffMsg').textContent = error.message; }
+  finally { button.disabled = false; }
+};
 $('runBtn').onclick = async () => {
   try { await api('POST', '/api/jobs/' + encodeURIComponent(current) + '/run', {}); loadStatus(); }
   catch (e) { $('runErr').textContent = e.message; }
 };
-$('refreshBtn').onclick = loadStatus;
+$('refreshBtn').onclick = () => { mediaLoaded = null; editorLoaded = null; loadStatus(); };
 $('mediaSearchBtn').onclick = () => renderMediaExplorer($('mediaSearch').value.trim());
 $('mediaSearch').onkeydown = event => { if (event.key === 'Enter') renderMediaExplorer($('mediaSearch').value.trim()); };
 document.querySelectorAll('[data-media-filter]').forEach(tab => tab.onclick = () => activateMediaFilter(tab.dataset.mediaFilter));
@@ -3017,6 +4524,22 @@ $('publishBtn').onclick = async () => {
   } catch (e) { $('pubMsg').innerHTML = '<span class="err">' + e.message + '</span>'; }
 };
 
+$('tagScriptBtn').onclick = async () => {
+  const input = $('tagNarration');
+  const start = Array.from(input.value.slice(0, input.selectionStart)).length;
+  const end = Array.from(input.value.slice(0, input.selectionEnd)).length;
+  if (start === end) { $('tagScriptMsg').textContent = 'Hãy bôi đen một đoạn lời dẫn.'; return; }
+  const refs = $('tagEvidence').value.split(',').map(ref => ref.trim()).filter(Boolean);
+  try {
+    await api('POST', '/api/jobs/' + encodeURIComponent(current) + '/script/tag', {
+      section_index: Number($('tagSection').value), start, end,
+      kind: $('tagKind').value, evidence_refs: refs
+    });
+    $('tagScriptMsg').textContent = 'Đã gắn nhãn. Hãy kiểm tra mốc nguồn rồi duyệt lại kịch bản.';
+    scriptLoaded = null; await loadStatus();
+  } catch (error) { $('tagScriptMsg').textContent = error.message; }
+};
+
 $('saveScriptBtn').onclick = async () => {
   try {
     const sections = JSON.parse($('scriptSections').value || '[]');
@@ -3033,6 +4556,136 @@ $('approveScriptBtn').onclick = async () => {
     loadStatus();
   } catch (e) { $('scriptMsg').innerHTML = '<span class="err">' + e.message + '</span>'; }
 };
+
+
+function creatorBriefFields() {
+  const fields = $('createForm').elements;
+  return {
+    review_thesis: fields.namedItem('review_thesis').value.trim(),
+    tone: fields.namedItem('tone').value.trim(),
+    target_audience: fields.namedItem('target_audience').value.trim(),
+    spoiler_policy: fields.namedItem('spoiler_policy').value,
+    forbidden_claims: fields.namedItem('forbidden_claims').value.split(String.fromCharCode(10)).map(value => value.trim()).filter(Boolean),
+  };
+}
+
+async function loadCreatorBriefs() {
+  const {briefs} = await api('GET', '/api/creator-library/briefs');
+  const menu = $('briefTemplateSelect');
+  menu.replaceChildren(new Option('Chọn mẫu để điền form…', ''));
+  for (const brief of briefs) menu.add(new Option(brief.name, brief.name));
+  return briefs;
+}
+$('applyBriefTemplate').onclick = async () => {
+  try {
+    const name = $('briefTemplateSelect').value;
+    const brief = (await loadCreatorBriefs()).find(item => item.name === name);
+    if (!brief) { $('briefTemplateMsg').textContent = 'Chọn một mẫu brief.'; return; }
+    const fields = $('createForm').elements;
+    for (const key of ['review_thesis', 'tone', 'target_audience', 'spoiler_policy']) {
+      fields.namedItem(key).value = brief[key] || (key === 'spoiler_policy' ? 'unspecified' : '');
+    }
+    fields.namedItem('forbidden_claims').value = (brief.forbidden_claims || []).join(String.fromCharCode(10));
+    $('briefTemplateMsg').textContent = 'Đã điền mẫu; bạn có thể sửa trước khi tạo project.';
+  } catch (error) { $('briefTemplateMsg').textContent = error.message; }
+};
+$('saveBriefTemplate').onclick = async () => {
+  try {
+    await api('POST', '/api/creator-library/briefs', {
+      name: $('briefTemplateName').value, brief: creatorBriefFields(),
+    });
+    await loadCreatorBriefs();
+    $('briefTemplateSelect').value = $('briefTemplateName').value.trim();
+    $('briefTemplateMsg').textContent = 'Đã lưu mẫu brief.';
+  } catch (error) { $('briefTemplateMsg').textContent = error.message; }
+};
+
+async function loadCreatorSeries() {
+  const {series} = await api('GET', '/api/creator-library/series');
+  const panel = $('seriesList');
+  panel.replaceChildren();
+  if (!series.length) { panel.textContent = 'Chưa có kế hoạch series.'; return; }
+  for (const plan of series) {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.textContent = plan.title + ' · ' + plan.entries.length + ' phim';
+    button.onclick = () => {
+      $('seriesId').value = plan.series_id;
+      $('seriesTitle').value = plan.title;
+      $('seriesEntries').value = plan.entries.map(entry => entry.movie_title +
+        (entry.job_id ? ' | ' + entry.job_id : '')).join(String.fromCharCode(10));
+      $('seriesMsg').textContent = 'Đã tải kế hoạch; lưu lại để cập nhật.';
+    };
+    panel.append(button);
+  }
+}
+$('saveSeriesBtn').onclick = async () => {
+  try {
+    const entries = $('seriesEntries').value.split(String.fromCharCode(10)).map(line => line.trim())
+      .filter(Boolean).map(line => {
+        const separator = line.lastIndexOf('|');
+        return {movie_title: (separator < 0 ? line : line.slice(0, separator)).trim(),
+          job_id: separator < 0 ? null : line.slice(separator + 1).trim() || null};
+      });
+    await api('POST', '/api/creator-library/series', {
+      series_id: $('seriesId').value.trim(), title: $('seriesTitle').value.trim(), entries,
+    });
+    $('seriesMsg').textContent = 'Đã lưu kế hoạch series.';
+    await loadCreatorSeries();
+  } catch (error) { $('seriesMsg').textContent = error.message; }
+};
+$('creatorProjectSearchBtn').onclick = async () => {
+  try {
+    const query = $('creatorProjectSearch').value.trim();
+    const {projects} = await api('GET', '/api/creator-library/search?q=' + encodeURIComponent(query));
+    const panel = $('creatorProjectResults');
+    panel.replaceChildren();
+    if (!projects.length) { panel.textContent = 'Không tìm thấy project.'; return; }
+    for (const project of projects) {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.textContent = (project.movie_title || project.job_id) + ' · ' + project.job_id;
+      button.onclick = () => selectJob(project.job_id);
+      panel.append(button);
+    }
+  } catch (error) { $('creatorProjectResults').textContent = error.message; }
+};
+$('creatorProjectSearch').onkeydown = event => {
+  if (event.key === 'Enter') { event.preventDefault(); $('creatorProjectSearchBtn').click(); }
+};
+
+async function loadRights() {
+  const jobId = current;
+  if (!jobId) return;
+  try {
+    const {rights} = await api('GET', '/api/jobs/' + encodeURIComponent(jobId) + '/rights');
+    if (current !== jobId) return;
+    const panel = $('rightsList');
+    panel.replaceChildren();
+    if (!rights.length) { panel.textContent = 'Chưa ghi nhận quyền sử dụng cho tài sản nào.'; return; }
+    for (const entry of rights) {
+      const line = document.createElement('div');
+      line.className = 'project-card';
+      line.textContent = entry.path + ' · ' + entry.permission_status + ' · ' +
+        entry.source + ' · ' + entry.usage + (entry.evidence_note ? ' · ' + entry.evidence_note : '');
+      panel.append(line);
+    }
+  } catch (error) { $('rightsMsg').textContent = error.message; }
+}
+$('saveRightsBtn').onclick = async () => {
+  if (!current) return;
+  try {
+    await api('POST', '/api/jobs/' + encodeURIComponent(current) + '/rights', {
+      path: $('rightsAssetPath').value.trim(), source: $('rightsSource').value.trim(),
+      usage: $('rightsUsage').value.trim(), permission_status: $('rightsStatus').value,
+      evidence_note: $('rightsEvidence').value.trim(),
+    });
+    $('rightsMsg').textContent = 'Đã lưu ghi chú nguồn và quyền.';
+    await loadRights();
+  } catch (error) { $('rightsMsg').textContent = error.message; }
+};
+loadCreatorBriefs().catch(error => { $('briefTemplateMsg').textContent = error.message; });
+loadCreatorSeries().catch(error => { $('seriesMsg').textContent = error.message; });
 
 loadJobs();
 loadSavedSearches().catch(() => {});

@@ -894,6 +894,7 @@ name = "movie-review-factory"
 version = "0.2.0"
 source = { editable = "." }
 dependencies = [
+    { name = "pillow" },
     { name = "pydantic" },
     { name = "typer" },
 ]
@@ -916,6 +917,7 @@ requires-dist = [
     { name = "fastembed", marker = "extra == 'semantic'", specifier = ">=0.7,<1" },
     { name = "faster-whisper", marker = "extra == 'media'", specifier = ">=1.1,<2" },
     { name = "ffmpeg-python", marker = "extra == 'media'", specifier = ">=0.2,<1" },
+    { name = "pillow", specifier = ">=11,<13" },
     { name = "pydantic", specifier = ">=2.11,<3" },
     { name = "typer", specifier = ">=0.16,<1" },
 ]

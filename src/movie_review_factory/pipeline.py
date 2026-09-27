@@ -1,4 +1,5 @@
 import copy
+import hashlib
 import json
 import math
 import os
@@ -9,9 +10,10 @@ import time
 from pathlib import Path
 from typing import Callable, Iterator
 
-from . import agy_vision, cancellation, scene_scoring, semantic_search
+from . import agy_vision, branding, cancellation, scene_scoring, semantic_search
 from .agy_agent import run_agy_json
 from .content_agent import run_claude_json
+from .creative_brief import prompt_creative_brief, script_evidence_issues, stale_script_tags
 from .media_store import MediaStore
 from .models import Artifact, JobConfig, JobManifest, MediaAsset, Shot, StageResult, TranscriptSegment, VisualObservation
 
@@ -24,7 +26,7 @@ _KNOWN_ARTIFACTS = (
     "ingest.json", "research.json", "transcript.json", "captions.srt",
     "scenes.json", "outline.json", "script.json", "script.md", "scene_plan.json",
     "voice.json", "narration.mp3", "alignment.json", "aligned.srt",
-    "render.json", "final.mp4", "qa.json",
+    "render.json", "final.mp4", "aligned.ass", "intro-card.png", "outro-card.png", "qa.json",
     "youtube_metadata.json", "thumbnails.json", "thumbnail.jpg",
     "thumbnail-1.jpg", "thumbnail-2.jpg", "thumbnail-3.jpg",
     "media_index.sqlite3", "publish_record.json",
@@ -40,7 +42,7 @@ _STAGE_ARTIFACTS = {
     "scene_plan": ("scene_plan.json",),
     "tts": ("voice.json", "narration.mp3"),
     "alignment": ("alignment.json", "aligned.srt"),
-    "render": ("render.json", "final.mp4"),
+    "render": ("render.json", "final.mp4", "aligned.ass"),
     "qa": ("qa.json",),
     "metadata": ("youtube_metadata.json",),
     "thumbnail": (
@@ -57,6 +59,12 @@ THUMBNAIL_SIZES = {"16:9": (1280, 720), "9:16": (720, 1280)}
 THUMBNAIL_COUNT = 3
 SCENE_PLAN_MAX_SHOTS_PER_SECTION = 6
 SCENE_PLAN_TARGET_SHOT_SECONDS = 8.0
+# Burned-in caption geometry, expressed as fractions of the real frame so the
+# same rule holds for 16:9 and 9:16 and for both the web preview and the export
+# (the preview plays the rendered MP4, so there is a single source of truth).
+SUBTITLE_BOTTOM_FRACTION = 0.10   # caption block sits ~10% above the frame bottom (lower-third safe area)
+SUBTITLE_SIDE_FRACTION = 0.075    # left/right margin -> caption width capped at ~85%
+SUBTITLE_FONT_FRACTION = 0.042    # caption font size as a fraction of frame height
 
 
 # --- manifest I/O -----------------------------------------------------------
@@ -285,13 +293,28 @@ def _transcript(root: Path, manifest: JobManifest) -> tuple[list[Artifact], str]
     except ImportError as exc:
         raise SkipStage("faster-whisper not installed - install the media extra") from exc
 
+    logical_cores = os.cpu_count() or 4
+    cpu_threads = min(8, max(1, logical_cores // 2))
+    configured_threads = os.environ.get("MRF_WHISPER_CPU_THREADS", "").strip()
+    if configured_threads:
+        cpu_threads = max(1, min(32, int(configured_threads)))
     model = WhisperModel(
         "small",
         device="cpu",
         compute_type="int8",
+        cpu_threads=cpu_threads,
         **_whisper_model_options(),
     )
-    raw_segments, _ = model.transcribe(str(src), language=cfg.language, vad_filter=True)
+    batch_size = max(1, min(16, int(os.environ.get("MRF_WHISPER_BATCH_SIZE", "4"))))
+    if batch_size > 1:
+        from faster_whisper import BatchedInferencePipeline
+
+        transcriber = BatchedInferencePipeline(model=model)
+        raw_segments, detected = transcriber.transcribe(
+            str(src), language=None, vad_filter=True, batch_size=batch_size,
+        )
+    else:
+        raw_segments, detected = model.transcribe(str(src), language=None, vad_filter=True)
     segments = [
         {
             "start_seconds": float(segment.start),
@@ -303,7 +326,8 @@ def _transcript(root: Path, manifest: JobManifest) -> tuple[list[Artifact], str]
     transcript = {
         "job_id": cfg.job_id,
         "source_video": str(src),
-        "language": cfg.language,
+        "language": getattr(detected, "language", "unknown"),
+        "output_language": cfg.language,
         "segments": segments,
     }
     srt = "\n".join(
@@ -914,9 +938,11 @@ def _outline(root: Path, manifest: JobManifest) -> tuple[list[Artifact], str]:
             f"Design a coherent {target_min:g}-minute {cfg.language} review/recap outline. "
             "Use the research and source-scene chronology below. Balance recap with original "
             "analysis, keep the hook useful, and do not invent scenes that are absent from the "
-            "provided scene context. Return 3-8 sections with relative time budgets."
+            "provided scene context. Treat creative brief as editorial preferences, not film facts. "
+            "Return 3-8 sections with relative time budgets."
         ),
         context={
+            "creative_brief": prompt_creative_brief(cfg),
             "movie_title": _movie_title(cfg),
             "language": cfg.language,
             "target_minutes": target_min,
@@ -971,6 +997,15 @@ def _outline(root: Path, manifest: JobManifest) -> tuple[list[Artifact], str]:
 
 # --- script: narration scaffold from outline --------------------------------
 
+def _script_tag_issues(root: Path, script: dict) -> list[str]:
+    stale = stale_script_tags(script)
+    issues = [f"stale evidence tags at {stale}"] if stale else []
+    issues.extend(script_evidence_issues(
+        script, _read_json(root, "scenes.json"), _read_json(root, "transcript.json")
+    ))
+    return issues
+
+
 def _script_markdown(script: dict) -> str:
     sections = script.get("sections") or []
     lines = [
@@ -1009,9 +1044,11 @@ def _script(root: Path, manifest: JobManifest) -> tuple[list[Artifact], str]:
             f"Write natural {cfg.language} narration for an original movie review/recap. "
             "Keep exactly the same section count and order as the outline. Ground plot claims "
             "in the supplied research and scene context, add analysis instead of merely retelling, "
-            "avoid long verbatim dialogue, and write enough narration to fit each section budget."
+            "avoid long verbatim dialogue, and write enough narration to fit each section budget. "
+            "Treat creative brief as editorial preferences, not film facts."
         ),
         context={
+            "creative_brief": __import__("movie_review_factory.creative_brief", fromlist=["prompt_creative_brief"]).prompt_creative_brief(cfg),
             "movie_title": _movie_title(cfg),
             "language": cfg.language,
             "target_minutes": cfg.target_minutes,
@@ -1834,6 +1871,9 @@ def _tts(root: Path, manifest: JobManifest) -> tuple[list[Artifact], str]:
     script = _read_json(root, "script.json")
     if not script.get("approved"):
         raise SkipStage("script.json not approved (set approved=true before TTS)")
+    tag_issues = _script_tag_issues(root, script)
+    if tag_issues:
+        raise SkipStage(f"script.json evidence tags need review: {'; '.join(tag_issues)}")
 
     sections = [
         {
@@ -1850,20 +1890,29 @@ def _tts(root: Path, manifest: JobManifest) -> tuple[list[Artifact], str]:
         import edge_tts
     except ImportError as exc:
         raise SkipStage("edge-tts not installed - install the tts extra") from exc
+    from . import narration_alignment
+    from .chunked_tts import synthesize_chunked
 
     cfg = manifest.config
     voice = VOICE_BY_LANGUAGE.get(cfg.language, DEFAULT_TTS_VOICE)
     narration = "\n\n".join(section["narration"] for section in sections)
     audio_path = root / "narration.mp3"
-    temporary_audio = root / "narration.synthesizing.mp3"
-    temporary_audio.unlink(missing_ok=True)
-    try:
-        edge_tts.Communicate(narration, voice).save_sync(str(temporary_audio))
-        if not temporary_audio.exists() or temporary_audio.stat().st_size <= 0:
-            raise RuntimeError("edge-tts completed without producing narration audio")
-        temporary_audio.replace(audio_path)
-    finally:
-        temporary_audio.unlink(missing_ok=True)
+    ffmpeg = shutil.which("ffmpeg")
+    ffprobe = shutil.which("ffprobe")
+    if len(narration) > 500 and (not ffmpeg or not ffprobe):
+        raise SkipStage("ffmpeg/ffprobe not on PATH - install FFmpeg for long narration")
+    no_audio_error = getattr(getattr(edge_tts, "exceptions", None), "NoAudioReceived", None)
+    if no_audio_error is None:
+        no_audio_error = type("_NoAudioReceived", (Exception,), {})
+    boundaries = synthesize_chunked(
+        narration, voice, audio_path,
+        communicate_factory=edge_tts.Communicate,
+        synthesize=narration_alignment.synthesize_with_boundaries,
+        no_audio_error=no_audio_error,
+        ffmpeg_bin=ffmpeg or "ffmpeg",
+        ffprobe_bin=ffprobe or "ffprobe",
+        sleep=time.sleep,
+    )
 
     metadata = {
         "job_id": cfg.job_id,
@@ -1873,6 +1922,8 @@ def _tts(root: Path, manifest: JobManifest) -> tuple[list[Artifact], str]:
         "audio_file": audio_path.name,
         "section_count": len(sections),
         "sections": sections,
+        "word_boundaries": boundaries,
+        "timing_mode": "tts_word_boundary",
     }
     return [
         _write_json(root, "voice.json", metadata),
@@ -1967,6 +2018,55 @@ def _narration_section_cues(sections: list[object], duration: float) -> list[dic
     return cues
 
 
+def _compact_caption_cues(cues: list[dict]) -> list[dict]:
+    """Keep each timed caption readable within two short lines."""
+    compact: list[dict] = []
+    for cue in cues:
+        text = cue["text"].strip()
+        start, end = cue["start_seconds"], cue["end_seconds"]
+        words = text.split()
+        if not words:
+            continue
+        if len(text.splitlines()) <= 2 and all(
+            len(line) <= 42 for line in text.splitlines()
+        ) and end - start <= 6:
+            chunks = [text]
+            sizes = [len(words)]
+        else:
+            max_words = max(1, min(14, int(len(words) * 6 / max(end - start, 0.001))))
+            chunks, sizes = [], []
+            position = 0
+            while position < len(words):
+                lines = [""]
+                count = 0
+                for word in words[position:]:
+                    candidate = f"{lines[-1]} {word}".strip()
+                    if len(candidate) <= 42:
+                        lines[-1] = candidate
+                    elif len(lines) == 1:
+                        lines.append(word)
+                    else:
+                        break
+                    count += 1
+                    if count >= max_words:
+                        break
+                chunks.append("\n".join(lines))
+                sizes.append(count)
+                position += count
+        elapsed = 0
+        for chunk, size in zip(chunks, sizes):
+            chunk_start = start + (end - start) * elapsed / len(words)
+            elapsed += size
+            chunk_end = end if elapsed == len(words) else start + (end - start) * elapsed / len(words)
+            compact.append({
+                "index": len(compact) + 1,
+                "start_seconds": chunk_start,
+                "end_seconds": chunk_end,
+                "text": chunk,
+            })
+    return compact
+
+
 def _script_fallback_cues(script: dict, duration: float) -> list[dict]:
     """Build deterministic cues from approved script narration for legacy jobs."""
     if not script.get("approved"):
@@ -2000,9 +2100,15 @@ def _alignment(root: Path, manifest: JobManifest) -> tuple[list[Artifact], str]:
     if duration <= 0:
         raise SkipStage("narration has no positive duration - cannot align")
 
-    aligned = _narration_section_cues(list(voice.get("sections") or []), duration)
+    from . import narration_alignment
+    boundaries = voice.get("word_boundaries")
+    aligned = (
+        narration_alignment.cues_from_boundaries(boundaries, duration)
+        if boundaries else _narration_section_cues(list(voice.get("sections") or []), duration)
+    )
     dropped = 0
-    cue_source = "voice.json"
+    cue_source = "voice.json.word_boundaries" if boundaries else "voice.json"
+    timing_mode = "tts_word_boundary" if boundaries else "estimated"
 
     if not aligned:
         aligned = _script_fallback_cues(_read_json(root, "script.json"), duration)
@@ -2020,14 +2126,23 @@ def _alignment(root: Path, manifest: JobManifest) -> tuple[list[Artifact], str]:
         dropped = len(cues) - len(aligned)
         cue_source = "captions.srt"
 
+    aligned = _compact_caption_cues(aligned)
+
+    section_bounds = (
+        narration_alignment.section_bounds_from_boundaries(
+            boundaries, list(voice.get("sections") or []), duration
+        ) if boundaries else []
+    )
     data = {
         "job_id": cfg.job_id,
         "language": cfg.language,
         "audio_file": audio_name,
         "narration_seconds": duration,
+        "section_bounds": section_bounds,
         "source_captions": cue_source,
         "cue_source": cue_source,
         "cue_count": len(aligned),
+        "timing_mode": timing_mode,
         "dropped_cues": dropped,
         "cues": aligned,
     }
@@ -2108,6 +2223,91 @@ def _escape_ffmpeg_filter_path(path: Path) -> str:
     return str(path.resolve()).replace("\\", "/").replace(":", "\\:").replace("'", r"\'")
 
 
+def _ass_timestamp(seconds: float) -> str:
+    """Render seconds as an ASS cue timestamp (H:MM:SS.cc)."""
+    centiseconds = max(0, round(seconds * 100))
+    hours, centiseconds = divmod(centiseconds, 360_000)
+    minutes, centiseconds = divmod(centiseconds, 6_000)
+    secs, centiseconds = divmod(centiseconds, 100)
+    return f"{hours}:{minutes:02}:{secs:02}.{centiseconds:02}"
+
+
+def caption_ass(
+    srt_text: str,
+    width: int,
+    height: int,
+    band: float | None = None,
+    *,
+    font_size: int | None = None,
+    margin_v: int | None = None,
+    margin_h: int | None = None,
+) -> str:
+    """Build an ASS caption script sized to the real frame.
+
+    This is the single source of truth for caption layout: the final render, the
+    section preview, and the portrait Shorts export all burn through it, so there
+    is exactly one geometry policy and no competing magic-number sets.
+
+    By default the geometry derives from the frame: bottom margin from ``band``
+    (a fraction of frame height), side margin from SUBTITLE_SIDE_FRACTION, and
+    font size from SUBTITLE_FONT_FRACTION -- the bottom-safe-area, ≤90%-width,
+    Alignment=2 policy used by the landscape review video. A caller with a
+    bespoke layout (e.g. the Shorts caption panel, which sits mid-frame rather
+    than at the bottom) may override ``margin_v``/``font_size``/``margin_h`` in
+    absolute pixels while still getting a frame-sized PlayRes.
+
+    The ASS header pins ``PlayResX``/``PlayResY`` to the real frame so every
+    pixel value below is accurate. This is required: for SRT input libass keeps
+    its own 384x288 default script, and neither the ``subtitles`` filter's
+    ``original_size`` nor ``force_style`` overrides that PlayRes -- so pixel
+    margins and font written for a 1080p (or 1920-tall portrait) frame were
+    interpreted in 384x288 and scaled up, which floated the caption into the
+    upper half as a narrow, word-per-line column. Alignment=2 pins the block
+    bottom-centre so its position never shifts with line count; MarginL/R cap
+    the width so long lines wrap inside the frame instead of overflowing.
+    """
+    if margin_v is None:
+        if band is None:
+            raise ValueError("caption_ass needs either band or margin_v")
+        margin_v = round(height * band)
+    if margin_h is None:
+        margin_h = round(width * SUBTITLE_SIDE_FRACTION)
+    if font_size is None:
+        font_size = round(height * SUBTITLE_FONT_FRACTION)
+    header = (
+        "[Script Info]\n"
+        "ScriptType: v4.00+\n"
+        f"PlayResX: {width}\n"
+        f"PlayResY: {height}\n"
+        "WrapStyle: 0\n"
+        "ScaledBorderAndShadow: yes\n"
+        "YCbCr Matrix: TV.709\n"
+        "\n"
+        "[V4+ Styles]\n"
+        "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, "
+        "OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, "
+        "ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, "
+        "MarginL, MarginR, MarginV, Encoding\n"
+        f"Style: Default,Arial,{font_size},&H00FFFFFF,&H000000FF,&H00000000,"
+        f"&H64000000,0,0,0,0,100,100,0,0,1,2,1,2,{margin_h},{margin_h},"
+        f"{margin_v},1\n"
+        "\n"
+        "[Events]\n"
+        "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, "
+        "Effect, Text\n"
+    )
+    lines: list[str] = []
+    for cue in _parse_srt(srt_text):
+        text = str(cue.get("text", "")).replace("\r\n", "\n").replace("\r", "\n")
+        # Neutralise ASS control syntax, then map SRT line breaks to hard \N.
+        text = text.replace("\\", "/").replace("{", "(").replace("}", ")")
+        text = text.replace("\n", "\\N")
+        start = _ass_timestamp(float(cue["start_seconds"]))
+        end = _ass_timestamp(float(cue["end_seconds"]))
+        lines.append(f"Dialogue: 0,{start},{end},Default,,0,0,0,,{text}")
+    return header + "\n".join(lines) + ("\n" if lines else "")
+
+
 @register_stage("render")
 def _render(root: Path, manifest: JobManifest) -> tuple[list[Artifact], str]:
     """Render selected ranges of the configured source video with narration and SRT."""
@@ -2136,14 +2336,60 @@ def _render(root: Path, manifest: JobManifest) -> tuple[list[Artifact], str]:
         raise SkipStage("ffprobe not on PATH - install FFmpeg to render")
     if not math.isfinite(source_duration) or source_duration <= 0:
         raise SkipStage("source_video has no positive duration - cannot render")
+    narration_duration = _probe_duration_seconds(narration_path)
+    if narration_duration is None:
+        raise SkipStage("ffprobe not on PATH - install FFmpeg to render")
+    if not math.isfinite(narration_duration) or narration_duration <= 0:
+        raise SkipStage("narration.mp3 has no positive duration - cannot render")
 
     plan = _read_json(root, "scene_plan.json")
     ratio = plan.get("aspect_ratio") or cfg.aspect_ratio
     if ratio not in RENDER_CANVASES:
         raise SkipStage(f"unsupported aspect_ratio {ratio!r}")
     ranges = _render_source_ranges(plan.get("clips") or [], source_duration)
+    alignment = _read_json(root, "alignment.json")
+    bounds = alignment.get("section_bounds") or []
+    bounds_by_section = {item["section_index"]: item for item in bounds}
+    voice_timed_visuals = bool(bounds_by_section) and all(
+        item.get("section_index") in bounds_by_section for item in ranges
+    )
+    if voice_timed_visuals:
+        counts: dict[int, int] = {}
+        for item in ranges:
+            section = item["section_index"]
+            counts[section] = counts.get(section, 0) + 1
+        positions: dict[int, int] = {}
+        for item in ranges:
+            section = item["section_index"]
+            position = positions.get(section, 0)
+            positions[section] = position + 1
+            span = bounds_by_section[section]["end_seconds"] - bounds_by_section[section]["start_seconds"]
+            item["duration_seconds"] = span / counts[section] if position < counts[section] - 1 else span - span / counts[section] * position
     width, height = RENDER_CANVASES[ratio]
+    max_height_raw = os.environ.get("MRF_RENDER_MAX_HEIGHT", "").strip()
+    if max_height_raw:
+        try:
+            max_height = int(max_height_raw)
+        except ValueError as exc:
+            raise ValueError("MRF_RENDER_MAX_HEIGHT must be an even positive integer") from exc
+        if max_height < 2 or max_height % 2:
+            raise ValueError("MRF_RENDER_MAX_HEIGHT must be an even positive integer")
+        if max_height < height:
+            width = max(2, round(width * max_height / height / 2) * 2)
+            height = max_height
 
+    # One transparent overlay per chapter; explicit bands cover source text only
+    # for jobs whose footage has verified letterbox bands.
+    titles = branding.chapter_titles([item["section"] for item in ranges], cfg.movie_title or "")
+    unique_titles = list(dict.fromkeys(titles))
+    overlay_paths = []
+    for number, title in enumerate(unique_titles):
+        overlay = root / f"brand-overlay-{number}.png"
+        branding.render_overlay(
+            root.parent, overlay, width, height, title,
+            cfg.brand_top_band, cfg.brand_bottom_band,
+        )
+        overlay_paths.append(overlay)
     filter_parts: list[str] = []
     concat_inputs: list[str] = []
     for item in ranges:
@@ -2177,12 +2423,134 @@ def _render(root: Path, manifest: JobManifest) -> tuple[list[Artifact], str]:
         )
         concat_inputs.append(f"[v{index}]")
     filter_parts.append(f"{''.join(concat_inputs)}concat=n={len(ranges)}:v=1:a=0[video]")
-    if subtitles_path.stat().st_size:
+    planned_duration = sum(item["duration_seconds"] for item in ranges)
+    # Each segment can lose a frame to rate conversion before concat. Reserve
+    # one second beyond any narration deficit so accumulated rounding across
+    # many clips cannot truncate the voice; -t caps the final file exactly.
+    padding = max(0.0, narration_duration - planned_duration) + 1.0
+    filter_parts.append(
+        f"[video]tpad=stop_mode=clone:stop_duration={padding:.6f}[padded]"
+    )
+    # Brand after concatenation so FFmpeg holds only one composed video stream,
+    # rather than a full-size overlay for every trimmed source clip.
+    video_label = "padded"
+    cursor = 0.0
+    intervals: dict[str, list[tuple[float, float]]] = {title: [] for title in unique_titles}
+    for item, title in zip(ranges, titles):
+        end = cursor + item["duration_seconds"]
+        intervals[title].append((cursor, end))
+        cursor = end
+    if titles:
+        last_title = titles[-1]
+        start, _ = intervals[last_title][-1]
+        intervals[last_title][-1] = (start, narration_duration + padding + 1)
+    for number, title in enumerate(unique_titles):
+        windows = "+".join(
+            f"between(t\\,{start:.6f}\\,{end:.6f})"
+            for start, end in intervals[title]
+        )
+        next_label = f"branded{number}"
         filter_parts.append(
-            f"[video]subtitles='{_escape_ffmpeg_filter_path(subtitles_path)}'[rendered]"
+            f"[{video_label}][{number + 2}:v]overlay=0:0:"
+            f"enable='{windows}':shortest=0:format=auto[{next_label}]"
+        )
+        video_label = next_label
+    if subtitles_path.stat().st_size:
+        # Bottom safe-area captions. Burn a generated ASS whose PlayRes equals
+        # the frame (see ``caption_ass``) so Alignment/MarginV/MarginL/MarginR/
+        # Fontsize are pixel-accurate. MarginV lifts the block into the lower
+        # third (above the film-title strip and clear of the player controls);
+        # the same generator feeds the section preview so both share one policy.
+        band = max(SUBTITLE_BOTTOM_FRACTION, cfg.brand_bottom_band + 0.03)
+        caption_path = root / "aligned.ass"
+        caption_path.write_text(
+            caption_ass(
+                subtitles_path.read_text(encoding="utf-8-sig"), width, height, band
+            ),
+            encoding="utf-8",
+        )
+        filter_parts.append(
+            f"[{video_label}]ass='{_escape_ffmpeg_filter_path(caption_path)}'[rendered]"
         )
     else:
-        filter_parts.append("[video]null[rendered]")
+        filter_parts.append(f"[{video_label}]null[rendered]")
+    from .audio_mix import build_audio_mix
+
+    mix = build_audio_mix(
+        _read_json(root, "audio_mix.json") if (root / "audio_mix.json").exists() else None,
+        overlay_count=len(overlay_paths),
+        duration_seconds=narration_duration,
+    )
+    filter_parts.extend(mix.filters)
+
+    # Optional branded intro/outro cards. Default 0s keeps the render identical to
+    # the no-card path (below block skipped). When enabled the cards are exact-
+    # length segments concatenated around a narration-length body, so caption and
+    # section timing (measured from the body's zero) are unchanged; only the final
+    # file grows by intro+outro. Narration stays the master audio of the body.
+    intro_seconds = float(getattr(cfg, "intro_seconds", 0.0) or 0.0)
+    outro_seconds = float(getattr(cfg, "outro_seconds", 0.0) or 0.0)
+    video_map = "[rendered]"
+    audio_map = mix.output_map
+    card_inputs: list[str] = []
+    card_paths: list[Path] = []
+    if intro_seconds > 0 or outro_seconds > 0:
+        brand_name = branding.load_settings(root.parent)["name"]
+        film_title = cfg.movie_title or "TÓM TẮT PHIM"
+        # Mix output is a bracket label; raw narration map "1:a:0" -> pad "[1:a]".
+        body_audio = (audio_map if audio_map.startswith("[")
+                      else f"[{audio_map.split(':', 1)[0]}:a]")
+        input_index = 2 + len(overlay_paths) + list(mix.input_args).count("-i")
+        segments: list[str] = []
+
+        def _silence(label: str, seconds: float) -> str:
+            return (f"anullsrc=r=48000:cl=stereo,"
+                    f"atrim=duration={seconds:.6f},asetpts=PTS-STARTPTS[{label}]")
+
+        if intro_seconds > 0:
+            intro_card = root / "intro-card.png"
+            branding.render_card(root.parent, intro_card, width, height,
+                                 headline=brand_name, sublines=[f"Review phim · {film_title}"])
+            card_paths.append(intro_card)
+            card_inputs += ["-loop", "1", "-t", f"{intro_seconds:.3f}", "-i", str(intro_card)]
+            filter_parts.append(
+                f"[{input_index}:v]scale={width}:{height},setsar=1,fps={RENDER_FRAME_RATE},"
+                f"format=yuv420p,trim=duration={intro_seconds:.6f},setpts=PTS-STARTPTS[introv]"
+            )
+            filter_parts.append(_silence("introa", intro_seconds))
+            segments += ["[introv]", "[introa]"]
+            input_index += 1
+        filter_parts.append(
+            f"[rendered]trim=duration={narration_duration:.6f},"
+            f"setpts=PTS-STARTPTS,setsar=1[bodyv]"
+        )
+        filter_parts.append(
+            f"{body_audio}atrim=duration={narration_duration:.6f},asetpts=PTS-STARTPTS,"
+            f"aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo[bodya]"
+        )
+        segments += ["[bodyv]", "[bodya]"]
+        if outro_seconds > 0:
+            outro_card = root / "outro-card.png"
+            branding.render_card(root.parent, outro_card, width, height,
+                                 headline=brand_name,
+                                 sublines=["Xem bản review đầy đủ",
+                                           "Theo dõi để xem phần tiếp theo"])
+            card_paths.append(outro_card)
+            card_inputs += ["-loop", "1", "-t", f"{outro_seconds:.3f}", "-i", str(outro_card)]
+            filter_parts.append(
+                f"[{input_index}:v]scale={width}:{height},setsar=1,fps={RENDER_FRAME_RATE},"
+                f"format=yuv420p,trim=duration={outro_seconds:.6f},setpts=PTS-STARTPTS[outrov]"
+            )
+            filter_parts.append(_silence("outroa", outro_seconds))
+            segments += ["[outrov]", "[outroa]"]
+            input_index += 1
+        segment_count = len(segments) // 2
+        filter_parts.append(
+            "".join(segments) + f"concat=n={segment_count}:v=1:a=1[showv][showa]"
+        )
+        video_map, audio_map = "[showv]", "[showa]"
+
+    total_duration = narration_duration + intro_seconds + outro_seconds
     filter_complex = ";".join(filter_parts)
 
     temporary_path = root / "final.rendering.mp4"
@@ -2195,24 +2563,52 @@ def _render(root: Path, manifest: JobManifest) -> tuple[list[Artifact], str]:
     # overruns the narration by the filter's buffered tail (~0.7s on the smoke
     # job), which exceeds RENDER_DURATION_DRIFT_SECONDS. -t pins both streams to
     # the narration length; -shortest stays as a secondary guard.
-    narration_duration = _probe_duration_seconds(narration_path)
-    if narration_duration is None:
-        raise SkipStage("ffprobe not on PATH - install FFmpeg to render")
-    if not math.isfinite(narration_duration) or narration_duration <= 0:
-        raise SkipStage("narration.mp3 has no positive duration - cannot render")
-
     command = [
         ffmpeg, "-y", "-i", str(source_path), "-i", str(narration_path),
+        *(arg for path in overlay_paths for arg in ("-i", str(path))),
+        *mix.input_args,
+        *card_inputs,
         "-filter_complex", filter_complex,
-        "-map", "[rendered]", "-map", "1:a:0",
+        "-map", video_map, "-map", audio_map,
         "-c:v", "libx264", "-preset", "fast", "-crf", "23",
         "-pix_fmt", "yuv420p", "-r", str(RENDER_FRAME_RATE),
-        "-t", f"{narration_duration:.6f}",
+        "-t", f"{total_duration:.6f}",
         "-c:a", "aac", "-b:a", "192k", "-shortest", "-movflags", "+faststart",
         str(temporary_path),
     ]
     try:
-        subprocess.run(command, capture_output=True, text=True, check=True)
+        context = cancellation.current_context()
+        if context is None:
+            subprocess.run(command, capture_output=True, text=True, check=True)
+        else:
+            cancellation.checkpoint()
+            process = subprocess.Popen(
+                command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            )
+            try:
+                if context.register_process:
+                    context.register_process(process)
+                while True:
+                    try:
+                        stdout, stderr = process.communicate(timeout=0.25)
+                        break
+                    except subprocess.TimeoutExpired:
+                        cancellation.checkpoint()
+                cancellation.checkpoint()
+                if process.returncode:
+                    raise subprocess.CalledProcessError(
+                        process.returncode, command, output=stdout, stderr=stderr,
+                    )
+            finally:
+                if process.poll() is None:
+                    process.terminate()
+                    try:
+                        process.communicate(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.communicate()
+                if context.unregister_process:
+                    context.unregister_process(process)
         if not temporary_path.exists():
             raise RuntimeError("ffmpeg completed without producing final output")
         output_duration = _probe_duration_seconds(temporary_path)
@@ -2220,13 +2616,15 @@ def _render(root: Path, manifest: JobManifest) -> tuple[list[Artifact], str]:
             raise RuntimeError("ffprobe unavailable while verifying rendered output")
         if output_duration <= 0:
             raise RuntimeError("rendered output has no positive duration")
-        if abs(output_duration - narration_duration) > RENDER_DURATION_DRIFT_SECONDS:
+        if abs(output_duration - total_duration) > RENDER_DURATION_DRIFT_SECONDS:
             raise RuntimeError(
                 f"rendered audio/video duration drift exceeds {RENDER_DURATION_DRIFT_SECONDS}s"
             )
         temporary_path.replace(final_path)
     finally:
         temporary_path.unlink(missing_ok=True)
+        for card in card_paths:
+            card.unlink(missing_ok=True)
 
     render_data = {
         "job_id": cfg.job_id,
@@ -2243,9 +2641,18 @@ def _render(root: Path, manifest: JobManifest) -> tuple[list[Artifact], str]:
         "framing_policy": "scale_pad",
         "source_duration_seconds": source_duration,
         "narration_duration_seconds": narration_duration,
+        "intro_seconds": intro_seconds,
+        "outro_seconds": outro_seconds,
         "output_duration_seconds": output_duration,
-        "duration_drift_seconds": abs(output_duration - narration_duration),
+        "duration_drift_seconds": abs(output_duration - total_duration),
         "clips": ranges,
+        "visual_timing_mode": "voice_section_bounds" if voice_timed_visuals else "scene_plan_estimate",
+        "audio_mix": {
+            "provenance": list(mix.provenance),
+            "voice_master": True,
+            "config_sha256": hashlib.sha256((root / "audio_mix.json").read_bytes()).hexdigest()
+            if (root / "audio_mix.json").is_file() else None,
+        },
     }
     artifacts = [
         _write_json(root, "render.json", render_data),
@@ -2279,6 +2686,8 @@ def _qa(root: Path, manifest: JobManifest) -> tuple[list[Artifact], str]:
     expected_height: int | None = render.get("height")
     expected_frame_rate: int = int(render.get("frame_rate", RENDER_FRAME_RATE))
     narration_duration: float | None = render.get("narration_duration_seconds")
+    intro_seconds = float(render.get("intro_seconds") or 0.0)
+    outro_seconds = float(render.get("outro_seconds") or 0.0)
 
     proc = subprocess.run(
         [ffprobe_bin, "-v", "error", "-print_format", "json",
@@ -2361,13 +2770,14 @@ def _qa(root: Path, manifest: JobManifest) -> tuple[list[Artifact], str]:
     )
 
     if narration_duration is not None and output_duration is not None:
-        drift = abs(output_duration - narration_duration)
+        expected_duration = narration_duration + intro_seconds + outro_seconds
+        drift = abs(output_duration - expected_duration)
         ok = drift <= RENDER_DURATION_DRIFT_SECONDS
         _record(
             "duration_drift",
             drift,
             ok,
-            "" if ok else f"output/narration drift {drift:.3f}s exceeds limit {RENDER_DURATION_DRIFT_SECONDS}s",
+            "" if ok else f"output/expected drift {drift:.3f}s exceeds limit {RENDER_DURATION_DRIFT_SECONDS}s",
         )
 
     alignment = _read_json(root, "alignment.json")
@@ -2386,6 +2796,26 @@ def _qa(root: Path, manifest: JobManifest) -> tuple[list[Artifact], str]:
             ok,
             "" if ok else f"cues exceed narration duration: indices {bad}",
         )
+
+    if (root / "scene_plan.json").is_file() and (root / "alignment.json").is_file() and render:
+        from . import editorial_qa
+        for editorial in editorial_qa.inspect_job(
+            root,
+            str(manifest.config.source_video or ""),
+            brand_top_band=manifest.config.brand_top_band,
+            brand_bottom_band=manifest.config.brand_bottom_band,
+        ):
+            checks.append(editorial)
+            if not editorial["passed"]:
+                failures.append(editorial["message"] or editorial["check"])
+
+    from . import media_qa
+    for signal in media_qa.inspect_rendered_media(
+        final_path, ffmpeg_bin=shutil.which("ffmpeg"), duration_seconds=output_duration,
+    ):
+        checks.append(signal)
+        if not signal["passed"]:
+            failures.append(signal["message"] or signal["check"])
 
     artifact = _write_json(root, "qa.json", {
         "job_id": manifest.config.job_id,
@@ -2550,7 +2980,7 @@ def _thumbnail(root: Path, manifest: JobManifest) -> tuple[list[Artifact], str]:
 
 
 def select_thumbnail(root: Path, candidate_name: str) -> dict:
-    """Select one generated candidate as thumbnail.jpg and invalidate publish."""
+    """Select a source or edited candidate, resetting approval only if artwork changes."""
     thumbnails = _read_json(root, "thumbnails.json")
     if not thumbnails:
         raise FileNotFoundError("thumbnails.json missing - run thumbnail stage first")
@@ -2560,6 +2990,12 @@ def select_thumbnail(root: Path, candidate_name: str) -> dict:
         for candidate in thumbnails.get("candidates", [])
         if isinstance(candidate, dict) and candidate.get("file")
     }
+    edits = _read_json(root, "thumbnail_edits.json")
+    candidates.update(
+        str(variant.get("file"))
+        for variant in edits.get("variants", [])
+        if isinstance(variant, dict) and variant.get("file")
+    )
     if candidate_name not in candidates:
         raise ValueError("thumbnail candidate is not part of this job")
 
@@ -2570,16 +3006,23 @@ def select_thumbnail(root: Path, candidate_name: str) -> dict:
         raise FileNotFoundError(f"thumbnail candidate missing: {candidate_name}")
 
     target = root / "thumbnail.jpg"
-    temporary = root / "thumbnail.jpg.tmp"
-    shutil.copyfile(source, temporary)
-    temporary.replace(target)
+    artwork_changed = not target.exists() or source.read_bytes() != target.read_bytes()
+    if artwork_changed:
+        temporary = root / "thumbnail.jpg.tmp"
+        shutil.copyfile(source, temporary)
+        temporary.replace(target)
 
     thumbnails["primary_candidate"] = candidate_name
     thumbnails["primary_thumbnail"] = target.name
     _write_json(root, "thumbnails.json", thumbnails)
 
-    # Selection changes the publish handoff, but thumbnail generation remains ready.
-    invalidate_downstream(root, "thumbnail")
+    if artwork_changed:
+        metadata = _read_json(root, "youtube_metadata.json")
+        if metadata:
+            metadata["approved"] = False
+            _write_json(root, "youtube_metadata.json", metadata)
+        # The thumbnail stage remains ready; export must use a new approved revision.
+        invalidate_downstream(root, "thumbnail")
     return thumbnails
 
 
@@ -2603,6 +3046,8 @@ def _publish(root: Path, manifest: JobManifest) -> tuple[list[Artifact], str]:
         blockers.append("script.json missing")
     elif not script.get("approved"):
         blockers.append("script.json not approved (set approved=true)")
+    elif _script_tag_issues(root, script):
+        blockers.append("script.json evidence tags need review")
     if not meta:
         blockers.append("youtube_metadata.json missing")
     elif not meta.get("approved"):
@@ -2665,6 +3110,13 @@ def run_job(root: Path, *, force: bool = False, until: str | None = None) -> Job
     manifest = load_manifest(root)
     for stage in manifest.stages:
         cancellation.checkpoint()
+        if stage.stage == "tts":
+            current_script = _read_json(root, "script.json")
+            if not current_script.get("approved") and any(
+                isinstance(section, dict) and section.get("midroll")
+                for section in current_script.get("sections", [])
+            ):
+                return manifest
         if stage.status == "ready":
             if until and stage.stage == until:
                 break
@@ -2922,6 +3374,9 @@ def approve_script(root: Path) -> dict:
     if not path.exists():
         raise FileNotFoundError("script.json missing - run the script stage first")
     script = json.loads(path.read_text(encoding="utf-8"))
+    tag_issues = _script_tag_issues(root, script)
+    if tag_issues:
+        raise ValueError(f"script evidence tags need review: {'; '.join(tag_issues)}")
     script["approved"] = True
     _write_json(root, "script.json", script)
     _write_text(root, "script.md", _script_markdown(script))
@@ -2937,7 +3392,18 @@ def update_script(root: Path, fields: dict) -> dict:
     if "sections" in fields and fields["sections"] is not None:
         if not isinstance(fields["sections"], list):
             raise ValueError("sections must be a JSON array")
-        script["sections"] = fields["sections"]
+        incoming = copy.deepcopy(fields["sections"])
+        current = script.get("sections") or []
+        for index, section in enumerate(incoming):
+            if not isinstance(section, dict) or "annotations" in section or index >= len(current):
+                continue
+            previous = current[index]
+            if not isinstance(previous, dict) or "annotations" not in previous:
+                continue
+            if (section.get("title") == previous.get("title")
+                    or section.get("narration") == previous.get("narration")):
+                section["annotations"] = copy.deepcopy(previous["annotations"])
+        script["sections"] = incoming
     if "notes" in fields and fields["notes"] is not None:
         script["notes"] = str(fields["notes"])
     script["approved"] = False

@@ -53,13 +53,26 @@ def test_onefile_build_is_deterministic_and_resolves_placeholders() -> None:
         "movie_review_factory/__init__.py",
         "movie_review_factory/agy_agent.py",
         "movie_review_factory/agy_vision.py",
+        "movie_review_factory/branding.py",
+        "movie_review_factory/creative_brief.py",
+        "movie_review_factory/creator_library.py",
+        "movie_review_factory/chunked_tts.py",
+        "movie_review_factory/analytics.py",
+        "movie_review_factory/audio_mix.py",
+        "movie_review_factory/assets/man-ke.svg",
+        "movie_review_factory/assets/man-ke.png",
         "movie_review_factory/cli.py",
         "movie_review_factory/content_agent.py",
         "movie_review_factory/cancellation.py",
         "movie_review_factory/editor_ops.py",
+        "movie_review_factory/editorial_qa.py",
+        "movie_review_factory/media_qa.py",
+        "movie_review_factory/handoff.py",
         "movie_review_factory/localization.py",
         "movie_review_factory/media_store.py",
         "movie_review_factory/media_intelligence.py",
+        "movie_review_factory/midroll.py",
+        "movie_review_factory/narration_alignment.py",
         "movie_review_factory/migrations/__init__.py",
         "movie_review_factory/migrations/001_media_intelligence.sql",
         "movie_review_factory/migrations/002_visual_memory.sql",
@@ -70,8 +83,12 @@ def test_onefile_build_is_deterministic_and_resolves_placeholders() -> None:
         "movie_review_factory/models.py",
         "movie_review_factory/pipeline.py",
         "movie_review_factory/pool_scheduler.py",
+        "movie_review_factory/quick_preview.py",
         "movie_review_factory/scene_scoring.py",
         "movie_review_factory/scene_validation.py",
+        "movie_review_factory/short_variants.py",
+        "movie_review_factory/thumbnail_editor.py",
+        "movie_review_factory/versions.py",
         "movie_review_factory/semantic_search.py",
         "movie_review_factory/webapp.py",
         "pyproject.toml",
@@ -87,6 +104,14 @@ def test_onefile_runs_from_an_isolated_copy_and_preserves_jobs(tmp_path: Path) -
     jobs.mkdir()
     marker = jobs / "keep-me.txt"
     marker.write_text("persistent", encoding="utf-8")
+    from movie_review_factory.models import JobConfig
+    from movie_review_factory.pipeline import create_job, load_manifest, save_manifest
+
+    active = jobs / "active"
+    create_job(active, JobConfig(job_id="active"))
+    manifest = load_manifest(active)
+    manifest.stage("ingest").mark("running", "owned by a live server")
+    save_manifest(active, manifest)
 
     runtime_home = tmp_path / "runtime-home"
     env = os.environ.copy()
@@ -115,6 +140,7 @@ def test_onefile_runs_from_an_isolated_copy_and_preserves_jobs(tmp_path: Path) -
     assert '"root_ok": true' in result.stdout
     assert '"api_ok": true' in result.stdout
     assert marker.read_text(encoding="utf-8") == "persistent"
+    assert load_manifest(active).stage("ingest").status == "running"
 
     runtime_dirs = list((runtime_home / "runtime").iterdir())
     assert len(runtime_dirs) == 1

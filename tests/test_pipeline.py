@@ -161,26 +161,40 @@ def test_resumability(job_dir: Path) -> None:
         assert s1.status == s2.status
 
 
-def test_transcript_writes_timed_segments_and_srt(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("batch_size", [1, 8])
+def test_transcript_writes_timed_segments_and_srt(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, batch_size: int) -> None:
     source = tmp_path / "owned-sample.mp4"
     source.touch()
     create_job(tmp_path, JobConfig(job_id="transcript-job", source_video=source))
 
     class FakeModel:
-        def __init__(self, model_name: str, *, device: str, compute_type: str) -> None:
+        def __init__(self, model_name: str, *, device: str, compute_type: str, cpu_threads: int) -> None:
             assert model_name == "small"
             assert device == "cpu"
             assert compute_type == "int8"
+            assert cpu_threads == 8
 
         def transcribe(self, source_path: str, **kwargs: object) -> tuple[list[object], object]:
             assert source_path == str(source)
-            assert kwargs == {"language": "vi", "vad_filter": True}
+            assert kwargs == {"language": None, "vad_filter": True}
             return [
                 types.SimpleNamespace(start=0.0, end=1.25, text=" Xin chào "),
                 types.SimpleNamespace(start=1.25, end=2.5, text="thế giới"),
-            ], object()
+            ], types.SimpleNamespace(language="vi")
 
-    monkeypatch.setitem(sys.modules, "faster_whisper", types.SimpleNamespace(WhisperModel=FakeModel))
+    class FakeBatched:
+        def __init__(self, model: FakeModel) -> None:
+            self.model = model
+
+        def transcribe(self, source_path: str, **kwargs: object) -> tuple[list[object], object]:
+            assert kwargs.pop("batch_size") == 8
+            return self.model.transcribe(source_path, **kwargs)
+
+    monkeypatch.setitem(sys.modules, "faster_whisper", types.SimpleNamespace(
+        WhisperModel=FakeModel, BatchedInferencePipeline=FakeBatched,
+    ))
+    monkeypatch.setenv("MRF_WHISPER_CPU_THREADS", "8")
+    monkeypatch.setenv("MRF_WHISPER_BATCH_SIZE", str(batch_size))
     from movie_review_factory.pipeline import _transcript
 
     artifacts, message = _transcript(tmp_path, load_manifest(tmp_path))
@@ -190,6 +204,7 @@ def test_transcript_writes_timed_segments_and_srt(tmp_path: Path, monkeypatch: p
     transcript = json.loads((tmp_path / "transcript.json").read_text(encoding="utf-8"))
     assert transcript["source_video"] == str(source)
     assert transcript["language"] == "vi"
+    assert transcript["output_language"] == "vi"
     assert transcript["segments"] == [
         {"start_seconds": 0.0, "end_seconds": 1.25, "text": "Xin chào"},
         {"start_seconds": 1.25, "end_seconds": 2.5, "text": "thế giới"},
@@ -421,17 +436,22 @@ def _approved_script_job(
 class _FakeCommunicate:
     """Stand-in for edge_tts.Communicate: records inputs, writes stub bytes.
 
-    Mirrors the production call shape edge_tts.Communicate(text, voice).save_sync(path)
+    Mirrors edge_tts.Communicate(text, voice, boundary=...).stream()
     without contacting any external service.
     """
 
     calls: list[tuple[str, str]] = []
 
-    def __init__(self, text: str, voice: str) -> None:
+    def __init__(self, text: str, voice: str, *, boundary: str = "WordBoundary") -> None:
+        assert boundary == "WordBoundary"
         type(self).calls.append((text, voice))
+        self.text = text
 
-    def save_sync(self, output_path: str) -> None:
-        Path(output_path).write_bytes(b"ID3-fake-mp3")
+    async def stream(self):
+        yield {"type": "audio", "data": b"ID3-fake-mp3"}
+        for i, word in enumerate(self.text.split()):
+            yield {"type": "WordBoundary", "text": word,
+                   "offset": i * 3_000_000, "duration": 2_000_000}
 
 
 def _fake_edge_tts() -> types.SimpleNamespace:
@@ -533,12 +553,12 @@ def test_tts_failure_cleans_partial_audio_and_keeps_metadata_absent(
     )
 
     class FailingCommunicate:
-        def __init__(self, text: str, voice: str) -> None:
+        def __init__(self, text: str, voice: str, *, boundary: str) -> None:
             self.text = text
             self.voice = voice
 
-        def save_sync(self, output_path: str) -> None:
-            Path(output_path).write_bytes(b"partial")
+        async def stream(self):
+            yield {"type": "audio", "data": b"partial"}
             raise RuntimeError("network interrupted")
 
     monkeypatch.setitem(
@@ -564,11 +584,11 @@ def test_tts_rejects_empty_synthesized_audio(
     )
 
     class EmptyCommunicate:
-        def __init__(self, text: str, voice: str) -> None:
+        def __init__(self, text: str, voice: str, *, boundary: str) -> None:
             pass
 
-        def save_sync(self, output_path: str) -> None:
-            Path(output_path).write_bytes(b"")
+        async def stream(self):
+            yield {"type": "audio", "data": b""}
 
     monkeypatch.setitem(
         sys.modules,
@@ -577,7 +597,7 @@ def test_tts_rejects_empty_synthesized_audio(
     )
     import movie_review_factory.pipeline as pipeline
 
-    with pytest.raises(RuntimeError, match="without producing narration audio"):
+    with pytest.raises(RuntimeError, match="no audio"):
         pipeline._tts(tmp_path, load_manifest(tmp_path))
 
     assert not (tmp_path / "narration.mp3").exists()
@@ -609,6 +629,40 @@ def test_tts_is_deterministic(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -
     _tts(tmp_path, load_manifest(tmp_path))
     second = (tmp_path / "voice.json").read_text(encoding="utf-8")
     assert first == second
+
+
+def test_tts_retries_transient_no_audio_without_installing_partial_result(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _approved_script_job(tmp_path, [{"title": "Hook", "narration": "Xin chào."}])
+
+    class NoAudioReceived(Exception):
+        pass
+
+    class IntermittentCommunicate:
+        calls = 0
+
+        def __init__(self, text, voice, *, boundary):
+            type(self).calls += 1
+            self.attempt = type(self).calls
+
+        async def stream(self):
+            yield {"type": "audio", "data": b"partial" if self.attempt == 1 else b"complete"}
+            if self.attempt == 1:
+                raise NoAudioReceived("No audio was received")
+            yield {"type": "WordBoundary", "offset": 1000000,
+                   "duration": 2000000, "text": "Xin"}
+
+    monkeypatch.setitem(sys.modules, "edge_tts", types.SimpleNamespace(
+        Communicate=IntermittentCommunicate,
+        exceptions=types.SimpleNamespace(NoAudioReceived=NoAudioReceived),
+    ))
+    import movie_review_factory.pipeline as pipeline
+    monkeypatch.setattr(pipeline.time, "sleep", lambda _seconds: None)
+    pipeline._tts(tmp_path, load_manifest(tmp_path))
+    assert IntermittentCommunicate.calls == 2
+    assert (tmp_path / "narration.mp3").read_bytes() == b"complete"
+    assert json.loads((tmp_path / "voice.json").read_text(encoding="utf-8"))["word_boundaries"][0]["text"] == "Xin"
 
 
 def test_create_job_resets_tts_artifacts(tmp_path: Path) -> None:
@@ -883,6 +937,31 @@ def test_alignment_writes_empty_output_when_all_cues_dropped(
     assert message == "aligned 0 cues within narration bounds (dropped 2)"
 
 
+def test_alignment_splits_long_narration_into_two_line_cues(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _alignment_job(tmp_path)
+    narration = " ".join(["Đây là một câu chuyện về người hùng và đồng đội."] * 25)
+    voice_path = tmp_path / "voice.json"
+    voice = json.loads(voice_path.read_text(encoding="utf-8"))
+    voice["sections"] = [{"narration": narration}]
+    voice_path.write_text(json.dumps(voice), encoding="utf-8")
+    import movie_review_factory.pipeline as pipeline
+
+    monkeypatch.setattr(pipeline, "_probe_duration_seconds", lambda src: 60.0)
+    pipeline._alignment(tmp_path, load_manifest(tmp_path))
+
+    cues = json.loads((tmp_path / "alignment.json").read_text(encoding="utf-8"))["cues"]
+    assert len(cues) > 15
+    assert " ".join(cue["text"].replace("\n", " ") for cue in cues) == narration
+    assert all(len(cue["text"].splitlines()) <= 2 for cue in cues)
+    assert all(all(len(line) <= 42 for line in cue["text"].splitlines()) for cue in cues)
+    assert all(cue["end_seconds"] - cue["start_seconds"] <= 6.01 for cue in cues)
+    assert cues[0]["start_seconds"] == 0
+    assert cues[-1]["end_seconds"] == 60.0
+    assert all(a["end_seconds"] == b["start_seconds"] for a, b in zip(cues, cues[1:]))
+
+
 def test_alignment_prefers_tts_narration_sections_over_source_captions(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1061,9 +1140,12 @@ def test_render_skips_when_ffmpeg_unavailable(
         pipeline._render(tmp_path, load_manifest(tmp_path))
 
 
-@pytest.mark.parametrize(("ratio", "dimensions"), [("16:9", (1920, 1080)), ("9:16", (1080, 1920))])
+@pytest.mark.parametrize(("ratio", "dimensions", "bottom_band"), [
+    ("16:9", (1920, 1080), 0), ("16:9", (1920, 1080), .1),
+    ("9:16", (1080, 1920), 0),
+])
 def test_render_produces_deterministic_artifacts(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, ratio: str, dimensions: tuple[int, int]
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, ratio: str, dimensions: tuple[int, int], bottom_band: float
 ) -> None:
     source = _render_job(tmp_path, ratio=ratio)
     import movie_review_factory.pipeline as pipeline
@@ -1079,7 +1161,9 @@ def test_render_produces_deterministic_artifacts(
         return object()
 
     monkeypatch.setattr(pipeline.subprocess, "run", fake_run)
-    artifacts, message = pipeline._render(tmp_path, load_manifest(tmp_path))
+    manifest = load_manifest(tmp_path)
+    manifest.config.brand_bottom_band = bottom_band
+    artifacts, message = pipeline._render(tmp_path, manifest)
 
     assert [artifact.name for artifact in artifacts] == ["render.json", "final.mp4"]
     assert all(artifact.status == "ready" for artifact in artifacts)
@@ -1094,11 +1178,209 @@ def test_render_produces_deterministic_artifacts(
     }]
     filter_complex = commands[0][commands[0].index("-filter_complex") + 1]
     assert "trim=start=1.000000:end=3.000000" in filter_complex
-    assert "subtitles='" in filter_complex
-    assert pipeline._escape_ffmpeg_filter_path(tmp_path / "aligned.srt") in filter_complex
+    # Captions burn from a generated ASS whose PlayRes matches the frame, so the
+    # filter references aligned.ass and carries no libass-default force_style.
+    assert "subtitles='" not in filter_complex
+    assert "original_size" not in filter_complex
+    assert "force_style" not in filter_complex
+    assert "ass='" in filter_complex
+    assert pipeline._escape_ffmpeg_filter_path(tmp_path / "aligned.ass") in filter_complex
+
+    band = max(0.10, bottom_band + 0.03)
+    expected_v = round(dimensions[1] * band)
+    expected_h = round(dimensions[0] * 0.075)
+    expected_font = round(dimensions[1] * 0.042)
+    caption = (tmp_path / "aligned.ass").read_text(encoding="utf-8")
+    # PlayRes must equal the real frame; this is the guard against the 384x288
+    # libass-default regression that floated captions into the upper half.
+    assert f"PlayResX: {dimensions[0]}" in caption
+    assert f"PlayResY: {dimensions[1]}" in caption
+    assert "WrapStyle: 0" in caption
+    # Style tail: ...BorderStyle,Outline,Shadow,Alignment,MarginL,MarginR,MarginV,Encoding
+    assert f"Style: Default,Arial,{expected_font}," in caption
+    assert f"1,2,1,2,{expected_h},{expected_h},{expected_v},1" in caption
     assert str(source) in commands[0]
     # Source range equals playback length, so no loop filter is introduced.
     assert "loop=loop=" not in filter_complex
+
+
+def test_render_default_has_no_intro_outro_concat(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Regression guard: with intro/outro at the 0s default the render must be the
+    # plain body -- no card inputs, no concat, and the map stays on [rendered].
+    _render_job(tmp_path)
+    import movie_review_factory.pipeline as pipeline
+
+    commands: list[list[str]] = []
+    monkeypatch.setattr(pipeline, "_probe_duration_seconds", lambda path: _render_duration(path, tmp_path))
+    monkeypatch.setattr(pipeline.shutil, "which", lambda name: f"/{name}")
+
+    def fake_run(command: list[str], **kwargs: object) -> object:
+        commands.append(command)
+        (tmp_path / "final.rendering.mp4").write_bytes(b"fake-mp4")
+        return object()
+
+    monkeypatch.setattr(pipeline.subprocess, "run", fake_run)
+    pipeline._render(tmp_path, load_manifest(tmp_path))
+
+    command = commands[0]
+    filter_complex = command[command.index("-filter_complex") + 1]
+    # The intro/outro path is uniquely marked by the [showv]/[bodyv] labels; the
+    # single-clip video concat (concat=n=1:...:a=0[video]) is a separate, expected
+    # part of every render and must not be conflated with card bookending.
+    assert "[showv]" not in filter_complex and "[showa]" not in filter_complex
+    assert "[bodyv]" not in filter_complex
+    assert "-loop" not in command
+    assert command[command.index("-map") + 1] == "[rendered]"
+    render = json.loads((tmp_path / "render.json").read_text(encoding="utf-8"))
+    assert render["intro_seconds"] == 0.0 and render["outro_seconds"] == 0.0
+    assert not (tmp_path / "intro-card.png").exists()
+
+
+def test_render_bookends_body_with_branded_intro_outro_cards(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _render_job(tmp_path)
+    import movie_review_factory.pipeline as pipeline
+
+    commands: list[list[str]] = []
+    # Narration body is 2s; final output must be intro(2)+body(2)+outro(3)=7s, so
+    # the probe of the muxed file returns 7 to satisfy the drift guard.
+    def probe(path: Path) -> float:
+        if path.name == "narration.mp3":
+            return 2.0
+        if path.name == "final.rendering.mp4":
+            return 7.0
+        return 10.0
+
+    monkeypatch.setattr(pipeline, "_probe_duration_seconds", probe)
+    monkeypatch.setattr(pipeline.shutil, "which", lambda name: f"/{name}")
+
+    def fake_run(command: list[str], **kwargs: object) -> object:
+        commands.append(command)
+        (tmp_path / "final.rendering.mp4").write_bytes(b"fake-mp4")
+        return object()
+
+    monkeypatch.setattr(pipeline.subprocess, "run", fake_run)
+    manifest = load_manifest(tmp_path)
+    manifest.config.intro_seconds = 2.0
+    manifest.config.outro_seconds = 3.0
+    pipeline._render(tmp_path, manifest)
+
+    command = commands[0]
+    filter_complex = command[command.index("-filter_complex") + 1]
+    # Three exact-length segments (intro card, narration body, outro card) are
+    # concatenated into one branded show; caption/section timing rides the body.
+    assert "concat=n=3:v=1:a=1[showv][showa]" in filter_complex
+    assert "[introv]" in filter_complex and "[bodyv]" in filter_complex and "[outrov]" in filter_complex
+    assert f"trim=duration={2.0:.6f}" in filter_complex  # body trimmed to narration length
+    # Both cards are looped stills fed as extra inputs at their exact durations.
+    assert command.count("-loop") == 2
+    assert "2.000" in command and "3.000" in command
+    # Output maps switch to the concatenated show streams.
+    map_indices = [i for i, tok in enumerate(command) if tok == "-map"]
+    assert command[map_indices[0] + 1] == "[showv]"
+    assert command[map_indices[1] + 1] == "[showa]"
+    # Hard duration cap covers body + intro + outro.
+    assert f"{7.0:.6f}" in command
+    render = json.loads((tmp_path / "render.json").read_text(encoding="utf-8"))
+    assert render["intro_seconds"] == 2.0
+    assert render["outro_seconds"] == 3.0
+    assert render["output_duration_seconds"] == 7.0
+    assert render["duration_drift_seconds"] == 0.0
+    # Transient card PNGs are cleaned up after the mux.
+    assert not (tmp_path / "intro-card.png").exists()
+    assert not (tmp_path / "outro-card.png").exists()
+
+
+def test_caption_ass_pins_playres_to_frame_and_bottom_safe_geometry() -> None:
+    from movie_review_factory import pipeline
+
+    srt = "1\n00:00:00,200 --> 00:00:09,000\nDòng một dài\nDòng hai dài\n"
+    ass = pipeline.caption_ass(srt, 1920, 1080, 0.10)
+    # PlayRes equals the real frame -- the guard against libass's 384x288
+    # default that mis-scaled pixel margins and floated captions to the top.
+    assert "PlayResX: 1920" in ass
+    assert "PlayResY: 1080" in ass
+    assert "WrapStyle: 0" in ass
+    # Bottom-centre (Alignment=2) with pixel margins/font from the frame size:
+    # FontSize = 1080*0.042 = 45; MarginL/R = 1920*0.075 = 144; MarginV = 108.
+    assert "Style: Default,Arial,45," in ass
+    assert "1,2,1,2,144,144,108,1" in ass
+    # SRT line breaks map to hard \N so a cue never overflows into stacked words.
+    assert "0:00:00.20,0:00:09.00" in ass
+    assert r"Dòng một dài\NDòng hai dài" in ass
+
+
+def test_caption_ass_scales_geometry_with_resolution_and_band() -> None:
+    from movie_review_factory import pipeline
+
+    srt = "1\n00:00:00,000 --> 00:00:01,000\nHi\n"
+    ass = pipeline.caption_ass(srt, 1080, 1920, 0.13)
+    assert "PlayResX: 1080" in ass and "PlayResY: 1920" in ass
+    # FontSize = 1920*0.042 = 81; MarginL/R = 1080*0.075 = 81; MarginV = 250.
+    assert "Style: Default,Arial,81," in ass
+    assert "1,2,1,2,81,81,250,1" in ass
+
+
+def test_caption_ass_neutralises_override_syntax() -> None:
+    from movie_review_factory import pipeline
+
+    srt = "1\n00:00:00,000 --> 00:00:01,000\n{\\an8}top hack\n"
+    events = pipeline.caption_ass(srt, 960, 540, 0.10).split("[Events]", 1)[1]
+    assert "{" not in events and "}" not in events
+    assert "\\an8" not in events
+
+
+def test_caption_ass_accepts_explicit_pixel_overrides_for_shorts_panel() -> None:
+    from movie_review_factory import pipeline
+
+    srt = "1\n00:00:00,000 --> 00:00:02,000\nBình luận\n"
+    # Portrait Shorts panel geometry: frame-sized PlayRes, bespoke font/MarginV.
+    ass = pipeline.caption_ass(srt, 1080, 1920, margin_v=590, font_size=45)
+    assert "PlayResX: 1080" in ass and "PlayResY: 1920" in ass
+    assert "WrapStyle: 0" in ass
+    assert "Style: Default,Arial,45," in ass
+    # default side margin 1080*0.075=81; Alignment=2; MarginV=590 (in the panel).
+    assert "1,2,1,2,81,81,590,1" in ass
+
+
+def test_caption_ass_requires_band_or_margin_v() -> None:
+    from movie_review_factory import pipeline
+
+    with pytest.raises(ValueError, match="band or margin_v"):
+        pipeline.caption_ass("1\n00:00:00,000 --> 00:00:01,000\nHi\n", 1920, 1080)
+
+
+def test_render_uses_authorized_music_mix_only_when_configured(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _render_job(tmp_path)
+    music = tmp_path / "licensed-music.wav"
+    music.write_bytes(b"fake-audio")
+    (tmp_path / "audio_mix.json").write_text(json.dumps({
+        "voice_gain_db": 1,
+        "music": {"path": str(music), "rights_note": "licensed by creator", "gain_db": -18},
+    }), encoding="utf-8")
+    import movie_review_factory.pipeline as pipeline
+    monkeypatch.setattr(pipeline, "_probe_duration_seconds", lambda path: _render_duration(path, tmp_path))
+    monkeypatch.setattr(pipeline.shutil, "which", lambda name: f"/{name}")
+    commands = []
+
+    def fake_run(command, **kwargs):
+        commands.append(command)
+        (tmp_path / "final.rendering.mp4").write_bytes(b"fake-mp4")
+        return object()
+
+    monkeypatch.setattr(pipeline.subprocess, "run", fake_run)
+    pipeline._render(tmp_path, load_manifest(tmp_path))
+    command = commands[0]
+    assert str(music) in command
+    assert "[audio]" in command
+    assert "sidechaincompress" in command[command.index("-filter_complex") + 1]
+    render = json.loads((tmp_path / "render.json").read_text(encoding="utf-8"))
+    assert render["audio_mix"]["provenance"][0]["rights_note"] == "licensed by creator"
 
 
 def test_render_loops_short_source_to_cover_clip_duration(
@@ -1200,6 +1482,8 @@ def test_render_omits_subtitles_filter_for_empty_aligned_srt(
     (tmp_path / "aligned.srt").write_text("", encoding="utf-8")
     pipeline._render(tmp_path, load_manifest(tmp_path))
     empty_filter = commands[-1][commands[-1].index("-filter_complex") + 1]
+    # Empty captions -> no burn filter at all (neither the ASS nor SRT path).
+    assert "ass=" not in empty_filter
     assert "subtitles=" not in empty_filter
 
     (tmp_path / "aligned.srt").write_text(
@@ -1207,7 +1491,221 @@ def test_render_omits_subtitles_filter_for_empty_aligned_srt(
     )
     pipeline._render(tmp_path, load_manifest(tmp_path))
     non_empty_filter = commands[-1][commands[-1].index("-filter_complex") + 1]
-    assert "subtitles=" in non_empty_filter
+    # Non-empty captions burn through the frame-sized ASS (aligned.ass).
+    assert "ass=" in non_empty_filter
+
+
+def test_render_real_ffmpeg_extends_short_video_to_narration(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import shutil
+    import subprocess
+
+    import movie_review_factory.pipeline as pipeline
+
+    ffmpeg = shutil.which("ffmpeg")
+    ffprobe = shutil.which("ffprobe")
+    if not ffmpeg or not ffprobe:
+        pytest.skip("FFmpeg toolchain unavailable")
+
+    source = _render_job(tmp_path, clips=[{
+        "section": "Hook",
+        "type": "narration",
+        "duration_seconds": 1.0,
+        "source_clip": {"start_seconds": 0.0, "end_seconds": 1.0},
+    }])
+    subprocess.run([
+        ffmpeg, "-v", "error", "-y", "-f", "lavfi",
+        "-i", "color=c=black:s=320x180:r=25:d=1",
+        "-c:v", "libx264", "-pix_fmt", "yuv420p", str(source),
+    ], capture_output=True, check=True)
+    narration = tmp_path / "narration.mp3"
+    subprocess.run([
+        ffmpeg, "-v", "error", "-y", "-f", "lavfi",
+        "-i", "sine=frequency=440:duration=2",
+        "-c:a", "libmp3lame", str(narration),
+    ], capture_output=True, check=True)
+    (tmp_path / "aligned.srt").write_text("", encoding="utf-8")
+    monkeypatch.setenv("MRF_RENDER_MAX_HEIGHT", "180")
+
+    artifacts, _ = pipeline._render(tmp_path, load_manifest(tmp_path))
+    assert [artifact.name for artifact in artifacts] == ["render.json", "final.mp4"]
+    output_duration = pipeline._probe_duration_seconds(tmp_path / "final.mp4")
+    narration_duration = pipeline._probe_duration_seconds(narration)
+    assert output_duration is not None and narration_duration is not None
+    assert abs(output_duration - narration_duration) <= pipeline.RENDER_DURATION_DRIFT_SECONDS
+
+
+def test_render_real_ffmpeg_changes_brand_between_chapters(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import shutil
+    import subprocess
+    import movie_review_factory.pipeline as pipeline
+
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg or not shutil.which("ffprobe"):
+        pytest.skip("FFmpeg toolchain unavailable")
+    clips = [
+        {"section": section, "type": "narration", "duration_seconds": 1.0,
+         "source_clip": {"start_seconds": index, "end_seconds": index + 1}}
+        for index, section in enumerate(("Mở đầu", "Race: hành trình", "Swarm: đối đầu"))
+    ]
+    source = _render_job(tmp_path, clips=clips)
+    subprocess.run([ffmpeg, "-v", "error", "-y", "-f", "lavfi",
+                    "-i", "color=c=black:s=320x180:r=25:d=3",
+                    "-c:v", "libx264", "-pix_fmt", "yuv420p", str(source)],
+                   capture_output=True, check=True)
+    subprocess.run([ffmpeg, "-v", "error", "-y", "-f", "lavfi",
+                    "-i", "sine=frequency=440:duration=3",
+                    "-c:a", "libmp3lame", str(tmp_path / "narration.mp3")],
+                   capture_output=True, check=True)
+    (tmp_path / "aligned.srt").write_text("", encoding="utf-8")
+    manifest = load_manifest(tmp_path)
+    manifest.config.movie_title = "BEN: Race + BEN: Swarm"
+    manifest.config.brand_top_band = .1
+    manifest.config.brand_bottom_band = .1
+    monkeypatch.setenv("MRF_RENDER_MAX_HEIGHT", "180")
+    artifacts, _ = pipeline._render(tmp_path, manifest)
+    assert [artifact.name for artifact in artifacts] == ["render.json", "final.mp4"]
+    assert (tmp_path / "final.mp4").stat().st_size > 0
+    assert len(list(tmp_path.glob("brand-overlay-*.png"))) == 3
+
+
+@pytest.mark.parametrize(("planned", "padding"), [(1.5, 1.5), (2.0, 1.0)])
+def test_render_pads_final_frame_when_narration_outlasts_scene_plan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, planned: float, padding: float
+) -> None:
+    import movie_review_factory.pipeline as pipeline
+
+    _render_job(tmp_path, clips=[{
+        "section": "Hook",
+        "type": "narration",
+        "duration_seconds": planned,
+        "source_clip": {"start_seconds": 1.0, "end_seconds": 1.0 + planned},
+    }])
+    commands: list[list[str]] = []
+    monkeypatch.setattr(pipeline.shutil, "which", lambda name: f"/{name}")
+
+    def probe(path: Path) -> float:
+        if path.name == "narration.mp3":
+            return 2.0
+        if path.name == "final.rendering.mp4":
+            graph = commands[0][commands[0].index("-filter_complex") + 1]
+            return 2.0 if "tpad=stop_mode=clone:" in graph else 1.5
+        return 10.0
+
+    def fake_run(command: list[str], **kwargs: object) -> object:
+        commands.append(command)
+        (tmp_path / "final.rendering.mp4").write_bytes(b"fake-mp4")
+        return object()
+
+    monkeypatch.setattr(pipeline, "_probe_duration_seconds", probe)
+    monkeypatch.setattr(pipeline.subprocess, "run", fake_run)
+
+    artifacts, _ = pipeline._render(tmp_path, load_manifest(tmp_path))
+    graph = commands[0][commands[0].index("-filter_complex") + 1]
+    assert f"tpad=stop_mode=clone:stop_duration={padding:.6f}" in graph
+    assert [artifact.name for artifact in artifacts] == ["render.json", "final.mp4"]
+    assert json.loads((tmp_path / "render.json").read_text())["duration_drift_seconds"] == 0.0
+
+
+def test_render_in_cancellation_scope_completes_when_not_stopped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import subprocess
+    import sys
+    import threading
+
+    import movie_review_factory.cancellation as cancellation
+    import movie_review_factory.pipeline as pipeline
+
+    _render_job(tmp_path)
+    monkeypatch.setattr(pipeline, "_probe_duration_seconds", lambda path: _render_duration(path, tmp_path))
+    monkeypatch.setattr(pipeline.shutil, "which", lambda name: "/ffmpeg")
+
+    original_popen = subprocess.Popen
+    registered: list[subprocess.Popen] = []
+    unregistered: list[subprocess.Popen] = []
+
+    def finish_ffmpeg(command: list[str], **kwargs: object) -> subprocess.Popen:
+        return original_popen(
+            [sys.executable, "-c",
+             "from pathlib import Path; import sys; Path(sys.argv[1]).write_bytes(b'video')",
+             str(tmp_path / "final.rendering.mp4")],
+            **kwargs,
+        )
+
+    monkeypatch.setattr(pipeline.subprocess, "Popen", finish_ffmpeg)
+    context = cancellation.CancellationContext(
+        threading.Event(), registered.append, unregistered.append,
+    )
+    with cancellation.cancellation_scope(context):
+        artifacts, message = pipeline._render(tmp_path, load_manifest(tmp_path))
+
+    assert message == "rendered 1 clips to final.mp4"
+    assert [artifact.name for artifact in artifacts] == ["render.json", "final.mp4"]
+    assert (tmp_path / "final.mp4").read_bytes() == b"video"
+    assert len(registered) == 1
+    assert unregistered == registered
+    assert registered[0].returncode == 0
+
+
+def test_render_stop_terminates_ffmpeg_and_cleans_partial_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import subprocess
+    import sys
+    import threading
+
+    import movie_review_factory.cancellation as cancellation
+    import movie_review_factory.pipeline as pipeline
+
+    _render_job(tmp_path)
+    monkeypatch.setattr(pipeline, "_probe_duration_seconds", lambda path: _render_duration(path, tmp_path))
+    monkeypatch.setattr(pipeline.shutil, "which", lambda name: "/ffmpeg")
+
+    original_popen = subprocess.Popen
+    event = threading.Event()
+    registered: list[subprocess.Popen] = []
+    unregistered: list[subprocess.Popen] = []
+
+    def start_slow_ffmpeg(command: list[str], **kwargs: object) -> subprocess.Popen:
+        (tmp_path / "final.rendering.mp4").write_bytes(b"partial")
+        process = original_popen(
+            [sys.executable, "-c", "import time; time.sleep(30)"],
+            **kwargs,
+        )
+        event.set()
+        return process
+
+    monkeypatch.setattr(pipeline.subprocess, "Popen", start_slow_ffmpeg)
+    def old_blocking_path(command: list[str], **kwargs: object) -> None:
+        raise cancellation.RunCancelled("stop requested before process registration")
+
+    monkeypatch.setattr(pipeline.subprocess, "run", old_blocking_path)
+    manifest = load_manifest(tmp_path)
+    for stage in manifest.stages:
+        if stage.stage != "render":
+            stage.status = "ready"
+    pipeline.save_manifest(tmp_path, manifest)
+
+    context = cancellation.CancellationContext(event, registered.append, unregistered.append)
+    try:
+        with cancellation.cancellation_scope(context):
+            result = run_job(tmp_path, until="render")
+        assert result.stage("render").status == "cancelled"
+        assert len(registered) == 1
+        assert unregistered == registered
+        assert registered[0].poll() is not None
+        assert not (tmp_path / "final.rendering.mp4").exists()
+        assert not (tmp_path / "final.mp4").exists()
+        assert not (tmp_path / "render.json").exists()
+    finally:
+        for process in registered:
+            if process.poll() is None:
+                process.kill()
+                process.wait(timeout=5)
 
 
 def test_render_failure_marks_stage_failed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1300,7 +1798,12 @@ def test_qa_skips_when_ffprobe_unavailable(tmp_path: Path, monkeypatch: pytest.M
 def test_qa_report_success(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     _qa_job(tmp_path)
     import movie_review_factory.pipeline as pipeline
+    from movie_review_factory import media_qa
 
+    monkeypatch.setattr(media_qa, "inspect_rendered_media", lambda *_a, **_kw: [
+        {"check": "decoded_media_scan", "value": {"video": True, "audio": True},
+         "passed": True, "message": ""},
+    ])
     monkeypatch.setattr(pipeline.shutil, "which", lambda name: f"/{name}")
 
     def fake_run(command: list[str], **kwargs: object) -> object:

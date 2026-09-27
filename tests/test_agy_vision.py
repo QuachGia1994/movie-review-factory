@@ -146,6 +146,20 @@ def test_agy_observation_parser_keeps_grounded_visual_metadata() -> None:
     }
 
 
+def test_agy_vision_parses_json_after_rule_receipt_and_fence() -> None:
+    response = (
+        '[RULES] agent (always_on) + coding,pattern (viewed)\\n\\n'
+        '```json\\n[{"id":1,"description":"A man wearing a cap",'
+        '"tags":["cap"],"people":["man"],"actions":["standing"]}]\\n```'
+    )
+    assert agy_vision._parse_observations(response, {1})[1]["description"] == "A man wearing a cap"
+    identity = (
+        '[RULES] agent (always_on)\\n```json\\n'
+        '[{"scene_id":1,"people":[]}]\\n```'
+    )
+    assert agy_vision._parse_identity_batch(identity, {1}, set()) == [{"scene_id": 1, "people": []}]
+
+
 def test_identity_parser_keeps_anonymous_labels_and_rejects_real_names() -> None:
     parsed = agy_vision._parse_identity_batch(
         '[{"scene_id":1,"people":[{"label":"Person 1","description":"woman in red coat",'

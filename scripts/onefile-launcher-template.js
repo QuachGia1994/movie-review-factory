@@ -921,6 +921,8 @@ function ensureToolchain() {
   prependEnvPath(childEnv, ffmpegBin);
   childEnv.MRF_FFMPEG_BIN = ffmpegBin;
   childEnv.MRF_WHISPER_CACHE = path.join(appDataRoot(), "models", "whisper");
+  childEnv.MRF_WHISPER_BATCH_SIZE = childEnv.MRF_WHISPER_BATCH_SIZE ||
+    (os.totalmem() >= 16 * 1024 * 1024 * 1024 ? "8" : "4");
   childEnv.MRF_EMBED_CACHE = path.join(appDataRoot(), "models", "embeddings");
   if (noNetwork()) {
     childEnv.MRF_WHISPER_OFFLINE = "1";
@@ -1047,12 +1049,18 @@ function pythonSelfTestCode() {
   ].join("\n");
 }
 
-function selfTest(py, runtime, jobs, env) {
-  var result = runSync(
-    py.command,
-    pythonArgs(py, ["-u", "-c", pythonSelfTestCode(), runtime, jobs]),
-    { timeout: 15000, env: env }
-  );
+function selfTest(py, runtime, env) {
+  var isolatedJobs = fs.mkdtempSync(path.join(os.tmpdir(), "mrf-selftest-"));
+  var result;
+  try {
+    result = runSync(
+      py.command,
+      pythonArgs(py, ["-u", "-c", pythonSelfTestCode(), runtime, isolatedJobs]),
+      { timeout: 15000, env: env }
+    );
+  } finally {
+    fs.rmSync(isolatedJobs, { recursive: true, force: true });
+  }
   if (result.status !== 0) {
     process.stderr.write(String(result.stderr || result.stdout || ""));
     if (result.error) {
@@ -1205,7 +1213,7 @@ function main() {
 
   if (hasArg("--self-test")) {
     process.exit(
-      selfTest(toolchain.python, runtime, jobs, toolchain.env) ? 0 : 1
+      selfTest(toolchain.python, runtime, toolchain.env) ? 0 : 1
     );
   }
   startServer(toolchain.python, runtime, jobs, scriptDir, toolchain.env);

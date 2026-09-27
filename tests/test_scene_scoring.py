@@ -141,3 +141,17 @@ def test_validation_report_compares_lexical_and_semantic_strategies(
     assert report["semantic_identity"]["top1_hit_rate"] == 1.0
     assert report["semantic_identity"]["candidate_hit_rate"] == 1.0
     assert report["sections"][0]["semantic_top"]["candidate_score"]["semantic"] == 1.0
+
+    output = scene_validation.write_validation_report(job, truth_path=truth)
+    assert output == job / "scene_validation.json"
+    assert json.loads(output.read_text(encoding="utf-8"))["semantic_identity"]["top1_hit_rate"] == 1.0
+
+
+def test_scene_validation_requires_complete_job(tmp_path: Path) -> None:
+    job = tmp_path / "incomplete"
+    job.mkdir()
+    (job / "script.json").write_text('{"sections": []}', encoding="utf-8")
+    (job / "scenes.json").write_text('{"scenes": []}', encoding="utf-8")
+
+    with pytest.raises(ValueError, match="requires script sections, scenes, and media_index"):
+        scene_validation.compare_scene_strategies(job)
