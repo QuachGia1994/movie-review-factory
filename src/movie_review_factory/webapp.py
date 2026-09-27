@@ -8,8 +8,11 @@ public service.
 
 Publishing safety is built into the shape of the API, not just the UI:
 
-* The web "run" action stops the pipeline at the ``thumbnail`` stage
-  (``until="thumbnail"``) and never reaches ``publish`` on its own.
+* Creating a project and importing its source never start the pipeline;
+  every run is triggered explicitly by the operator.
+* The web "run" action stops at the ``script`` stage for review and only
+  advances toward the ``thumbnail`` stage once the script is approved - it
+  never reaches ``publish`` on its own.
 * Metadata approval (``approved=true``) is a separate, explicit endpoint.
 * Publishing requires an explicit ``confirm`` and, even then, only runs the
   ``publish`` stage - which merely writes the handoff record
@@ -44,6 +47,7 @@ _SAFE_SEGMENT = re.compile(r"^[A-Za-z0-9._-]+$")
 
 # The web "run" button intentionally stops here; publish is a separate action.
 RUN_UNTIL_STAGE = "thumbnail"
+SCRIPT_REVIEW_STAGE = "script"
 
 # Optional bearer-token auth.  Set DASHBOARD_TOKEN in the environment to require
 # a token on every request.  When the variable is absent or empty every request
@@ -167,7 +171,7 @@ class JobsService:
         self._indexing: dict[str, dict] = {}
         self._index_queue: "queue.Queue[str]" = queue.Queue()
         self._index_cv = threading.Condition(self._lock)
-        self._index_auto = os.environ.get("MRF_AUTO_INDEX", "1").strip().lower() not in (
+        self._index_auto = os.environ.get("MRF_AUTO_INDEX", "0").strip().lower() not in (
             "0", "false", "no", "off",
         )
         self._index_worker_thread = threading.Thread(
@@ -1190,9 +1194,10 @@ class JobsService:
             temporary.unlink(missing_ok=True)
             with self._lock:
                 self._uploads.discard(job_id)
-        # Import finished: kick off background indexing so the heavy transcript/
-        # scene/visual/embedding work happens off the request while other
-        # projects stay usable (roadmap #14). Opt out with MRF_AUTO_INDEX=0.
+        # Importing the source never advances the pipeline: the operator starts
+        # every run explicitly. Pre-warming the heavy transcript/scene/visual/
+        # embedding work in the background is opt-in via MRF_AUTO_INDEX=1
+        # (roadmap #14) for operators who want it ready before the run.
         if self._index_auto:
             self._enqueue_index_quietly(job_id)
         return self.status(job_id)
@@ -1243,8 +1248,13 @@ class JobsService:
                 self._deleting.difference_update(job_ids)
         return {"deleted": deleted, "failed": failed}
 
-    def start_run(self, job_id: str, *, until: str | None = RUN_UNTIL_STAGE) -> dict:
+    def start_run(self, job_id: str, *, until: str | None = None) -> dict:
         root = self._require_job(job_id)
+        if until is None:
+            # The first run stops at the script for review; a run only advances
+            # toward the finished video after the operator approves the script.
+            approved = bool(self._read_json(root, "script.json").get("approved"))
+            until = RUN_UNTIL_STAGE if approved else SCRIPT_REVIEW_STAGE
         # A background index for this job must yield before a full run starts so
         # the two never write the same media_index concurrently (roadmap #14).
         self._preempt_index(job_id)

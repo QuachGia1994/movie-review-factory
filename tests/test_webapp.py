@@ -191,26 +191,64 @@ def test_status_remains_readable_while_run_persists_manifest(tmp_path: Path) -> 
 
     status = svc.status("demo")
     assert status["running"] is False
-    assert status["approvals"]["metadata_present"] is True
+    # The run to script must produce the script draft while status stays readable.
+    assert status["approvals"]["script_present"] is True
 
 
-def test_start_run_reaches_thumbnail_and_stops(tmp_path: Path) -> None:
+def test_import_does_not_auto_index_or_advance(tmp_path: Path) -> None:
     svc = JobsService(tmp_path)
     svc.create_job({"job_id": "demo"})
-    svc.start_run("demo")
-    # run_job persists per-stage; poll until the background run finishes.
+    data = b"\x00" * 64
+    svc.import_video("demo", "source.mp4", len(data), io.BytesIO(data))
+    # Loading the source must not auto-start indexing or any downstream stage.
+    assert svc.index_state("demo") is None
+    status = svc.status("demo")
+    assert status["running"] is False
+    stages = {s["stage"]: s["status"] for s in status["stages"]}
+    for stage in ("research", "transcript", "scenes", "outline", "script", "scene_plan"):
+        assert stages[stage] == "pending", (stage, stages[stage])
+
+
+def test_run_stops_at_script_until_approved(tmp_path: Path) -> None:
+    svc = JobsService(tmp_path)
+    svc.create_job({"job_id": "demo"})
+
+    # The run must stop at the script for review - never touching the scene plan
+    # (AGY), metadata, or thumbnail, and never advancing publish.
+    assert svc.start_run("demo")["until"] == "script"
     deadline = time.time() + 10
     while time.time() < deadline and svc.status("demo")["running"]:
         time.sleep(0.1)
     status = svc.status("demo")
     assert status["running"] is False
-    assert status["approvals"]["metadata_present"] is True
-    thumbnail = next(s for s in status["stages"] if s["stage"] == "thumbnail")
-    assert thumbnail["status"] == "skipped"
-    # The UI run must never advance the publish stage on its own.
-    publish = next(s for s in status["stages"] if s["stage"] == "publish")
-    assert publish["status"] == "pending"
+    assert status["approvals"]["script_present"] is True
+    assert status["approvals"]["metadata_present"] is False
+    stages = {s["stage"]: s["status"] for s in status["stages"]}
+    assert stages["script"] == "ready"
+    assert stages["scene_plan"] == "pending"
+    assert stages["metadata"] == "pending"
+    assert stages["thumbnail"] == "pending"
+    assert stages["publish"] == "pending"
     assert not (tmp_path / "demo" / "publish_record.json").exists()
+
+
+def test_run_targets_video_after_script_approved(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    svc = JobsService(tmp_path)
+    svc.create_job({"job_id": "demo"})
+    # An approved script must make the next run target the finished video.
+    (tmp_path / "demo" / "script.json").write_text(
+        json.dumps({"approved": True, "sections": [{"narration": "x"}]}), encoding="utf-8"
+    )
+    captured: dict = {}
+    monkeypatch.setattr(
+        pipeline, "run_job",
+        lambda root, *, until=None, force=False: captured.setdefault("until", until),
+    )
+    assert svc.start_run("demo")["until"] == "thumbnail"
+    deadline = time.time() + 5
+    while time.time() < deadline and svc.status("demo")["running"]:
+        time.sleep(0.02)
+    assert captured["until"] == "thumbnail"
 
 
 # --- approval + publishing gate ---------------------------------------------
