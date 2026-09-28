@@ -2642,6 +2642,7 @@ INDEX_HTML = """<!DOCTYPE html>
         <input id="sourceFile" type="file" accept=".mp4,video/mp4">
         <label for="newJobId">Mã project</label>
         <input id="newJobId" name="job_id" placeholder="vd: review-abc" required>
+        <div id="jobIdHint" class="notice" role="status"></div>
         <label>Tên phim / truy vấn nghiên cứu</label>
         <input name="movie_title" placeholder="vd: The Matrix (1999)">
         <details class="advanced-fields"><summary>Định hướng review</summary>
@@ -3083,13 +3084,31 @@ document.querySelectorAll('.workspace-tabs [role="tab"]').forEach(tab => {
   });
 });
 $('reviewAction').onclick = () => { setWorkspaceView('review'); $('scriptSections').focus(); };
+// Fold Vietnamese diacritics and đ, keep only [a-z0-9_-], so the value always
+// matches the server's _is_safe_segment instead of being rejected with no card.
+function slugifyJobId(raw) {
+  return (raw || '').normalize('NFKD').replace(/[\\u0300-\\u036f]/g, '')
+    .replace(/[đĐ]/g, 'd').toLowerCase().replace(/[^a-z0-9_-]+/g, '-')
+    .replace(/^-+|-+$/g, '').slice(0, 64).replace(/-+$/g, '');
+}
+function updateJobIdHint() {
+  const raw = $('newJobId').value;
+  const hint = $('jobIdHint');
+  if (!raw.trim()) { hint.textContent = ''; return; }
+  const slug = slugifyJobId(raw);
+  hint.textContent = slug ? 'Mã sẽ dùng: ' + slug : 'Mã chưa hợp lệ, hãy nhập chữ hoặc số.';
+}
+$('newJobId').addEventListener('input', updateJobIdHint);
+$('newJobId').addEventListener('blur', () => {
+  const slug = slugifyJobId($('newJobId').value);
+  if (slug) $('newJobId').value = slug;
+  updateJobIdHint();
+});
 $('sourceFile').onchange = () => {
   const input = $('newJobId');
   if (input.value.trim()) return;
   const file = $('sourceFile').files[0];
-  if (file) input.value = file.name.replace(/[.]mp4$/i, '').normalize('NFKD')
-    .replace(/[\\u0300-\\u036f]/g, '').toLowerCase().replace(/[^a-z0-9_-]+/g, '-')
-    .replace(/^-+|-+$/g, '').slice(0, 64) || 'video-project';
+  if (file) { input.value = slugifyJobId(file.name.replace(/[.]mp4$/i, '')) || 'video-project'; updateJobIdHint(); }
 };
 
 const selectedProjects = new Set();
@@ -4261,6 +4280,8 @@ $('createForm').onsubmit = async (e) => {
   const file = $('sourceFile').files[0];
   const fd = new FormData(e.target);
   const payload = Object.fromEntries(fd.entries());
+  payload.job_id = slugifyJobId(payload.job_id || '');
+  if (!payload.job_id) { $('createMsg').textContent = 'Mã project chưa hợp lệ, hãy nhập chữ hoặc số.'; return; }
   payload.creative_brief = {
     review_thesis: String(payload.review_thesis || '').trim(),
     tone: String(payload.tone || '').trim(),
@@ -4279,6 +4300,7 @@ $('createForm').onsubmit = async (e) => {
     if (file) await uploadVideo(created.job_id, file);
     $('createMsg').textContent = file ? 'Đã tạo và import video cho project ' + created.job_id + '.' : 'Đã tạo project ' + created.job_id + '.';
     e.target.reset();
+    updateJobIdHint();
     await loadJobs();
     selectJob(created.job_id);
   } catch (err) {

@@ -1436,6 +1436,15 @@ def test_content_agent_select_offers_agy_pool() -> None:
     assert '<option value="agy">AGY pool (research → outline → script)</option>' in webapp_mod.INDEX_HTML
 
 
+def test_create_form_normalizes_job_id_to_safe_segment() -> None:
+    html = webapp_mod.INDEX_HTML
+    assert "function slugifyJobId(" in html
+    assert 'id="jobIdHint"' in html
+    # Submit sends the slug, so an accented or spaced code can never be rejected
+    # by _is_safe_segment while leaving the project list blank with no card.
+    assert "payload.job_id = slugifyJobId(" in html
+
+
 # --- roadmap #14: background indexing queue ---------------------------------
 
 
