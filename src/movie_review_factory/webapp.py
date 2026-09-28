@@ -1605,8 +1605,8 @@ class JobsService:
         manifest = pipeline.load_manifest(root)
         script = self._read_json(root, "script.json")
         plan = self._read_json(root, "scene_plan.json")
-        if manifest.config.content_agent != "agy":
-            raise ValueError("CTA giữa video cần project dùng AGY.")
+        # The mid-roll CTA is always AGY-written through its own pool call, so it
+        # runs regardless of the project's content_agent (scaffold/claude included).
         if not script.get("approved") or any(s.get("midroll") for s in script.get("sections", []) if isinstance(s, dict)):
             raise ValueError("Kịch bản cần được duyệt và chưa có CTA.")
         schema = {"type": "object", "properties": {"line": {"type": "string"}},
@@ -1629,6 +1629,14 @@ class JobsService:
         draft = {"line": line, "start_seconds": at, "duration_seconds": 10, "generator": "agy"}
         pipeline._write_json(root, "midroll-draft.json", draft)
         return draft
+
+    def agy_pool_status(self) -> dict:
+        from .agy_vision import pool_status
+        return pool_status()
+
+    def probe_agy(self) -> dict:
+        from .agy_agent import probe
+        return probe()
 
     def stage_midroll(self, job_id: str, payload: dict) -> dict:
         root = self._require_job(job_id)
@@ -1914,6 +1922,9 @@ class MRFRequestHandler(BaseHTTPRequestHandler):
         if parts == ["brand", "logo.svg"]:
             self._serve_file(branding.ASSETS / "man-ke.svg")
             return
+        if parts == ["agy-pool"]:
+            self._send_json(200, self.service.agy_pool_status())
+            return
         if parts == ["jobs"]:
             self._send_json(200, {"jobs": self.service.list_jobs()})
             return
@@ -2035,6 +2046,9 @@ class MRFRequestHandler(BaseHTTPRequestHandler):
                 raise ValueError("Logo PNG cần dung lượng 1 byte–2 MB.")
             branding.save_logo(self.service.jobs_root, self.rfile.read(size))
             self._send_json(200, {"logo_url": "/api/brand/logo"})
+            return
+        if parts == ["agy-pool", "probe"]:
+            self._send_json(200, self.service.probe_agy())
             return
         if parts == ["jobs"]:
             self._send_json(201, self.service.create_job(self._read_body()))
@@ -2668,6 +2682,10 @@ INDEX_HTML = """<!DOCTYPE html>
           <option value="claude">Claude Code (research → outline → script)</option>
           <option value="agy">AGY pool (research → outline → script)</option>
         </select>
+        <div class="row" id="agyPoolRow" style="margin-top:6px;align-items:center;gap:8px">
+          <span id="agyPoolBadge" class="badge pending">AGY: chưa kiểm tra</span>
+          <button type="button" id="agyProbeBtn">Kiểm tra AGY</button>
+        </div>
         <label>Thời lượng mục tiêu (phút)</label>
         <input name="target_minutes" type="number" value="10" min="1" max="60" step="0.5">
         <label>Tỷ lệ khung hình</label>
@@ -4307,6 +4325,38 @@ $('createForm').onsubmit = async (e) => {
     $('createMsg').textContent = (created ? 'Project đã tạo; có thể mở và thử import lại. ' : '') + err.message;
     if (created) { await loadJobs(); selectJob(created.job_id); }
   } finally { submit.disabled = false; }
+};
+
+const agyPoolSelect = document.querySelector('select[name="content_agent"]');
+function setAgyBadge(state, text) {
+  const badge = $('agyPoolBadge');
+  badge.className = 'badge ' + state;
+  badge.textContent = 'AGY: ' + text;
+}
+async function refreshAgyPool() {
+  setAgyBadge('pending', 'đang kiểm tra…');
+  try {
+    const status = await api('GET', '/api/agy-pool');
+    if (!status.configured) { setAgyBadge('skipped', 'chưa cấu hình'); return; }
+    const state = status.total > 0 && status.reachable === status.total ? 'ready'
+      : (status.reachable > 0 ? 'running' : 'failed');
+    setAgyBadge(state, status.reachable + '/' + status.total + ' worker mở cổng');
+  } catch (err) { setAgyBadge('failed', err.message); }
+}
+if (agyPoolSelect) {
+  agyPoolSelect.addEventListener('change', () => { if (agyPoolSelect.value === 'agy') refreshAgyPool(); });
+  if (agyPoolSelect.value === 'agy') refreshAgyPool();
+}
+$('agyProbeBtn').onclick = async () => {
+  const btn = $('agyProbeBtn');
+  btn.disabled = true;
+  setAgyBadge('running', 'đang gọi thử…');
+  try {
+    const result = await api('POST', '/api/agy-pool/probe');
+    if (result.ok) setAgyBadge('ready', 'gọi thử thành công');
+    else setAgyBadge('failed', result.error || 'lỗi không rõ');
+  } catch (err) { setAgyBadge('failed', err.message); }
+  finally { btn.disabled = false; }
 };
 
 $('sourceRetryBtn').onclick = async () => {

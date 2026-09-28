@@ -1436,6 +1436,14 @@ def test_content_agent_select_offers_agy_pool() -> None:
     assert '<option value="agy">AGY pool (research → outline → script)</option>' in webapp_mod.INDEX_HTML
 
 
+def test_agy_pool_badge_and_probe_button_are_wired_into_the_dashboard() -> None:
+    html = webapp_mod.INDEX_HTML
+    assert 'id="agyPoolBadge"' in html
+    assert 'id="agyProbeBtn"' in html
+    assert "api('GET', '/api/agy-pool')" in html
+    assert "api('POST', '/api/agy-pool/probe')" in html
+
+
 def test_create_form_normalizes_job_id_to_safe_segment() -> None:
     html = webapp_mod.INDEX_HTML
     assert "function slugifyJobId(" in html

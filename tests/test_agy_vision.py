@@ -25,6 +25,55 @@ def _isolated_pool_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Non
         monkeypatch.delenv(name, raising=False)
 
 
+def _write_pool_config(location: Path) -> None:
+    pool = location / "pool"
+    pool.mkdir()
+    location.joinpath("setting.json").write_text(json.dumps({"agy": {"workers": {
+        role: {"url": f"http://127.0.0.1:{7411 + number}", "root": str(pool),
+               "secretRef": role, "allowedModes": ["plan"]}
+        for number, role in enumerate(agy_vision.WORKER_ROLES)
+    }}}), encoding="utf-8")
+    location.joinpath("agy-pool-secrets.json").write_text(
+        json.dumps({role: f"token-{role}" for role in agy_vision.WORKER_ROLES}), encoding="utf-8"
+    )
+
+
+def test_pool_status_tcp_probes_each_worker_port(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _write_pool_config(tmp_path)
+    down = {7412}
+
+    class _Conn:
+        def __enter__(self) -> "_Conn":
+            return self
+
+        def __exit__(self, *exc: object) -> bool:
+            return False
+
+    def connect(address: tuple[str, int], timeout: float) -> _Conn:
+        if address[1] in down:
+            raise OSError("connection refused")
+        return _Conn()
+
+    monkeypatch.setattr(agy_vision.socket, "create_connection", connect)
+    status = agy_vision.pool_status(pool_dir=tmp_path)
+    assert status["configured"] is True
+    assert status["total"] == 4
+    assert status["reachable"] == 3
+    assert {worker["port"]: worker["reachable"] for worker in status["workers"]} == {
+        7411: True, 7412: False, 7413: True, 7414: True,
+    }
+
+
+def test_pool_status_reports_unconfigured_pool(tmp_path: Path) -> None:
+    assert agy_vision.pool_status(pool_dir=tmp_path) == {
+        "configured": False,
+        "detail": "AGY pool is not configured",
+        "workers": [],
+        "reachable": 0,
+        "total": 0,
+    }
+
+
 def test_agy_pool_describes_owned_candidate_frames_and_cleans_copy(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

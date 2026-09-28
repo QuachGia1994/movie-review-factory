@@ -53,6 +53,29 @@ def _http_error(url: str, code: int, reason: str, body: bytes) -> urllib.error.H
     return urllib.error.HTTPError(url, code, reason, {}, io.BytesIO(body))
 
 
+def test_probe_returns_ok_on_clean_roundtrip(monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: dict[str, object] = {}
+
+    def fake(*, stage: str, prompt: str, schema: dict) -> dict:
+        seen["stage"] = stage
+        seen["required"] = schema.get("required")
+        return {"ok": True}
+
+    monkeypatch.setattr(agy_agent, "run_agy_json", fake)
+    assert agy_agent.probe() == {"ok": True}
+    assert seen == {"stage": "probe", "required": ["ok"]}
+
+
+def test_probe_returns_the_real_error_when_the_pool_fails(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fake(*, stage: str, prompt: str, schema: dict) -> dict:
+        raise ContentAgentError(f"AGY content agent unavailable during {stage}: no plan workers")
+
+    monkeypatch.setattr(agy_agent, "run_agy_json", fake)
+    result = agy_agent.probe()
+    assert result["ok"] is False
+    assert "unavailable during probe" in result["error"]
+
+
 def test_run_agy_json_extracts_object_behind_cli_prefix(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

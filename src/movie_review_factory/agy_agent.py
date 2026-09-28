@@ -143,3 +143,23 @@ def run_agy_json(
 
     detail = "; ".join(outcome.failures) or "no configured plan workers"
     raise ContentAgentError(f"AGY content agent failed during {stage}: {detail[:400]}")
+
+
+def probe() -> dict[str, Any]:
+    """Run one tiny structured call through the AGY pool to prove it answers.
+
+    Returns ``{"ok": True}`` on a clean round-trip, or ``{"ok": False, "error":
+    <detail>}`` carrying the pool's own failure message, so a caller can show
+    why AGY is unusable instead of a generic failure.
+    """
+    schema = {
+        "type": "object",
+        "properties": {"ok": {"type": "boolean"}},
+        "required": ["ok"],
+        "additionalProperties": False,
+    }
+    try:
+        run_agy_json(stage="probe", prompt='Reply with the JSON object {"ok": true} and nothing else.', schema=schema)
+    except ContentAgentError as exc:
+        return {"ok": False, "error": str(exc)}
+    return {"ok": True}

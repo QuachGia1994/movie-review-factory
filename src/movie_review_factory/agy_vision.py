@@ -4,6 +4,7 @@ import hashlib
 import json
 import secrets
 import shutil
+import socket
 import subprocess
 import urllib.error
 import urllib.parse
@@ -121,6 +122,38 @@ def pool_workers(pool_dir: Path | None) -> list[tuple[str, str, Path, str]]:
     if not workers:
         raise VisionUnavailable("AGY pool has no configured plan workers")
     return workers
+
+
+def _port_open(host: str, port: int, *, timeout: float = 0.5) -> bool:
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def pool_status(pool_dir: Path | None = None) -> dict:
+    """Cheap TCP reachability of each configured AGY worker port.
+
+    Never calls a worker or spends quota; it only checks that the local port
+    accepts a TCP connection.  An unconfigured pool is returned as data
+    (``configured`` False) rather than raised, so the dashboard badge renders a
+    plain state instead of an error.
+    """
+    try:
+        workers = pool_workers(pool_dir)
+    except VisionUnavailable as exc:
+        return {"configured": False, "detail": str(exc), "workers": [], "reachable": 0, "total": 0}
+    statuses: list[dict] = []
+    for role, url, _root, _token in workers:
+        port = urllib.parse.urlsplit(url).port
+        statuses.append({"role": role, "port": port, "reachable": _port_open("127.0.0.1", port)})
+    return {
+        "configured": True,
+        "workers": statuses,
+        "reachable": sum(1 for status in statuses if status["reachable"]),
+        "total": len(statuses),
+    }
 
 
 def _clean_terms(value: object, *, limit: int = 12) -> list[str]:
