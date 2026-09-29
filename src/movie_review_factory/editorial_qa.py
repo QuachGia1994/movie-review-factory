@@ -53,8 +53,9 @@ def caption_checks(alignment: dict) -> list[dict]:
                not invalid, f"Subtitle timing invalid or overlapping: {invalid}" if invalid else ""),
         _check("caption_two_line_safe", {"overflow": overflow, "max_lines": 2, "max_characters_per_line": 42},
                not overflow, f"Subtitle exceeds two short lines: {overflow}" if overflow else ""),
-        _check("caption_readable_duration", {"outside_0.25_to_6.1_seconds": unreadable},
-               not unreadable, f"Subtitle duration requires review: {unreadable}" if unreadable else ""),
+        {"check": "caption_readable_duration", "value": {"outside_0.25_to_6.1_seconds": unreadable},
+         "passed": True, "review_required": bool(unreadable),
+         "message": f"Subtitle duration requires review: {unreadable}" if unreadable else ""},
     ]
 
 

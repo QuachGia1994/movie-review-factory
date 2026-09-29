@@ -604,14 +604,14 @@ def test_http_index_and_job_lifecycle(tmp_path: Path) -> None:
             html = response.read().decode("utf-8")
         assert "Xưởng Review Phim" in html
         assert "Chọn ảnh bìa" in html
-        assert "Media Explorer" in html
+        assert "Trình khám phá tư liệu" in html
         assert 'class="media-workspace"' in html
         assert 'class="sticky-player"' in html
         assert 'role="tablist"' in html
         assert 'data-media-filter="transcript"' in html
         assert 'data-media-filter="scenes"' in html
         assert 'data-media-filter="highlights"' in html
-        assert 'aria-label="Source media player"' in html
+        assert 'aria-label="Trình phát video nguồn"' in html
         assert "prefers-reduced-motion: reduce" in html
         assert "syncActiveTranscript" in html
         assert "manualTranscriptScrollUntil" in html
@@ -636,7 +636,7 @@ def test_http_index_and_job_lifecycle(tmp_path: Path) -> None:
         assert "/api/library-search?" in html
         assert "/timeline" in html
         assert "/regenerate" in html
-        assert "Find similar" in html
+        assert "Tìm cảnh tương tự" in html
         assert "pendingLibrarySeek" in html
         assert "row.visual_description || row.label" in html
         assert "className = 'project-card" in html
@@ -1433,7 +1433,7 @@ def test_auth_header_not_required_on_html_page_without_token(tmp_path: Path) -> 
 
 
 def test_content_agent_select_offers_agy_pool() -> None:
-    assert '<option value="agy">AGY pool (research → outline → script)</option>' in webapp_mod.INDEX_HTML
+    assert '<option value="agy">AGY pool (nghiên cứu → dàn ý → kịch bản)</option>' in webapp_mod.INDEX_HTML
 
 
 def test_agy_pool_badge_and_probe_button_are_wired_into_the_dashboard() -> None:
@@ -1444,13 +1444,52 @@ def test_agy_pool_badge_and_probe_button_are_wired_into_the_dashboard() -> None:
     assert "api('POST', '/api/agy-pool/probe')" in html
 
 
+def test_dashboard_root_layout_dialog_tools_and_project_switcher_are_wired() -> None:
+    html = webapp_mod.INDEX_HTML
+    assert 'class="layout dashboard-shell"' in html
+    assert 'class="top-toolbar"' in html
+    assert 'id="projectSummaryLabel"' in html
+    assert 'class="project-popover"' in html
+    assert '.project-popover{ position:absolute' in html
+    assert '<dialog id="createPanel" class="tool-dialog"' in html
+    assert '<dialog id="brandPanel" class="tool-dialog"' in html
+    assert '<dialog id="libraryPanel" class="tool-dialog tool-dialog-wide"' in html
+    assert 'id="openCreateProject"' in html
+    assert 'id="openLibraryHub"' in html
+    assert 'id="openBrandSettings"' in html
+    assert "dialog.showModal()" in html
+    assert "document.addEventListener('pointerdown'" in html
+    assert 'id="emptyCreateBtn"' in html
+    assert 'id="emptyProjectsBtn"' in html
+    assert "$('createPanel').open = true" not in html
+    assert 'id="midrollStatus"' in html
+    assert 'insertion.location_label' in html
+
+
+def test_midroll_state_exposes_insertion_location(tmp_path: Path) -> None:
+    root = _job_with_metadata(tmp_path, "cta-location")
+    script = json.loads((root / "script.json").read_text(encoding="utf-8"))
+    script["sections"][0]["midroll"] = True
+    script["sections"][0]["start_seconds"] = 42.4
+    (root / "script.json").write_text(json.dumps(script), encoding="utf-8")
+    state = JobsService(tmp_path).get_midroll("cta-location")
+    assert state["insertion"] == {
+        "status": "inserted",
+        "start_seconds": 42.4,
+        "location_label": "Khoảng 42 giây · gần giữa video",
+    }
+
+
 def test_create_form_normalizes_job_id_to_safe_segment() -> None:
     html = webapp_mod.INDEX_HTML
     assert "function slugifyJobId(" in html
-    assert 'id="jobIdHint"' in html
-    # Submit sends the slug, so an accented or spaced code can never be rejected
-    # by _is_safe_segment while leaving the project list blank with no card.
-    assert "payload.job_id = slugifyJobId(" in html
+    # The project code is auto-generated and hidden: no visible code field, and
+    # the id input is a hidden field the operator never edits.
+    assert 'id="newJobId" name="job_id" type="hidden"' in html
+    assert "function autoJobId(" in html
+    # Submit auto-generates a safe slug, so an accented or spaced title can never
+    # be rejected by _is_safe_segment while leaving the project list blank.
+    assert "payload.job_id = autoJobId(" in html
 
 
 # --- roadmap #14: background indexing queue ---------------------------------

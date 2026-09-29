@@ -22,6 +22,10 @@ def test_caption_geometry_and_timing_identify_actual_overflow():
     assert by_name["caption_timing"]["value"]["invalid"] == [2, 3]
     assert by_name["caption_two_line_safe"]["value"]["overflow"] == [2]
     assert by_name["caption_readable_duration"]["value"]["outside_0.25_to_6.1_seconds"] == [2]
+    # Duration is a readability judgement, not a hard error: it flags for human
+    # review (passed) rather than failing QA, matching the other review checks.
+    assert by_name["caption_readable_duration"]["passed"] is True
+    assert by_name["caption_readable_duration"]["review_required"] is True
 
 
 def test_repeated_footage_is_advisory_and_render_mismatch_fails():

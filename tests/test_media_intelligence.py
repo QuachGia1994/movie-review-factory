@@ -129,8 +129,11 @@ def test_chat_local_fallback_and_claude_citation_validation(tmp_path: Path, monk
 def test_dashboard_vtt_sync_and_authenticated_clip_download_contract() -> None:
     html = webapp.INDEX_HTML
     assert '<track id="sourceCaptions" kind="subtitles"' in html
-    assert "const captions = await authFetch(data.transcript_vtt_href)" in html
-    assert "track.track.mode = 'showing'" in html
+    # Captions are built client-side from transcript rows (chunked to <=2 lines)
+    # and added as VTTCues, instead of loading the raw .vtt as one long cue.
+    assert "renderSourceCaptions(track, mediaExplorerData.transcript)" in html
+    assert "function chunkTranscriptRow(row)" in html
+    assert "tt.mode = 'showing'" in html
     assert "async function downloadHighlight" in html
     assert "const resolved = await authFetch(href)" in html
     assert "downloadHighlight(item.export_href, item.id)" in html

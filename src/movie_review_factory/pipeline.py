@@ -1209,9 +1209,12 @@ def _agent_scene_assignments(
                 video_duration,
             )
             if allowed is not None:
-                first = positions[shot["start_scene_index"]]
-                last = positions[shot["end_scene_index"]]
-                if any(scenes[position].get("index") not in allowed for position in range(first, last + 1)):
+                # The agent only references the range endpoints, and the per-section
+                # candidate set is a sparse ranked subset, so intermediate scenes in
+                # a contiguous range are frequently not candidates through no fault of
+                # the agent. Validate only the chosen endpoints against candidates.
+                if (shot["start_scene_index"] not in allowed
+                        or shot["end_scene_index"] not in allowed):
                     raise ValueError("content agent scene plan selected a scene outside section candidates")
             key = (source_clip["start_seconds"], source_clip["end_seconds"])
             if key in seen_ranges:

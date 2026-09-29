@@ -1597,7 +1597,24 @@ class JobsService:
         draft = self._read_json(root, "midroll-draft.json")
         script = self._read_json(root, "script.json")
         staged = next((s for s in script.get("sections", []) if isinstance(s, dict) and s.get("midroll")), None)
-        return {"draft": draft, "staged": staged, "approved": bool(script.get("approved"))}
+        start_seconds = None
+        if isinstance(staged, dict):
+            start_seconds = staged.get("start_seconds")
+        if start_seconds is None and isinstance(draft, dict):
+            start_seconds = draft.get("start_seconds")
+        return {
+            "draft": draft,
+            "staged": staged,
+            "approved": bool(script.get("approved")),
+            "insertion": {
+                "status": "inserted" if staged else "draft" if draft else "missing",
+                "start_seconds": start_seconds,
+                "location_label": (
+                    f"Khoảng {round(float(start_seconds))} giây · gần giữa video"
+                    if isinstance(start_seconds, (int, float)) else "Chưa xác định vị trí"
+                ),
+            },
+        }
 
     def generate_midroll(self, job_id: str) -> dict:
         from .agy_agent import run_agy_json
@@ -2244,15 +2261,13 @@ INDEX_HTML = """<!DOCTYPE html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Xưởng Review Phim — Bảng điều khiển</title>
 <style>
-  :root { color-scheme: light dark; --gap: 16px; --accent: #4f7cff; }
+  :root { color-scheme: light dark; --gap: 16px; --accent: #338ef7; }
   * { box-sizing: border-box; }
   body { margin: 0; font-family: system-ui, "Segoe UI", Roboto, sans-serif;
          line-height: 1.5; background: #0f1115; color: #e6e8ee; }
   header { padding: 14px 20px; background: #171a21; border-bottom: 1px solid #262b36; }
   header h1 { margin: 0; font-size: 18px; }
   header .sub { color: #9aa3b2; font-size: 13px; }
-  .layout { display: grid; grid-template-columns: 320px 1fr; gap: var(--gap); padding: var(--gap); }
-  @media (max-width: 820px) { .layout { grid-template-columns: 1fr; } }
   .card { background: #171a21; border: 1px solid #262b36; border-radius: 10px; padding: 14px; margin-bottom: var(--gap); }
   .card h2 { margin: 0 0 10px; font-size: 15px; }
   label { display: block; font-size: 12px; color: #9aa3b2; margin: 8px 0 2px; }
@@ -2264,6 +2279,19 @@ INDEX_HTML = """<!DOCTYPE html>
       background: #232838; color: #e6e8ee; }
   button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
   button:disabled { opacity: .45; cursor: not-allowed; }
+  /* Modern SaaS glass layer: additive overrides preserve existing behavior. */
+  html { min-height: 100%; background: #080b12; }
+  body { min-height: 100vh; color: #f4f7ff; background: radial-gradient(circle at 12% -8%, rgba(109,140,255,.22), transparent 34rem), radial-gradient(circle at 92% 8%, rgba(139,92,246,.16), transparent 30rem), #080b12; }
+  header { position: sticky; top: 0; z-index: 20; padding: 18px clamp(18px,3vw,36px); background: rgba(8,11,18,.72); border-color: rgba(148,163,184,.18); backdrop-filter: blur(18px) saturate(140%); }
+  header h1 { font-size: clamp(18px,2vw,23px); letter-spacing: -.025em; }
+  .card { background: rgba(20,25,38,.72); border-color: rgba(148,163,184,.18); border-radius: 16px; padding: clamp(14px,2vw,20px); box-shadow: 0 18px 50px rgba(0,0,0,.28); backdrop-filter: blur(18px) saturate(125%); }
+  input, select, textarea { padding: 9px 11px; background: rgba(7,10,17,.72); border-color: rgba(148,163,184,.18); border-radius: 9px; }
+  input:focus, select:focus, textarea:focus { outline: none; border-color: rgba(109,140,255,.8); box-shadow: 0 0 0 3px rgba(109,140,255,.16); }
+  button { border-radius: 9px; border-color: rgba(148,163,184,.18); background: rgba(38,47,69,.82); transition: transform .16s, border-color .16s, background .16s; }
+  button:hover:not(:disabled) { transform: translateY(-1px); border-color: rgba(148,163,184,.38); background: rgba(49,60,87,.92); }
+  button:focus-visible, a:focus-visible { outline: 3px solid rgba(109,140,255,.55); outline-offset: 2px; }
+  button.primary { background: linear-gradient(135deg,#6d8cff,#8b5cf6); border-color: rgba(255,255,255,.16); box-shadow: 0 8px 24px rgba(109,140,255,.24); }
+  @media (max-width: 820px) { header { position: relative; } }
   .project-list, .artifact-grid { display: grid; gap: 8px; }
   .project-toolbar { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 10px; }
   .project-toolbar label { display: flex; align-items: center; gap: 6px; margin: 0; }
@@ -2313,7 +2341,21 @@ INDEX_HTML = """<!DOCTYPE html>
   .timeline-list { display: grid; gap: 8px; margin-top: 10px; }
   .timeline-card, .track-card { border: 1px solid var(--line); border-radius: 8px; padding: 10px; background: var(--panel-raised); }
   .timeline-card.locked { border-color: #6b5324; }
-  .timeline-controls { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 6px; margin-top: 8px; }
+  .timeline-controls { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-top: 8px; }
+  .timeline-controls > button { flex: 1 1 0; min-width: 0; }
+  .clip-more { position: relative; flex: 0 0 auto; }
+  .clip-more > summary { list-style: none; cursor: pointer; padding: 6px 10px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel-raised); user-select: none; }
+  .clip-more > summary::-webkit-details-marker { display: none; }
+  .clip-more[open] > summary { border-color: var(--accent, #4f7cff); }
+  .clip-more-menu { position: absolute; right: 0; top: calc(100% + 4px); z-index: 20; display: grid; gap: 4px; min-width: 190px; padding: 6px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel-raised); box-shadow: 0 6px 18px rgba(0,0,0,0.35); }
+  .clip-more-menu button { width: 100%; text-align: left; }
+  .clip-more { position: relative; }
+  .clip-more > summary { list-style: none; cursor: pointer; text-align: center; border: 1px solid var(--line); border-radius: 6px; padding: 5px 8px; background: var(--panel); color: var(--text-dim); }
+  .clip-more > summary::-webkit-details-marker { display: none; }
+  .clip-more[open] > summary { background: #283755; color: #fff; }
+  .clip-more-menu { position: absolute; right: 0; z-index: 30; margin-top: 4px; display: grid; gap: 4px; padding: 6px; min-width: 168px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel-raised); box-shadow: 0 8px 24px rgba(0,0,0,.35); }
+  .clip-more-menu button { width: 100%; }
+  .step-focus { outline: 2px solid var(--accent); outline-offset: 3px; border-radius: 8px; }
   .continuity-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 8px; margin-top: 10px; }
   .gate { border: 1px dashed #6b5324; background: #1c1706; border-radius: 8px; padding: 10px; }
   .ok { color: #57d98a; } .warn { color: #f5c451; } .err { color: #ff7a86; }
@@ -2374,7 +2416,6 @@ INDEX_HTML = """<!DOCTYPE html>
   /* Compact project workspace: one task visible at a time. */
   body { background: #10141c; font-size: 14px; }
   header { padding: 11px 20px; }
-  .layout { grid-template-columns: minmax(250px, 290px) minmax(0, 1fr); gap: 12px; max-width: 1800px; margin: auto; padding: 12px; }
   aside, main, #detail { min-width: 0; }
   aside .card { margin-bottom: 10px; }
   summary { cursor: pointer; font-weight: 650; }
@@ -2403,14 +2444,12 @@ INDEX_HTML = """<!DOCTYPE html>
   #view-review-form { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 320px), 1fr)); gap: 10px; align-items: start; }
   #view-review-form .card { min-width: 0; }
   @media (max-width: 820px) {
-    .layout { grid-template-columns: 1fr; }
     .project-list { max-height: 210px; }
     .media-list { max-height: 380px; }
     .source-frame video { max-height: 32dvh; }
     .workspace-tabs button { padding: 8px; }
   }
   @media (max-width: 430px) {
-    .layout { padding: 8px; gap: 8px; }
     .card { padding: 10px; margin-bottom: 8px; }
     .project-list { max-height: 180px; }
     .stage { flex-wrap: wrap; }
@@ -2433,12 +2472,13 @@ INDEX_HTML = """<!DOCTYPE html>
     --bg-base:#0a0c11; --panel:#14171f; --panel-raised:#1b1f29; --field-bg:#0e1016;
     --line:#242a36; --line-strong:#333a48;
     --text:#e7e9f0; --text-dim:#9aa3b4; --text-muted:#6c7484;
-    --accent:#6366f1; --accent-hover:#7c83f6; --accent-contrast:#ffffff;
-    --accent-soft:rgba(99,102,241,.16); --ring:rgba(99,102,241,.5);
+    --accent:#338ef7; --accent-hover:#57a3f9; --accent-contrast:#ffffff;
+    --accent-soft:rgba(51,142,247,.16); --ring:rgba(51,142,247,.5);
     --ok:#34d399; --ok-soft:rgba(16,185,129,.16); --ok-line:rgba(16,185,129,.34);
     --warn:#fbbf24; --warn-soft:rgba(245,158,11,.15); --warn-line:rgba(245,158,11,.32);
     --err:#fb7185; --err-soft:rgba(244,63,94,.15); --err-line:rgba(244,63,94,.34);
     --shadow-1:0 1px 2px rgba(0,0,0,.4); --shadow-2:0 8px 24px rgba(0,0,0,.36); --shadow-3:0 20px 50px rgba(0,0,0,.5);
+    --z-toolbar:20;
     --gap:16px;
   }
   :root[data-theme="light"]{
@@ -2446,8 +2486,8 @@ INDEX_HTML = """<!DOCTYPE html>
     --bg-base:#f5f7fb; --panel:#ffffff; --panel-raised:#ffffff; --field-bg:#f1f4f9;
     --line:#e4e8f0; --line-strong:#cdd5e1;
     --text:#0f172a; --text-dim:#526078; --text-muted:#8a94a6;
-    --accent:#4f46e5; --accent-hover:#4338ca; --accent-contrast:#ffffff;
-    --accent-soft:rgba(79,70,229,.10); --ring:rgba(79,70,229,.35);
+    --accent:#1f7ae0; --accent-hover:#166bce; --accent-contrast:#ffffff;
+    --accent-soft:rgba(51,142,247,.12); --ring:rgba(51,142,247,.35);
     --ok:#059669; --ok-soft:rgba(5,150,105,.12); --ok-line:rgba(5,150,105,.28);
     --warn:#b45309; --warn-soft:rgba(180,83,9,.12); --warn-line:rgba(180,83,9,.28);
     --err:#e11d48; --err-soft:rgba(225,29,72,.10); --err-line:rgba(225,29,72,.26);
@@ -2455,7 +2495,6 @@ INDEX_HTML = """<!DOCTYPE html>
   }
   body{ background:var(--bg-base); color:var(--text); font-size:14px; -webkit-font-smoothing:antialiased;
         background-image:radial-gradient(1100px 520px at 100% -8%, var(--accent-soft), transparent 62%); background-attachment:fixed; }
-  .layout{ max-width:1820px; }
   header{ position:sticky; top:0; z-index:30; display:flex; align-items:center; justify-content:space-between; gap:var(--space-4);
           padding:12px 22px; border-bottom:1px solid var(--line);
           background:var(--panel); background:color-mix(in srgb, var(--panel) 85%, transparent);
@@ -2464,7 +2503,7 @@ INDEX_HTML = """<!DOCTYPE html>
   header .sub{ color:var(--text-dim); font-size:12px; }
   .brand{ display:flex; align-items:center; gap:12px; min-width:0; }
   .brand-mark{ display:grid; place-items:center; width:38px; height:38px; border-radius:11px; font-size:19px; flex:none;
-               background:linear-gradient(135deg, var(--accent), #a855f7); box-shadow:0 6px 18px var(--accent-soft); }
+               background:linear-gradient(135deg, var(--accent), var(--accent-hover)); box-shadow:0 6px 18px var(--accent-soft); }
   .brand-text{ min-width:0; }
   .theme-toggle{ display:inline-flex; align-items:center; gap:8px; flex:none; padding:7px 13px; border-radius:var(--r-pill);
                  background:var(--panel-raised); border:1px solid var(--line-strong); color:var(--text); font-size:12.5px; font-weight:650; }
@@ -2479,15 +2518,16 @@ INDEX_HTML = """<!DOCTYPE html>
                            padding:8px 10px; transition:border-color .15s, box-shadow .15s; }
   input::placeholder, textarea::placeholder{ color:var(--text-muted); }
   input:focus, select:focus, textarea:focus{ outline:none; border-color:var(--accent); box-shadow:0 0 0 3px var(--ring); }
-  button{ background:var(--panel-raised); color:var(--text); border:1px solid var(--line-strong); border-radius:var(--r-sm);
-          padding:8px 13px; font-weight:650; letter-spacing:.01em;
+  /* Clipto-style: pill-shaped buttons, one solid accent (no gradient). */
+  button{ background:var(--panel-raised); color:var(--text); border:1px solid var(--line-strong); border-radius:var(--r-pill);
+          padding:8px 15px; font-weight:650; letter-spacing:.01em;
           transition:background .15s, border-color .15s, transform .06s, box-shadow .15s, filter .15s; }
-  button:hover{ border-color:var(--accent); }
+  button:hover{ border-color:var(--accent); color:var(--accent); }
   button:active{ transform:translateY(1px); }
-  button.primary, button.primary:hover{ background:linear-gradient(135deg, var(--accent), #7c83f6); border-color:transparent;
+  button.primary, button.primary:hover{ background:var(--accent); border-color:transparent;
                                         color:var(--accent-contrast); box-shadow:0 6px 18px var(--accent-soft); }
   button.primary:hover{ filter:brightness(1.06); }
-  .button-link{ background:linear-gradient(135deg, var(--accent), #7c83f6); border-radius:var(--r-sm); box-shadow:0 6px 18px var(--accent-soft); }
+  .button-link{ background:var(--accent); color:var(--accent-contrast); border-radius:var(--r-pill); box-shadow:0 6px 18px var(--accent-soft); }
   button.danger, .danger{ color:var(--err); border-color:var(--err-line); background:var(--err-soft); }
   button.danger:hover{ border-color:var(--err); }
   button:disabled{ opacity:.45; }
@@ -2512,13 +2552,39 @@ INDEX_HTML = """<!DOCTYPE html>
   .project-card .open-project:hover{ color:var(--accent); }
   .stage{ border-bottom-color:var(--line); }
   .stage .name{ font-variant-numeric:tabular-nums; }
-  .workspace-tabs, .media-tabs{ background:var(--field-bg); border:1px solid var(--line); border-radius:var(--r-md); }
-  .workspace-tabs button, .media-tab{ border-radius:var(--r-sm); font-weight:650; transition:background .15s, color .15s; }
-  .workspace-tabs button[aria-selected="true"], .media-tab[aria-selected="true"]{ background:var(--panel); color:var(--text); box-shadow:var(--shadow-1); }
+  .workspace-tabs, .media-tabs{ background:var(--field-bg); border:1px solid var(--line); border-radius:var(--r-pill); }
+  .workspace-tabs button, .media-tab{ border-radius:var(--r-pill); font-weight:650; transition:background .15s, color .15s; }
+  .workspace-tabs button:hover, .media-tab:hover{ color:var(--accent); }
+  .workspace-tabs button[aria-selected="true"], .media-tab[aria-selected="true"]{ background:var(--accent); color:var(--accent-contrast); box-shadow:var(--shadow-1); }
   .media-shell, .browser-pane{ background:var(--panel); }
   .player-pane{ background:var(--bg-base); border-right-color:var(--line); }
   .media-topbar, .media-searchbar, .chat-box{ border-color:var(--line); }
   .media-title p, .player-hint, .highlight-card p{ color:var(--text-dim); }
+  /* Clipto-style Media Explorer layout: softer/rounder shell, centered titles
+     with more breathing room. CSS-only; dark theme and markup unchanged. */
+  #mediaExplorerCard.media-shell{ border-radius:var(--r-lg); }
+  #mediaExplorerCard .media-topbar{ flex-direction:column; align-items:center; text-align:center; gap:10px; padding:22px 20px; }
+  #mediaExplorerCard .media-title{ max-width:640px; }
+  #mediaExplorerCard .media-title h2{ font-size:20px; }
+  #mediaExplorerCard .media-title p{ margin-top:6px; }
+  #mediaExplorerCard .export-tools{ justify-content:center; }
+  /* Centered, stacked section headings (title over subtitle) instead of the
+     left title / right subtitle split. */
+  #mediaExplorerCard .section-heading{ flex-direction:column; align-items:center; justify-content:center; text-align:center; gap:2px; margin-bottom:12px; }
+  /* Extend the Clipto treatment to the other workspace areas (Biên tập,
+     Duyệt & xuất) and the create-project panel: larger card radius + centered
+     section titles. CSS-only, dark theme unchanged. */
+  #view-explore .card, #view-edit .card, #view-review .card,
+  #view-review-content .card, #view-review-form .card{ border-radius:var(--r-lg); }
+  /* Center only direct card headings; headings that sit in a flex .row with
+     action buttons (e.g. #editorCard, #detail job title) are .card > .row > h2
+     and are intentionally left untouched. */
+  #view-edit .card > h2, #view-review .card > h2,
+  #view-review-content .card > h2, #view-review-form .card > h2{ text-align:center; }
+  /* Give the create-project dropdown a softer, rounder frame and a centered
+     panel title to match. */
+  .create-panel > form{ border-radius:var(--r-lg); }
+  .create-panel > summary{ justify-content:center; text-align:center; }
   .result-copy{ color:var(--text); }
   .media-result:hover{ border-color:var(--line-strong); background:var(--panel-raised); }
   .media-result.active{ border-color:var(--accent); background:var(--accent-soft); }
@@ -2528,7 +2594,13 @@ INDEX_HTML = """<!DOCTYPE html>
   .time-chip{ color:var(--accent); background:var(--accent-soft); }
   .speaker-chip{ color:#c4b5fd; background:rgba(139,92,246,.16); }
   .kind-chip{ color:var(--text-dim); background:var(--panel-raised); }
-  .seek-button{ color:var(--accent); background:var(--accent-soft); border-color:var(--line-strong); }
+  .seek-button{ color:var(--accent); background:var(--accent-soft); border-color:var(--line-strong); border-radius:var(--r-pill); }
+  /* Overflow ("⋯ Thêm") trigger matches the pill button family; its menu items
+     stay left-aligned but rounded to fit inside the popover. */
+  .clip-more > summary{ border-radius:var(--r-pill); background:var(--panel-raised); color:var(--text); border-color:var(--line-strong); }
+  .clip-more[open] > summary{ background:var(--accent); color:var(--accent-contrast); border-color:transparent; }
+  .clip-more-menu button{ border-radius:var(--r-sm); text-align:left; }
+  .button-link:hover{ filter:brightness(1.06); }
   .source-frame{ border-color:var(--line); box-shadow:var(--shadow-2); }
   .state-panel{ background:var(--panel); border-color:var(--line); color:var(--text-dim); }
   .chat-answer{ background:var(--field-bg); }
@@ -2549,58 +2621,73 @@ INDEX_HTML = """<!DOCTYPE html>
   @media (max-width:560px){ header{ flex-wrap:wrap; padding:10px 14px; } .theme-toggle-label{ display:none; } }
 </style>
 <style>
-  /* ============================================================
-     Horizontal control bar (top-nav) — turns the vertical sidebar
-     (Create / Project / Library) into a compact toolbar so the
-     workspace spans the full width for a pro, wide-canvas feel.
-     Pure CSS over the existing markup; ids/behaviour unchanged.
-     ============================================================ */
-  .layout{ display:block; max-width:none; padding:14px 18px; }
-  aside{ display:flex; align-items:flex-start; gap:12px; flex-wrap:wrap; margin-bottom:14px; }
-  aside > .card{ margin:0; padding:10px 12px; }
-  aside > .card > summary{ list-style:none; display:flex; align-items:center; gap:8px; font-weight:700; font-size:13px; white-space:nowrap; }
-  aside > .card > summary::-webkit-details-marker{ display:none; }
-  aside > .card > summary::before{ content:"▸"; color:var(--text-muted); font-size:11px; transition:transform .15s; }
-  aside > .card[open] > summary::before{ transform:rotate(90deg); }
-  /* Create + Library act as compact dropdown triggers */
-  .create-panel, .library-panel, .brand-panel{ position:relative; flex:0 0 auto; }
-  .brand-fields{ position:absolute; top:calc(100% + 8px); left:0; width:310px; max-width:92vw; z-index:46; padding:14px; background:var(--panel); border:1px solid var(--line); border-radius:var(--r-md); box-shadow:var(--shadow-3); }
-  .brand-preview{ display:flex; align-items:center; gap:10px; margin:8px 0; }
-  .brand-preview img{ width:52px; height:52px; object-fit:contain; background:#11151d; border-radius:12px; }
-  .brand-fields input[type=file]{ max-width:100%; }
+  /* Workspace chrome: .dashboard-shell owns top-level layout; .layout only disables the legacy grid. */
+  .layout{ display:block; }
+  .dashboard-shell{ width:min(1800px,100%); margin:0 auto; padding:12px 18px 18px; }
+  .top-toolbar{ position:relative; z-index:var(--z-toolbar); display:flex; align-items:center; gap:8px; min-width:0; margin:0 0 12px; }
+  .toolbar-action{ min-height:42px; flex:0 0 auto; }
+  .top-toolbar .project-panel{ position:relative; flex:0 1 auto; min-width:0; margin:0; padding:0; border-radius:var(--r-pill); }
+  .project-panel > summary{ list-style:none; display:flex; align-items:center; gap:8px; min-height:42px; padding:8px 14px; white-space:nowrap; }
+  .project-panel > summary::-webkit-details-marker{ display:none; }
+  .project-panel > summary::before{ content:"▾"; color:var(--text-muted); font-size:11px; transition:transform .15s; }
+  .project-panel[open] > summary::before{ transform:rotate(180deg); }
+  .project-summary-prefix{ color:var(--text-dim); font-size:12px; font-weight:650; }
+  .project-label{ max-width:360px; overflow:hidden; text-overflow:ellipsis; color:var(--text); }
+  .project-popover{ position:absolute; top:calc(100% + 8px); left:0; z-index:80; width:min(560px,calc(100vw - 36px)); max-height:min(68dvh,560px); overflow:hidden; padding:12px; background:var(--panel); border:1px solid var(--line-strong); border-radius:var(--r-md); box-shadow:var(--shadow-3); }
+  .project-popover .project-list{ display:grid; grid-template-columns:1fr; max-height:min(52dvh,440px); overflow-y:auto; overflow-x:hidden; padding:0 4px 4px 0; scroll-snap-type:none; }
+  .project-popover .project-card{ width:100%; min-width:0; }
 
-  .create-panel > summary::after{ content:"＋"; color:var(--accent); font-weight:800; margin-left:2px; }
-  .create-panel > form{ position:absolute; top:calc(100% + 8px); left:0; width:340px; max-width:92vw; z-index:45;
-    background:var(--panel); border:1px solid var(--line); border-radius:var(--r-md); box-shadow:var(--shadow-3);
-    padding:14px; max-height:72vh; overflow:auto; }
-  .library-panel[open]{ flex:1 1 320px; max-width:560px; }
-  /* Project switcher: takes remaining width, scrolls horizontally as chips */
-  .project-panel{ flex:1 1 460px; min-width:0; }
-  .project-panel > summary{ margin-bottom:8px; }
-  .project-panel .project-toolbar{ margin-bottom:8px; }
-  .project-panel .project-list{ display:flex; flex-direction:row; align-items:stretch; gap:8px;
-    max-height:none; overflow-x:auto; overflow-y:hidden; padding-bottom:6px; scroll-snap-type:x proximity; }
-  .project-panel .project-card{ flex:0 0 216px; scroll-snap-align:start; }
-  /* Full-width workspace */
-  main, #detail{ width:100%; }
-  #view-review-form{ grid-template-columns:repeat(auto-fit, minmax(min(100%, 360px), 1fr)); }
+  .tool-dialog{ width:min(760px,calc(100vw - 32px)); max-width:none; max-height:min(88dvh,860px); padding:0; overflow:hidden; }
+  .tool-dialog-wide{ width:min(1040px,calc(100vw - 32px)); }
+  .tool-dialog::backdrop{ background:rgba(6,8,12,.68); -webkit-backdrop-filter:blur(4px); backdrop-filter:blur(4px); }
+  .dialog-shell{ display:grid; grid-template-rows:auto minmax(0,1fr); max-height:min(88dvh,860px); }
+  .dialog-header{ display:flex; align-items:center; justify-content:space-between; gap:16px; padding:14px 18px; border-bottom:1px solid var(--line); background:var(--panel); }
+  .dialog-header h2{ margin:0; font-size:16px; }
+  .dialog-header p{ margin:2px 0 0; color:var(--text-dim); font-size:12px; }
+  .dialog-close{ display:grid; place-items:center; width:36px; height:36px; padding:0; flex:none; font-size:20px; line-height:1; }
+  .dialog-body{ min-height:0; overflow:auto; padding:18px; }
+  .create-form{ max-width:680px; margin:0 auto; }
+  .create-form > label:first-of-type{ margin-top:0; }
+  .brand-fields{ display:grid; gap:16px; }
+  .brand-preview{ display:flex; align-items:center; gap:12px; margin:0; padding:12px; border:1px solid var(--line); border-radius:var(--r-md); background:var(--field-bg); }
+  .brand-preview img{ width:56px; height:56px; object-fit:contain; background:var(--bg-base); border-radius:var(--r-md); }
+  .settings-section{ display:grid; gap:10px; padding:14px; border:1px solid var(--line); border-radius:var(--r-md); background:var(--panel); }
+  .settings-section h3, .library-section h3{ margin:0; font-size:14px; }
+  .settings-section > p, .library-section > p{ margin:0; color:var(--text-dim); font-size:12px; }
+  .settings-row{ display:grid; grid-template-columns:minmax(0,1fr) auto; gap:8px; align-items:end; }
+  .settings-row label{ margin:0 0 2px; }
+  .settings-row button{ white-space:nowrap; }
+  .library-hub{ display:grid; grid-template-columns:minmax(0,1.15fr) minmax(300px,.85fr); gap:16px; align-items:start; }
+  .library-section{ min-width:0; padding:14px; border:1px solid var(--line); border-radius:var(--r-md); background:var(--panel); }
+  .library-section > .search-field{ margin-top:12px; }
+  .library-section .project-list{ max-height:340px; overflow:auto; }
+  .library-section details{ margin-top:10px; }
+
+  .empty-state{ min-height:min(420px,calc(100dvh - 220px)); margin:0; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:10px; padding:32px; text-align:center; border-style:dashed; }
+  .empty-state-mark{ display:grid; place-items:center; width:52px; height:52px; border-radius:var(--r-lg); background:var(--accent-soft); color:var(--accent); font-size:28px; font-weight:750; }
+  .empty-state h2{ margin:0; color:var(--text); font-size:20px; }
+  .empty-state p{ max-width:620px; margin:0; color:var(--text-dim); }
+  .empty-actions{ display:flex; flex-wrap:wrap; justify-content:center; gap:8px; margin-top:4px; }
+  .empty-help{ font-size:12px; color:var(--text-muted); }
+  .cta-status{ margin:8px 0; padding:9px 11px; border:1px solid var(--line); border-radius:9px; background:var(--field-bg); font-weight:650; }
+
+  /* Review/export player stays constrained to the viewport. */
+  #video{ display:block; width:100%; max-width:1040px; height:auto; aspect-ratio:16/9; max-height:calc(100dvh - 260px); object-fit:contain; margin:10px auto 0; background:#000; border-radius:10px; }
+
   @media (max-width:860px){
-    aside{ flex-direction:column; align-items:stretch; }
-    .create-panel, .library-panel, .project-panel, .brand-panel{ flex:1 1 auto; width:100%; max-width:none; }
-    .brand-fields{ position:static; width:auto; max-width:none; box-shadow:none; margin-top:10px; }
-    .create-panel > form{ position:static; width:auto; max-width:none; max-height:none; box-shadow:none; padding:0; border:0; background:transparent; }
-    .project-panel .project-list{ flex-direction:column; overflow-x:hidden; overflow-y:auto; max-height:220px; }
+    .dashboard-shell{ padding:8px; }
+    .top-toolbar{ flex-wrap:wrap; overflow:visible; padding-bottom:0; }
+    .project-label{ max-width:220px; }
+    .project-popover{ position:absolute; top:calc(100% + 8px); left:0; right:auto; bottom:auto; width:min(560px,calc(100vw - 16px)); max-height:min(60dvh,480px); }
+    .tool-dialog, .tool-dialog-wide{ width:calc(100vw - 16px); max-height:92dvh; }
+    .dialog-shell{ max-height:92dvh; }
+    .dialog-header{ padding:12px 14px; }
+    .dialog-body{ padding:14px; }
+    .library-hub{ grid-template-columns:1fr; }
+    .settings-row{ grid-template-columns:1fr; }
+    .empty-state{ min-height:320px; padding:22px 16px; }
+    #video{ max-height:56dvh; }
   }
-  /* Review/export player (“Duyệt & xuất”): a constrained 16:9 preview that fits
-     the desktop viewport, so the whole video is visible without scrolling.
-     Fixed at the component root (not an inline per-screen hack); object-fit keeps
-     the aspect ratio without distortion even when max-height clamps the box. */
-  #video{
-    display:block; width:100%; max-width:1040px; height:auto; aspect-ratio:16/9;
-    max-height:calc(100dvh - 260px); object-fit:contain; margin:10px auto 0;
-    background:#000; border-radius:10px;
-  }
-  @media (max-width:860px){ #video{ max-height:56dvh; } }
 </style>
 <script>
   (function(){
@@ -2647,140 +2734,202 @@ INDEX_HTML = """<!DOCTYPE html>
     });
   })();
 </script>
-<div class="layout">
-  <aside>
-    <details class="card create-panel" id="createPanel">
-      <summary>Tạo project mới</summary>
-      <form id="createForm">
-        <label for="sourceFile">Video MP4</label>
-        <input id="sourceFile" type="file" accept=".mp4,video/mp4">
-        <label for="newJobId">Mã project</label>
-        <input id="newJobId" name="job_id" placeholder="vd: review-abc" required>
-        <div id="jobIdHint" class="notice" role="status"></div>
-        <label>Tên phim / truy vấn nghiên cứu</label>
-        <input name="movie_title" placeholder="vd: The Matrix (1999)">
-        <details class="advanced-fields"><summary>Định hướng review</summary>
-          <label for="briefTemplateSelect">Mẫu brief dùng lại</label>
-          <select id="briefTemplateSelect"><option value="">Chọn mẫu để điền form…</option></select>
-          <button id="applyBriefTemplate" type="button">Áp dụng mẫu</button>
-          <label for="briefTemplateName">Lưu các trường bên dưới thành mẫu mới</label>
-          <input id="briefTemplateName" maxlength="200" placeholder="Tên mẫu brief">
-          <button id="saveBriefTemplate" type="button">Lưu mẫu brief</button>
-          <span id="briefTemplateMsg" class="notice" role="status"></span>
-          <label>Luận điểm chính</label><textarea name="review_thesis" rows="2" maxlength="500" placeholder="Điều bạn muốn người xem nhớ sau video"></textarea>
-          <label>Giọng kể</label><input name="tone" maxlength="120" placeholder="Hài hước, phân tích, giàu cảm xúc...">
-          <label>Khán giả</label><input name="target_audience" maxlength="200" placeholder="Người mới xem hay fan lâu năm">
-          <label>Mức tiết lộ nội dung</label><select name="spoiler_policy"><option value="unspecified">Chưa chọn</option><option value="none">Không spoiler</option><option value="limited">Spoiler hạn chế</option><option value="full">Review toàn bộ</option></select>
-          <label>Điều không được khẳng định (mỗi dòng một ý)</label><textarea name="forbidden_claims" rows="2" placeholder="Không đoán danh tính nhân vật..."></textarea>
-        </details>
-        <details class="advanced-fields"><summary>Tùy chọn dựng video</summary>
-        <label>Ngôn ngữ</label>
-        <input name="language" value="vi">
-        <label>Bộ tạo nội dung</label>
-        <select name="content_agent">
-          <option value="scaffold">Scaffold (offline)</option>
-          <option value="claude">Claude Code (research → outline → script)</option>
-          <option value="agy">AGY pool (research → outline → script)</option>
-        </select>
-        <div class="row" id="agyPoolRow" style="margin-top:6px;align-items:center;gap:8px">
-          <span id="agyPoolBadge" class="badge pending">AGY: chưa kiểm tra</span>
-          <button type="button" id="agyProbeBtn">Kiểm tra AGY</button>
+<div class="layout dashboard-shell">
+  <aside class="top-toolbar" aria-label="Công cụ project">
+    <details class="card project-panel" id="projectPanel">
+      <summary>
+        <span class="project-summary-prefix">Project</span>
+        <strong id="projectSummaryLabel" class="project-label">Chưa chọn</strong>
+      </summary>
+      <div class="project-popover">
+        <div class="project-toolbar">
+          <label><input id="selectAllProjects" type="checkbox"> Chọn tất cả</label>
+          <button id="deleteSelectedBtn" class="danger" type="button" disabled>Xóa đã chọn (0)</button>
         </div>
-        <label>Thời lượng mục tiêu (phút)</label>
-        <input name="target_minutes" type="number" value="10" min="1" max="60" step="0.5">
-        <label>Tỷ lệ khung hình</label>
-        <select name="aspect_ratio"><option>16:9</option><option>9:16</option></select>
-        <label>Che dải watermark phía trên (0–20% chiều cao)</label>
-        <input name="brand_top_band" type="number" value="0" min="0" max="0.2" step="0.01">
-        <label>Che dải tiêu đề cũ phía dưới (0–20% chiều cao)</label>
-        <input name="brand_bottom_band" type="number" value="0" min="0" max="0.2" step="0.01">
-        </details>
-        <details><summary class="muted">Hoặc nhập đường dẫn cục bộ</summary>
-          <label for="sourcePath">Đường dẫn video trên máy chạy ứng dụng</label>
-          <input id="sourcePath" name="source_video" placeholder="data\\raw\\....mp4">
-        </details>
-        <div class="row" style="margin-top:10px">
-          <button class="primary" type="submit">Tạo project</button>
-        </div>
-        <progress id="uploadProgress" class="upload-progress" max="100" value="0" hidden></progress>
-        <div id="createMsg" class="notice" role="status"></div>
-      </form>
-    </details>
-    <details class="card brand-panel" id="brandPanel">
-      <summary>Thương hiệu</summary>
-      <div class="brand-fields">
-        <div class="brand-preview"><img id="brandPreview" alt="Logo kênh"><strong id="brandPreviewName">Màn Kể</strong></div>
-        <label for="brandName">Tên kênh</label>
-        <input id="brandName" maxlength="40" value="Màn Kể" autocomplete="off">
-        <button id="saveBrandName" type="button">Lưu tên kênh</button>
-        <label for="brandLogo">Thay logo PNG nền trong suốt (tối đa 2 MB)</label>
-        <input id="brandLogo" type="file" accept="image/png,.png">
-        <button id="saveBrandLogo" type="button">Lưu logo</button>
-        <div id="brandMsg" class="notice" role="status"></div>
-        <label for="brandTopBand">Che dải chữ cũ phía trên (tỷ lệ 0–0,2)</label>
-        <input id="brandTopBand" type="number" min="0" max="0.2" step="0.01" value="0">
-        <label for="brandBottomBand">Che dải tiêu đề cũ phía dưới (tỷ lệ 0–0,2)</label>
-        <input id="brandBottomBand" type="number" min="0" max="0.2" step="0.01" value="0">
-        <button id="brandRenderBtn" type="button" disabled>Dựng lại video đang chọn</button>
-        <small class="muted">Tên và logo lưu dùng chung; dải che theo từng project. <a href="/api/brand/logo.svg" download="man-ke.svg">Tải SVG gốc</a>.</small>
+        <div id="bulkMsg" class="notice" role="status"></div>
+        <div id="jobList" class="project-list" aria-live="polite">Đang tải…</div>
       </div>
     </details>
-    <details class="card project-panel" id="projectPanel" open>
-      <summary>Project</summary>
-      <div class="project-toolbar">
-        <label><input id="selectAllProjects" type="checkbox"> Chọn tất cả</label>
-        <button id="deleteSelectedBtn" class="danger" type="button" disabled>Xóa đã chọn (0)</button>
-      </div>
-      <div id="bulkMsg" class="notice" role="status"></div>
-      <div id="jobList" class="project-list" aria-live="polite">Đang tải…</div>
-    </details>
-    <details class="card library-panel">
-      <summary>Tìm trong thư viện</summary>
-      <div class="search-field" role="search">
-        <label class="sr-only" for="librarySearch">Tìm lời thoại hoặc nội dung hình ảnh trong mọi project</label>
-        <input id="librarySearch" type="search" maxlength="200" placeholder='vd: xe đỏ person:"Person 1" location:hospital'>
-        <button id="librarySearchBtn" type="button">Tìm</button>
-      </div>
-      <details>
-        <summary class="muted">Bộ lọc nâng cao</summary>
-        <div class="filter-grid">
-          <select id="libraryKind"><option value="">Mọi loại</option><option value="visual">Visual</option><option value="transcript">Transcript</option></select>
-          <input id="libraryProject" placeholder="Project">
-          <input id="libraryPerson" placeholder="Person / alias">
-          <input id="libraryAction" placeholder="Action">
-          <input id="libraryLocation" placeholder="Location">
-          <input id="libraryObject" placeholder="Object">
-          <input id="librarySceneType" placeholder="Scene type / shot label">
-          <input id="librarySource" placeholder="Source (agy/transcript/...)">
-          <input id="libraryDateFrom" type="date" aria-label="Project date from">
-          <input id="libraryDateTo" type="date" aria-label="Project date to">
-          <input id="libraryMinDuration" type="number" min="0" step="0.1" placeholder="Min seconds">
-          <input id="libraryMaxDuration" type="number" min="0" step="0.1" placeholder="Max seconds">
-          <input id="libraryMinConfidence" type="number" min="0" max="1" step="0.05" placeholder="Min confidence">
-        </div>
-      </details>
-      <div class="row" style="margin-top:8px">
-        <button id="saveLibrarySearchBtn" type="button">Lưu tìm kiếm</button>
-        <select id="savedLibrarySearches" aria-label="Saved library searches"><option value="">Tìm kiếm đã lưu…</option></select>
-      </div>
-      <div id="libraryResults" class="project-list muted" aria-live="polite">Nhập từ khóa hoặc bộ lọc để tìm xuyên mọi project.</div>
-    </details>
-    <details class="card" id="creatorLibraryPanel">
-      <summary>Thư viện project và series</summary>
-      <label for="creatorProjectSearch">Tìm tên phim, brief, tiêu đề, mô tả, tag</label>
-      <div class="row"><input id="creatorProjectSearch" type="search" maxlength="200" placeholder="Tìm project"><button id="creatorProjectSearchBtn" type="button">Tìm</button></div>
-      <div id="creatorProjectResults" class="project-list notice" role="status"></div>
-      <label for="seriesId">Mã series</label><input id="seriesId" maxlength="100" placeholder="vd: review-ben-10">
-      <label for="seriesTitle">Tên series</label><input id="seriesTitle" maxlength="200" placeholder="Review thế giới Ben 10">
-      <label for="seriesEntries">Phim theo thứ tự (mỗi dòng: tên phim | mã project, mã tùy chọn)</label>
-      <textarea id="seriesEntries" rows="3" placeholder="Ben 10 Alien Swarm | ben-review&#10;Phần tiếp theo"></textarea>
-      <button id="saveSeriesBtn" type="button">Lưu kế hoạch series</button>
-      <div id="seriesMsg" class="notice" role="status"></div>
-      <div id="seriesList" class="project-list notice"></div>
-    </details>
+    <button id="openCreateProject" class="primary toolbar-action" type="button">＋ Tạo project</button>
+    <button id="openLibraryHub" class="toolbar-action" type="button">Thư viện</button>
+    <button id="openBrandSettings" class="toolbar-action" type="button">Thương hiệu</button>
   </aside>
+
+  <dialog id="createPanel" class="tool-dialog" aria-labelledby="createDialogTitle">
+    <div class="dialog-shell">
+      <div class="dialog-header">
+        <div>
+          <h2 id="createDialogTitle">Tạo project mới</h2>
+          <p>Chọn MP4 trước. Các thiết lập nâng cao có thể để mặc định.</p>
+        </div>
+        <button id="closeCreateProject" class="dialog-close" type="button" aria-label="Đóng">×</button>
+      </div>
+      <div class="dialog-body">
+        <form id="createForm" class="create-form">
+          <label for="sourceFile">Video MP4</label>
+          <input id="sourceFile" type="file" accept=".mp4,video/mp4">
+          <input id="newJobId" name="job_id" type="hidden">
+          <label>Tên phim / truy vấn nghiên cứu</label>
+          <input name="movie_title" placeholder="vd: The Matrix (1999)">
+          <details class="advanced-fields"><summary>Định hướng review</summary>
+            <label for="briefTemplateSelect">Mẫu brief dùng lại</label>
+            <select id="briefTemplateSelect"><option value="">Chọn mẫu để điền form…</option></select>
+            <button id="applyBriefTemplate" type="button">Áp dụng mẫu</button>
+            <label for="briefTemplateName">Lưu các trường bên dưới thành mẫu mới</label>
+            <input id="briefTemplateName" maxlength="200" placeholder="Tên mẫu brief">
+            <button id="saveBriefTemplate" type="button">Lưu mẫu brief</button>
+            <span id="briefTemplateMsg" class="notice" role="status"></span>
+            <label>Luận điểm chính</label><textarea name="review_thesis" rows="2" maxlength="500" placeholder="Điều bạn muốn người xem nhớ sau video"></textarea>
+            <label>Giọng kể</label><input name="tone" maxlength="120" placeholder="Hài hước, phân tích, giàu cảm xúc...">
+            <label>Khán giả</label><input name="target_audience" maxlength="200" placeholder="Người mới xem hay fan lâu năm">
+            <label>Mức tiết lộ nội dung</label><select name="spoiler_policy"><option value="unspecified">Chưa chọn</option><option value="none">Không spoiler</option><option value="limited">Spoiler hạn chế</option><option value="full">Review toàn bộ</option></select>
+            <label>Điều không được khẳng định (mỗi dòng một ý)</label><textarea name="forbidden_claims" rows="2" placeholder="Không đoán danh tính nhân vật..."></textarea>
+          </details>
+          <details class="advanced-fields"><summary>Tùy chọn dựng video</summary>
+            <label>Ngôn ngữ</label>
+            <input name="language" value="vi">
+            <label>Bộ tạo nội dung</label>
+            <select name="content_agent">
+              <option value="scaffold">Scaffold (offline)</option>
+              <option value="claude">Claude Code (nghiên cứu → dàn ý → kịch bản)</option>
+              <option value="agy">AGY pool (nghiên cứu → dàn ý → kịch bản)</option>
+            </select>
+            <div class="row" id="agyPoolRow" style="margin-top:6px;align-items:center;gap:8px">
+              <span id="agyPoolBadge" class="badge pending">AGY: chưa kiểm tra</span>
+              <button type="button" id="agyProbeBtn">Kiểm tra AGY</button>
+            </div>
+            <label>Thời lượng mục tiêu (phút)</label>
+            <input name="target_minutes" type="number" value="10" min="1" max="60" step="0.5">
+            <label>Tỷ lệ khung hình</label>
+            <select name="aspect_ratio"><option>16:9</option><option>9:16</option></select>
+            <label>Che dải watermark phía trên (0–20% chiều cao)</label>
+            <input name="brand_top_band" type="number" value="0" min="0" max="0.2" step="0.01">
+            <label>Che dải tiêu đề cũ phía dưới (0–20% chiều cao)</label>
+            <input name="brand_bottom_band" type="number" value="0" min="0" max="0.2" step="0.01">
+          </details>
+          <details><summary class="muted">Hoặc nhập đường dẫn cục bộ</summary>
+            <label for="sourcePath">Đường dẫn video trên máy chạy ứng dụng</label>
+            <input id="sourcePath" name="source_video" placeholder="data\\raw\\....mp4">
+          </details>
+          <div class="row" style="margin-top:10px">
+            <button class="primary" type="submit">Tạo project</button>
+          </div>
+          <progress id="uploadProgress" class="upload-progress" max="100" value="0" hidden></progress>
+          <div id="createMsg" class="notice" role="status"></div>
+        </form>
+      </div>
+    </div>
+  </dialog>
+
+  <dialog id="brandPanel" class="tool-dialog" aria-labelledby="brandDialogTitle">
+    <div class="dialog-shell">
+      <div class="dialog-header">
+        <div>
+          <h2 id="brandDialogTitle">Thương hiệu</h2>
+          <p>Tên và logo dùng chung. Dải che chỉ áp dụng cho project đang mở.</p>
+        </div>
+        <button id="closeBrandSettings" class="dialog-close" type="button" aria-label="Đóng">×</button>
+      </div>
+      <div class="dialog-body">
+        <div class="brand-fields">
+          <div class="brand-preview"><img id="brandPreview" alt="Logo kênh"><strong id="brandPreviewName">Màn Kể</strong></div>
+          <section class="settings-section">
+            <h3>Nhận diện kênh</h3>
+            <div class="settings-row">
+              <div><label for="brandName">Tên kênh</label><input id="brandName" maxlength="40" value="Màn Kể" autocomplete="off"></div>
+              <button id="saveBrandName" type="button">Lưu tên</button>
+            </div>
+            <div class="settings-row">
+              <div><label for="brandLogo">Logo PNG nền trong suốt, tối đa 2 MB</label><input id="brandLogo" type="file" accept="image/png,.png"></div>
+              <button id="saveBrandLogo" type="button">Lưu logo</button>
+            </div>
+            <div id="brandMsg" class="notice" role="status"></div>
+            <small class="muted"><a href="/api/brand/logo.svg" download="man-ke.svg">Tải SVG gốc</a></small>
+          </section>
+          <section class="settings-section">
+            <h3>Che chữ nguồn của project hiện tại</h3>
+            <p>Chỉ dùng khi bạn có quyền xử lý nguồn. Kiểm tra lại bản dựng sau khi áp dụng.</p>
+            <div class="settings-row">
+              <div><label for="brandTopBand">Dải phía trên (0–0,2)</label><input id="brandTopBand" type="number" min="0" max="0.2" step="0.01" value="0"></div>
+              <div><label for="brandBottomBand">Dải phía dưới (0–0,2)</label><input id="brandBottomBand" type="number" min="0" max="0.2" step="0.01" value="0"></div>
+            </div>
+            <button id="brandRenderBtn" type="button" disabled>Dựng lại video đang chọn</button>
+          </section>
+        </div>
+      </div>
+    </div>
+  </dialog>
+
+  <dialog id="libraryPanel" class="tool-dialog tool-dialog-wide" aria-labelledby="libraryDialogTitle">
+    <div class="dialog-shell">
+      <div class="dialog-header">
+        <div>
+          <h2 id="libraryDialogTitle">Thư viện</h2>
+          <p>Tìm cảnh, lời thoại, project và quản lý series ở một nơi.</p>
+        </div>
+        <button id="closeLibraryHub" class="dialog-close" type="button" aria-label="Đóng">×</button>
+      </div>
+      <div class="dialog-body library-hub">
+        <section class="library-section">
+          <h3>Tìm cảnh & lời thoại</h3>
+          <p>Tìm xuyên tất cả project theo nội dung hoặc bộ lọc.</p>
+          <div class="search-field" role="search">
+            <label class="sr-only" for="librarySearch">Tìm lời thoại hoặc nội dung hình ảnh trong mọi project</label>
+            <input id="librarySearch" type="search" maxlength="200" placeholder='vd: xe đỏ person:"Person 1" location:hospital'>
+            <button id="librarySearchBtn" type="button">Tìm</button>
+          </div>
+          <details>
+            <summary class="muted">Bộ lọc nâng cao</summary>
+            <div class="filter-grid">
+              <select id="libraryKind"><option value="">Mọi loại</option><option value="visual">Hình ảnh</option><option value="transcript">Lời thoại</option></select>
+              <input id="libraryProject" placeholder="Dự án / Mã project">
+              <input id="libraryPerson" placeholder="Nhân vật / tên gọi">
+              <input id="libraryAction" placeholder="Hành động">
+              <input id="libraryLocation" placeholder="Địa điểm">
+              <input id="libraryObject" placeholder="Đồ vật">
+              <input id="librarySceneType" placeholder="Loại cảnh / nhãn cảnh">
+              <input id="librarySource" placeholder="Nguồn (agy/transcript/...)">
+              <input id="libraryDateFrom" type="date" aria-label="Ngày dự án từ">
+              <input id="libraryDateTo" type="date" aria-label="Ngày dự án đến">
+              <input id="libraryMinDuration" type="number" min="0" step="0.1" placeholder="Số giây tối thiểu">
+              <input id="libraryMaxDuration" type="number" min="0" step="0.1" placeholder="Số giây tối đa">
+              <input id="libraryMinConfidence" type="number" min="0" max="1" step="0.05" placeholder="Độ tin cậy tối thiểu">
+            </div>
+          </details>
+          <div class="row" style="margin-top:8px">
+            <button id="saveLibrarySearchBtn" type="button">Lưu tìm kiếm</button>
+            <select id="savedLibrarySearches" aria-label="Tìm kiếm thư viện đã lưu"><option value="">Tìm kiếm đã lưu…</option></select>
+          </div>
+          <div id="libraryResults" class="project-list muted" aria-live="polite">Nhập từ khóa hoặc bộ lọc để tìm xuyên mọi project.</div>
+        </section>
+        <section class="library-section" id="creatorLibraryPanel">
+          <h3>Project & series</h3>
+          <p>Tìm project theo nội dung và lưu thứ tự các phần trong series.</p>
+          <label for="creatorProjectSearch">Tìm tên phim, brief, tiêu đề, mô tả, tag</label>
+          <div class="row"><input id="creatorProjectSearch" type="search" maxlength="200" placeholder="Tìm project"><button id="creatorProjectSearchBtn" type="button">Tìm</button></div>
+          <div id="creatorProjectResults" class="project-list notice" role="status"></div>
+          <label for="seriesId">Mã series</label><input id="seriesId" maxlength="100" placeholder="vd: review-ben-10">
+          <label for="seriesTitle">Tên series</label><input id="seriesTitle" maxlength="200" placeholder="Review thế giới Ben 10">
+          <label for="seriesEntries">Phim theo thứ tự (mỗi dòng: tên phim | mã project, mã tùy chọn)</label>
+          <textarea id="seriesEntries" rows="3" placeholder="Ben 10 Alien Swarm | ben-review&#10;Phần tiếp theo"></textarea>
+          <button id="saveSeriesBtn" type="button">Lưu kế hoạch series</button>
+          <div id="seriesMsg" class="notice" role="status"></div>
+          <div id="seriesList" class="project-list notice"></div>
+        </section>
+      </div>
+    </div>
+  </dialog>
   <main>
-    <div id="empty" class="card muted">Chọn video MP4 và tạo project để bắt đầu, hoặc mở một project đã có.</div>
+    <div id="empty" class="card empty-state" role="status">
+      <div class="empty-state-mark" aria-hidden="true">＋</div>
+      <h2>Bắt đầu một video review</h2>
+      <p>Chọn MP4 để tạo project mới. Mặc định đã đủ để bắt đầu; brief và tùy chọn dựng chỉ cần mở khi bạn muốn chỉnh sâu.</p>
+      <div class="empty-actions">
+        <button id="emptyCreateBtn" class="primary" type="button">Tạo project từ MP4</button>
+        <button id="emptyProjectsBtn" type="button" hidden>Mở project có sẵn</button>
+      </div>
+      <div class="empty-help">Sau khi tạo, project mở thẳng vào workspace và giữ toàn bộ tiến trình ở một nơi.</div>
+    </div>
     <div id="detail" style="display:none">
       <div class="card">
         <div class="row" style="justify-content:space-between">
@@ -2886,40 +3035,40 @@ INDEX_HTML = """<!DOCTYPE html>
       <section class="card media-shell" id="mediaExplorerCard" style="display:none" aria-labelledby="mediaExplorerTitle">
         <div class="media-topbar">
           <div class="media-title">
-            <h2 id="mediaExplorerTitle">Media Explorer</h2>
-            <p>Review footage, follow the transcript, and pull clips from one workspace.</p>
+            <h2 id="mediaExplorerTitle">Trình khám phá tư liệu</h2>
+            <p>Xem lại cảnh quay, theo dõi lời thoại và trích đoạn trong cùng một không gian làm việc.</p>
           </div>
-          <div class="export-tools" aria-label="Export controls">
-            <button id="mediaExportBtn" type="button" style="display:none" aria-label="Download transcript as VTT">↓ VTT</button>
+          <div class="export-tools" aria-label="Công cụ xuất">
+            <button id="mediaExportBtn" type="button" style="display:none" aria-label="Tải bản ghi lời thoại dạng VTT">↓ VTT</button>
           </div>
         </div>
         <div class="media-workspace">
           <div class="player-pane">
             <div class="sticky-player">
               <div class="source-frame">
-                <video id="sourceVideo" controls preload="metadata" aria-label="Source media player"><track id="sourceCaptions" kind="subtitles" srclang="und" label="Lời thoại nguồn" default></video>
+                <video id="sourceVideo" controls preload="metadata" aria-label="Trình phát video nguồn"><track id="sourceCaptions" kind="subtitles" srclang="und" label="Lời thoại nguồn" default></video>
               </div>
-              <div class="player-hint"><span>Click a transcript row or scene to seek</span><span id="playerTime" aria-live="off">00:00</span></div>
-              <details class="extras-panel"><summary>Highlights và hỏi đáp video</summary>
+              <div class="player-hint"><span>Bấm vào dòng lời thoại hoặc cảnh để tua tới</span><span id="playerTime" aria-live="off">00:00</span></div>
+              <details class="extras-panel"><summary>Khoảnh khắc nổi bật và hỏi đáp video</summary>
               <section class="highlight-section" aria-labelledby="highlightsHeading">
-                <div class="section-heading"><h3 id="highlightsHeading">Smart highlights</h3><span class="muted">Vertical-ready picks</span></div>
-                <div id="highlightResults" class="highlight-grid"><div class="state-panel">Loading highlights…</div></div>
+                <div class="section-heading"><h3 id="highlightsHeading">Khoảnh khắc nổi bật thông minh</h3><span class="muted">Đoạn gợi ý cho video dọc</span></div>
+                <div id="highlightResults" class="highlight-grid"><div class="state-panel">Đang tải khoảnh khắc nổi bật…</div></div>
               </section>
               <section class="chat-box" aria-labelledby="askHeading">
-                <div class="section-heading"><h3 id="askHeading">Ask about this video</h3><span class="muted">Uses indexed transcript</span></div>
-                <div class="search-field"><label class="sr-only" for="chatQuestion">Question about this video</label><input id="chatQuestion" maxlength="500" placeholder="What happens after the lighthouse scene?"><button id="chatAskBtn" type="button">Ask</button></div>
-                <div id="chatAnswer" class="chat-answer notice" aria-live="polite">Ask a question to find grounded moments.</div>
+                <div class="section-heading"><h3 id="askHeading">Hỏi đáp về video này</h3><span class="muted">Dựa trên lời thoại đã lập chỉ mục</span></div>
+                <div class="search-field"><label class="sr-only" for="chatQuestion">Câu hỏi về video này</label><input id="chatQuestion" maxlength="500" placeholder="Chuyện gì xảy ra sau cảnh ngọn hải đăng?"><button id="chatAskBtn" type="button">Hỏi</button></div>
+                <div id="chatAnswer" class="chat-answer notice" aria-live="polite">Đặt câu hỏi để tìm các đoạn liên quan trong video.</div>
               </section>
               </details>
             </div>
           </div>
           <div class="browser-pane">
             <div class="media-searchbar">
-              <div class="search-field" role="search"><label class="sr-only" for="mediaSearch">Search transcript and scenes</label><input id="mediaSearch" type="search" placeholder="Search words, speakers, or scenes…" autocomplete="off"><button id="mediaSearchBtn" type="button">Search</button></div>
-              <div class="media-tabs" role="tablist" aria-label="Media result filter">
-                <button class="media-tab" type="button" role="tab" aria-selected="true" data-media-filter="transcript">Transcript <span id="transcriptCount"></span></button>
-                <button class="media-tab" type="button" role="tab" aria-selected="false" data-media-filter="scenes">Scenes <span id="sceneCount"></span></button>
-                <button class="media-tab" type="button" role="tab" aria-selected="false" data-media-filter="highlights">Highlights <span id="highlightCount"></span></button>
+              <div class="search-field" role="search"><label class="sr-only" for="mediaSearch">Tìm trong lời thoại và cảnh</label><input id="mediaSearch" type="search" placeholder="Tìm từ khóa, người nói hoặc cảnh…" autocomplete="off"><button id="mediaSearchBtn" type="button">Tìm kiếm</button></div>
+              <div class="media-tabs" role="tablist" aria-label="Bộ lọc kết quả tư liệu">
+                <button class="media-tab" type="button" role="tab" aria-selected="true" data-media-filter="transcript">Lời thoại <span id="transcriptCount"></span></button>
+                <button class="media-tab" type="button" role="tab" aria-selected="false" data-media-filter="scenes">Cảnh <span id="sceneCount"></span></button>
+                <button class="media-tab" type="button" role="tab" aria-selected="false" data-media-filter="highlights">Nổi bật <span id="highlightCount"></span></button>
               </div>
             </div>
             <div id="mediaResults" class="media-list" aria-live="polite" aria-busy="false"></div>
@@ -2953,12 +3102,13 @@ INDEX_HTML = """<!DOCTYPE html>
         <button id="audioSaveBtn" type="button">Lưu âm thanh</button>
         <div id="audioMsg" class="notice" role="status"></div>
       </details>
-      <div class="card" id="editorCard" style="display:none">
+      <div class="card" id="editorCard">
         <div class="row" style="justify-content:space-between">
-          <h2 style="margin:0">Timeline &amp; Continuity</h2>
-          <button id="autoBrollBtn" type="button">Auto B-roll lặp cảnh</button>
+          <h2 style="margin:0">Dòng thời gian &amp; Liền mạch</h2>
+          <button id="autoBrollBtn" type="button">Tự chèn B-roll lặp cảnh</button>
         </div>
-        <div class="muted">Khóa clip để giữ nguyên; trim/replace chỉ làm mất hiệu lực các bước sau scene plan.</div>
+        <div class="muted">Khóa clip để giữ nguyên; cắt/thay chỉ làm mất hiệu lực các bước sau kế hoạch cảnh.</div>
+        <div id="editorState" class="action-note" role="status" hidden></div>
         <details id="sectionPreviewPanel">
           <summary>Xem nhanh một phần · 540p</summary>
           <p class="muted">Chọn phần để dựng thử từ các cảnh đã chọn, giọng đọc và phụ đề có mốc thời gian. Không dựng lại toàn bộ video.</p>
@@ -2998,8 +3148,9 @@ INDEX_HTML = """<!DOCTYPE html>
         <div class="card"><h2>Tệp project</h2><div id="artifacts" class="artifact-grid muted"></div></div>
       </section>
       <section id="view-review-form" class="workspace-view" hidden>
-      <div class="card">
+      <div class="card" id="scriptReviewCard">
         <h2>Kịch bản &amp; Duyệt</h2>
+        <div id="midrollStatus" class="cta-status" role="status">CTA: đang kiểm tra trạng thái…</div>
         <details id="midrollPanel">
           <summary>CTA giữa video · AGY</summary>
           <p class="muted">AGY viết câu hài ngắn tại ranh giới gần 50% video. Bạn duyệt câu trong kịch bản trước khi dựng lại.</p>
@@ -3029,7 +3180,7 @@ INDEX_HTML = """<!DOCTYPE html>
         <div id="scriptMsg" class="notice"></div>
       </div>
 
-      <div class="card">
+      <div class="card" id="metadataReviewCard">
         <h2>Siêu dữ liệu &amp; Duyệt</h2>
         <div id="metaState" class="muted"></div>
         <label>Tiêu đề</label>
@@ -3046,7 +3197,7 @@ INDEX_HTML = """<!DOCTYPE html>
         <div id="metaMsg" class="notice"></div>
       </div>
 
-      <div class="card">
+      <div class="card" id="publishGateCard">
         <h2>Cổng xuất bản</h2>
         <div class="gate">
           <div>Thao tác này <strong>không tải lên</strong> bất kỳ đâu. Nó chỉ ghi tệp bàn giao
@@ -3080,6 +3231,40 @@ const $ = (id) => document.getElementById(id);
 let current = null;
 let poller = null;
 let editorLoaded = null;
+// Which review block matches the current next action: 'script' | 'metadata'
+// | 'thumbnail' | 'export'. loadStatus() keeps this in sync with nextAction so
+// opening "Duyệt & xuất" jumps straight to the block that needs attention.
+let reviewFocus = 'script';
+// The card that matches each focus. Opening the review view scrolls to this
+// block; the three FORM cards (script/metadata/publish) collapse so only the
+// one called out by the next action is expanded. videoCard / exportCard /
+// thumbnailCard keep whatever visibility their own state gave them (a ready
+// preview or export must never disappear just because it is not the focus).
+const REVIEW_FOCUS_TARGET = {
+  script: 'scriptReviewCard',
+  metadata: 'metadataReviewCard',
+  thumbnail: 'thumbnailCard',
+  export: 'exportCard',
+};
+// Only these three collapse by focus; the rest are governed by loadStatus.
+const REVIEW_FORM_CARDS = ['scriptReviewCard', 'metadataReviewCard', 'publishGateCard'];
+function applyReviewFocus(scroll = false) {
+  const focus = REVIEW_FOCUS_TARGET[reviewFocus] ? reviewFocus : 'script';
+  // Both review sub-sections stay visible so every state-driven card (final
+  // preview, export, thumbnail) can still show; we only collapse the sibling
+  // form cards that are not the current focus.
+  $('view-review-content').hidden = false;
+  $('view-review-form').hidden = false;
+  const focusFormCard = REVIEW_FORM_CARDS.includes(REVIEW_FOCUS_TARGET[focus]) ? REVIEW_FOCUS_TARGET[focus] : null;
+  for (const id of REVIEW_FORM_CARDS) {
+    const el = $(id);
+    if (el) el.hidden = focusFormCard ? id !== focusFormCard : false;
+  }
+  // Only scroll on an explicit user action (opening the review view); never on
+  // background loadStatus polls, which would jerk the page during a run.
+  const target = $(REVIEW_FOCUS_TARGET[focus]);
+  if (scroll && target && target.offsetParent !== null) target.scrollIntoView({behavior: 'smooth', block: 'start'});
+}
 function setWorkspaceView(view) {
   for (const tab of document.querySelectorAll('.workspace-tabs [role="tab"]')) {
     const active = tab.dataset.view === view;
@@ -3087,8 +3272,12 @@ function setWorkspaceView(view) {
     tab.tabIndex = active ? 0 : -1;
   }
   for (const name of ['explore', 'edit', 'review', 'files']) $('view-' + name).hidden = name !== view;
-  $('view-review-content').hidden = view !== 'review';
-  $('view-review-form').hidden = view !== 'review';
+  if (view === 'review') {
+    applyReviewFocus(true);
+  } else {
+    $('view-review-content').hidden = true;
+    $('view-review-form').hidden = true;
+  }
 }
 document.querySelectorAll('.workspace-tabs [role="tab"]').forEach(tab => {
   tab.addEventListener('click', () => setWorkspaceView(tab.dataset.view));
@@ -3101,7 +3290,7 @@ document.querySelectorAll('.workspace-tabs [role="tab"]').forEach(tab => {
     if (target) { event.preventDefault(); target.focus(); setWorkspaceView(target.dataset.view); }
   });
 });
-$('reviewAction').onclick = () => { setWorkspaceView('review'); $('scriptSections').focus(); };
+$('reviewAction').onclick = () => { reviewFocus = 'script'; setWorkspaceView('review'); $('scriptSections').focus(); };
 // Fold Vietnamese diacritics and đ, keep only [a-z0-9_-], so the value always
 // matches the server's _is_safe_segment instead of being rejected with no card.
 function slugifyJobId(raw) {
@@ -3109,25 +3298,14 @@ function slugifyJobId(raw) {
     .replace(/[đĐ]/g, 'd').toLowerCase().replace(/[^a-z0-9_-]+/g, '-')
     .replace(/^-+|-+$/g, '').slice(0, 64).replace(/-+$/g, '');
 }
-function updateJobIdHint() {
-  const raw = $('newJobId').value;
-  const hint = $('jobIdHint');
-  if (!raw.trim()) { hint.textContent = ''; return; }
-  const slug = slugifyJobId(raw);
-  hint.textContent = slug ? 'Mã sẽ dùng: ' + slug : 'Mã chưa hợp lệ, hãy nhập chữ hoặc số.';
+// The project code is generated automatically and stays hidden from the form;
+// the created code is shown in the success message after the project is made.
+function autoJobId(title, file) {
+  const fromTitle = slugifyJobId(title || '');
+  const fromFile = file ? slugifyJobId(file.name.replace(/[.]mp4$/i, '')) : '';
+  const base = fromTitle || fromFile || 'review';
+  return (base + '-' + Date.now().toString(36).slice(-4)).slice(0, 64).replace(/-+$/g, '');
 }
-$('newJobId').addEventListener('input', updateJobIdHint);
-$('newJobId').addEventListener('blur', () => {
-  const slug = slugifyJobId($('newJobId').value);
-  if (slug) $('newJobId').value = slug;
-  updateJobIdHint();
-});
-$('sourceFile').onchange = () => {
-  const input = $('newJobId');
-  if (input.value.trim()) return;
-  const file = $('sourceFile').files[0];
-  if (file) { input.value = slugifyJobId(file.name.replace(/[.]mp4$/i, '')) || 'video-project'; updateJobIdHint(); }
-};
 
 const selectedProjects = new Set();
 let projectJobs = [];
@@ -3302,7 +3480,7 @@ function renderMediaRows() {
   if (mediaFilter === 'highlights') rows = mediaExplorerData.highlights;
   if (!rows.length) {
     const searching = $('mediaSearch').value.trim();
-    setMediaState(searching ? 'No matching ' + mediaFilter + ' found. Try a broader search.' : 'No ' + mediaFilter + ' are available yet.', 'empty');
+    setMediaState(searching ? 'Không tìm thấy kết quả phù hợp. Hãy thử tìm kiếm rộng hơn.' : 'Chưa có dữ liệu.', 'empty');
     return;
   }
   setMediaState('');
@@ -3311,13 +3489,13 @@ function renderMediaRows() {
       const card = document.createElement('article');
       card.className = 'highlight-card';
       const heading = document.createElement('strong');
-      heading.textContent = row.title || 'Highlight';
+      heading.textContent = row.title || 'Khoảnh khắc nổi bật';
       const meta = document.createElement('div'); meta.className = 'result-meta';
-      meta.append(makeChip(formatTime(row.start_seconds ?? row.start) + '–' + formatTime(row.end_seconds ?? row.end), 'time-chip'), makeChip('Highlight', 'kind-chip'));
-      const reason = document.createElement('p'); reason.textContent = row.reason || 'Suggested moment';
+      meta.append(makeChip(formatTime(row.start_seconds ?? row.start) + '–' + formatTime(row.end_seconds ?? row.end), 'time-chip'), makeChip('Nổi bật', 'kind-chip'));
+      const reason = document.createElement('p'); reason.textContent = row.reason || 'Đoạn gợi ý';
       const actions = document.createElement('div'); actions.className = 'row';
-      const preview = document.createElement('button'); preview.type = 'button'; preview.textContent = '▶ Preview'; preview.onclick = makeSeekHandler(row.start_seconds ?? row.start);
-      const download = document.createElement('button'); download.type = 'button'; download.textContent = '↓ 9:16 MP4'; download.setAttribute('aria-label', 'Export ' + heading.textContent + ' as vertical MP4'); download.onclick = () => downloadHighlight(row.export_href, row.id).catch(showError);
+      const preview = document.createElement('button'); preview.type = 'button'; preview.textContent = '▶ Xem trước'; preview.onclick = makeSeekHandler(row.start_seconds ?? row.start);
+      const download = document.createElement('button'); download.type = 'button'; download.textContent = '↓ 9:16 MP4'; download.setAttribute('aria-label', 'Xuất ' + heading.textContent + ' dạng MP4 dọc'); download.onclick = () => downloadHighlight(row.export_href, row.id).catch(showError);
       actions.append(preview, download); card.append(heading, meta, reason, actions); results.append(card); continue;
     }
     const item = document.createElement('article');
@@ -3328,21 +3506,21 @@ function renderMediaRows() {
     if (isTranscript) item.dataset.transcriptId = String(row.id ?? row.start_seconds);
     if (!isTranscript) {
       const img = document.createElement('img');
-      img.alt = 'Scene thumbnail at ' + formatTime(row.start_seconds);
+      img.alt = 'Ảnh thu nhỏ cảnh tại ' + formatTime(row.start_seconds);
       img.loading = 'lazy';
-      authFetch(row.thumbnail_href).then(resolved => { if (resolved.startsWith('blob:')) mediaObjectUrls.push(resolved); img.src = resolved; }).catch(error => { img.alt = 'Thumbnail unavailable: ' + error.message; });
+      authFetch(row.thumbnail_href).then(resolved => { if (resolved.startsWith('blob:')) mediaObjectUrls.push(resolved); img.src = resolved; }).catch(error => { img.alt = 'Ảnh thu nhỏ không khả dụng: ' + error.message; });
       item.append(img);
     }
     const detail = document.createElement('div');
     const meta = document.createElement('div'); meta.className = 'result-meta';
     meta.append(makeChip(formatTime(row.start_seconds) + '–' + formatTime(row.end_seconds), 'time-chip'));
     if (isTranscript && row.speaker) meta.append(makeChip(row.speaker, 'speaker-chip'));
-    meta.append(makeChip(isTranscript ? 'Transcript' : 'Scene', 'kind-chip'));
+    meta.append(makeChip(isTranscript ? 'Lời thoại' : 'Cảnh', 'kind-chip'));
     if (row.semantic_score !== null && row.semantic_score !== undefined) {
-      meta.append(makeChip('Semantic ' + Number(row.semantic_score).toFixed(2), 'kind-chip'));
+      meta.append(makeChip('Ngữ nghĩa ' + Number(row.semantic_score).toFixed(2), 'kind-chip'));
     }
     const copy = document.createElement('div'); copy.className = 'result-copy';
-    copy.textContent = isTranscript ? row.text : (row.visual_description || row.label || 'Indexed scene');
+    copy.textContent = isTranscript ? row.text : (row.visual_description || row.label || 'Cảnh đã lập chỉ mục');
     if (!isTranscript) {
       for (const value of [
         ...(row.visual_tags || []).slice(0, 3),
@@ -3351,18 +3529,18 @@ function renderMediaRows() {
         ...(row.person_tracks || []).slice(0, 3),
       ]) meta.append(makeChip(value, 'kind-chip'));
     }
-    const seek = document.createElement('button'); seek.type = 'button'; seek.className = 'seek-button'; seek.textContent = '▶ Jump to ' + formatTime(row.start_seconds); seek.setAttribute('aria-label', 'Seek source video to ' + formatTime(row.start_seconds)); seek.onclick = event => { event.stopPropagation(); seekSource(row.start_seconds); };
+    const seek = document.createElement('button'); seek.type = 'button'; seek.className = 'seek-button'; seek.textContent = '▶ Nhảy tới ' + formatTime(row.start_seconds); seek.setAttribute('aria-label', 'Tua video nguồn tới ' + formatTime(row.start_seconds)); seek.onclick = event => { event.stopPropagation(); seekSource(row.start_seconds); };
     detail.append(meta, copy, seek);
     if (!isTranscript && row.id) {
       const similar = document.createElement('button');
       similar.type = 'button';
-      similar.textContent = 'Find similar';
+      similar.textContent = 'Tìm cảnh tương tự';
       similar.onclick = event => { event.stopPropagation(); findSimilarScenes(row.id).catch(showError); };
       detail.append(similar);
     }
     item.append(detail);
     if (isTranscript) {
-      item.tabIndex = 0; item.setAttribute('role', 'button'); item.setAttribute('aria-label', 'Play transcript from ' + formatTime(row.start_seconds) + ': ' + row.text);
+      item.tabIndex = 0; item.setAttribute('role', 'button'); item.setAttribute('aria-label', 'Phát lời thoại từ ' + formatTime(row.start_seconds) + ': ' + row.text);
       item.onclick = makeSeekHandler(row.start_seconds);
       item.onkeydown = event => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); seekSource(row.start_seconds); } };
     }
@@ -3384,27 +3562,27 @@ function syncActiveTranscript(currentTime, allowScroll = true) {
 
 async function loadHighlights() {
   const box = $('highlightResults');
-  box.innerHTML = '<div class="state-panel">Loading highlights…</div>';
+  box.innerHTML = '<div class="state-panel">Đang tải khoảnh khắc nổi bật…</div>';
   try {
     const data = await api('GET', '/api/jobs/' + encodeURIComponent(current) + '/highlights');
     mediaExplorerData.highlights = Array.isArray(data.highlights) ? data.highlights : [];
     $('highlightCount').textContent = mediaExplorerData.highlights.length ? '(' + mediaExplorerData.highlights.length + ')' : '';
     box.replaceChildren();
-    if (!mediaExplorerData.highlights.length) { box.innerHTML = '<div class="state-panel">No highlights detected yet.</div>'; }
+    if (!mediaExplorerData.highlights.length) { box.innerHTML = '<div class="state-panel">Chưa phát hiện khoảnh khắc nổi bật nào.</div>'; }
     for (const item of mediaExplorerData.highlights.slice(0, 4)) {
       const card = document.createElement('article'); card.className = 'highlight-card';
-      const title = document.createElement('strong'); title.textContent = item.title || 'Highlight';
+      const title = document.createElement('strong'); title.textContent = item.title || 'Khoảnh khắc nổi bật';
       const meta = document.createElement('div'); meta.className = 'result-meta'; meta.append(makeChip(formatTime(item.start_seconds ?? item.start) + '–' + formatTime(item.end_seconds ?? item.end), 'time-chip'));
-      const reason = document.createElement('p'); reason.textContent = item.reason || 'Suggested moment';
+      const reason = document.createElement('p'); reason.textContent = item.reason || 'Đoạn gợi ý';
       const actions = document.createElement('div'); actions.className = 'row';
-      const play = document.createElement('button'); play.type = 'button'; play.textContent = '▶ Preview'; play.onclick = makeSeekHandler(item.start_seconds ?? item.start);
-      const download = document.createElement('button'); download.type = 'button'; download.textContent = '↓ Export'; download.onclick = () => downloadHighlight(item.export_href, item.id).catch(showError);
+      const play = document.createElement('button'); play.type = 'button'; play.textContent = '▶ Xem trước'; play.onclick = makeSeekHandler(item.start_seconds ?? item.start);
+      const download = document.createElement('button'); download.type = 'button'; download.textContent = '↓ Xuất'; download.onclick = () => downloadHighlight(item.export_href, item.id).catch(showError);
       actions.append(play, download); card.append(title, meta, reason, actions); box.append(card);
     }
     if (mediaFilter === 'highlights') renderMediaRows();
   } catch (error) {
     mediaExplorerData.highlights = [];
-    box.innerHTML = '<div class="state-panel">Highlights unavailable: ' + error.message + '</div>';
+    box.innerHTML = '<div class="state-panel">Khoảnh khắc nổi bật không khả dụng: ' + error.message + '</div>';
   }
 }
 
@@ -3429,36 +3607,177 @@ async function downloadTranscript(href) {
 
 async function askVideo() {
   const question = $('chatQuestion').value.trim();
-  if (!question) { $('chatAnswer').textContent = 'Enter a question first.'; $('chatQuestion').focus(); return; }
-  $('chatAskBtn').disabled = true; $('chatAnswer').textContent = 'Searching the indexed transcript…';
+  if (!question) { $('chatAnswer').textContent = 'Hãy nhập câu hỏi trước.'; $('chatQuestion').focus(); return; }
+  $('chatAskBtn').disabled = true; $('chatAnswer').textContent = 'Đang tìm trong lời thoại đã lập chỉ mục…';
   try {
     const data = await api('POST', '/api/jobs/' + encodeURIComponent(current) + '/chat', {question});
     const citations = Array.isArray(data.citations) ? data.citations.length : 0;
-    $('chatAnswer').textContent = (data.answer || 'No answer available.') + (citations ? ' · ' + citations + ' cited moment' + (citations === 1 ? '' : 's') : '');
+    $('chatAnswer').textContent = (data.answer || 'Không tìm thấy câu trả lời.') + (citations ? ' · ' + citations + ' đoạn trích dẫn' : '');
   } finally { $('chatAskBtn').disabled = false; }
+}
+
+// --- Client-side caption chunking -----------------------------------------
+// Whisper-style transcript rows can span ~30s and hundreds of characters. Shown
+// as one cue they cover 30-40% of the frame. We wrap each row to <=2 lines of
+// ~42 characters and split long rows into time-sliced sub-cues so only a short,
+// readable caption is on screen at any moment.
+const CAPTION_MAX_CPL = 42;   // characters per line (broadcast/web standard)
+const CAPTION_MAX_LINES = 2;  // lines visible at once
+const CAPTION_MIN_CUE_SECONDS = 1.2;
+// A sentence shorter than this is merged with the next one (when they still fit
+// in CAPTION_MAX_LINES) so a caption never flashes a tiny fragment on its own.
+const CAPTION_MERGE_MIN_CHARS = 25;
+
+// Greedy word-wrap into lines of at most maxCpl characters. Words longer than
+// maxCpl are hard-split so a single token can never overflow the frame.
+function wrapCaptionLines(text, maxCpl) {
+  const words = String(text || '').replace(/\\s+/g, ' ').trim().split(' ').filter(Boolean);
+  const lines = [];
+  let line = '';
+  for (let word of words) {
+    while (word.length > maxCpl) {
+      if (line) { lines.push(line); line = ''; }
+      lines.push(word.slice(0, maxCpl));
+      word = word.slice(maxCpl);
+    }
+    if (!line) line = word;
+    else if ((line + ' ' + word).length <= maxCpl) line += ' ' + word;
+    else { lines.push(line); line = word; }
+  }
+  if (line) lines.push(line);
+  return lines;
+}
+
+// Split a block of text into sentences at ., ?, !, … (and their repeats),
+// keeping the terminal punctuation attached. This lets each caption cue align
+// with a complete sentence instead of an arbitrary character window. Text with
+// no sentence-ending punctuation comes back as a single sentence.
+function splitIntoSentences(text) {
+  const normalized = String(text || '').replace(/\\s+/g, ' ').trim();
+  if (!normalized) return [];
+  const matches = normalized.match(/[^.!?…]+(?:[.!?…]+["'”’)\\]]*|$)/g);
+  const sentences = (matches || [normalized]).map(s => s.trim()).filter(Boolean);
+  return sentences.length ? sentences : [normalized];
+}
+
+// Greedily merge a short sentence (< CAPTION_MERGE_MIN_CHARS) into the next one
+// as long as the combined text still wraps within CAPTION_MAX_LINES, so tiny
+// fragments ("Vâng." / "Được.") ride along with the following sentence instead
+// of flashing as their own cue.
+function mergeShortSentences(sentences) {
+  const merged = [];
+  let buffer = '';
+  const fitsTwoLines = (text) => wrapCaptionLines(text, CAPTION_MAX_CPL).length <= CAPTION_MAX_LINES;
+  for (const sentence of sentences) {
+    if (!buffer) { buffer = sentence; continue; }
+    const combined = buffer + ' ' + sentence;
+    // Merge only while the running buffer is still short and the result fits.
+    if (buffer.length < CAPTION_MERGE_MIN_CHARS && fitsTwoLines(combined)) {
+      buffer = combined;
+    } else {
+      merged.push(buffer);
+      buffer = sentence;
+    }
+  }
+  if (buffer) merged.push(buffer);
+  return merged;
+}
+
+// Turn one transcript row into 1..N sub-cues of <=CAPTION_MAX_LINES lines. We
+// first split the row into whole sentences, then wrap each sentence to
+// CAPTION_MAX_CPL and break it into <=2-line blocks. Every block's [start,end]
+// is interpolated within the row proportionally to its character length, so a
+// cue both aligns with a sentence and tracks the spoken pace.
+function chunkTranscriptRow(row) {
+  const start = Number(row.start_seconds);
+  let end = Number(row.end_seconds);
+  const text = String(row.text || '').trim();
+  if (!text || !Number.isFinite(start)) return [];
+  if (!Number.isFinite(end) || end <= start) end = start + CAPTION_MIN_CUE_SECONDS;
+  // Sentence first (merging tiny fragments), then wrap + split into <=2 lines.
+  const blocks = [];
+  for (const sentence of mergeShortSentences(splitIntoSentences(text))) {
+    const lines = wrapCaptionLines(sentence, CAPTION_MAX_CPL);
+    for (let i = 0; i < lines.length; i += CAPTION_MAX_LINES) {
+      blocks.push(lines.slice(i, i + CAPTION_MAX_LINES).join('\\n'));
+    }
+  }
+  if (!blocks.length) return [];
+  const totalChars = blocks.reduce((sum, block) => sum + block.replace(/\\n/g, '').length, 0) || 1;
+  const span = end - start;
+  const cues = [];
+  let cursor = start;
+  for (let i = 0; i < blocks.length; i++) {
+    const block = blocks[i];
+    const chars = block.replace(/\\n/g, '').length;
+    let cueEnd = i === blocks.length - 1 ? end : cursor + span * (chars / totalChars);
+    if (cueEnd - cursor < 0.2) cueEnd = Math.min(end, cursor + 0.2);
+    cues.push({ start: cursor, end: cueEnd, text: block });
+    cursor = cueEnd;
+  }
+  return cues;
+}
+
+// Rebuild the source video's caption track from transcript rows. Adds VTTCues
+// directly (no raw .vtt blob) so we control wrapping and per-cue timing.
+function renderSourceCaptions(trackEl, transcript) {
+  const video = $('sourceVideo');
+  const CueCtor = window.VTTCue || window.TextTrackCue;
+  // Remove any previously built cues so re-opening a project starts clean.
+  for (const existing of Array.from(video.textTracks || [])) {
+    if (existing.cues) for (const cue of Array.from(existing.cues)) { try { existing.removeCue(cue); } catch (e) {} }
+  }
+  const tt = trackEl.track;
+  if (!tt || !CueCtor) return;
+  tt.mode = 'hidden';
+  if (!Array.isArray(transcript) || !transcript.length) { tt.mode = 'disabled'; return; }
+  for (const row of transcript) {
+    for (const cue of chunkTranscriptRow(row)) {
+      if (!(cue.end > cue.start)) continue;
+      try { tt.addCue(new CueCtor(cue.start, cue.end, cue.text)); } catch (e) {}
+    }
+  }
+  tt.mode = 'showing';
 }
 
 async function renderMediaExplorer(query = '') {
   const card = $('mediaExplorerCard'); const results = $('mediaResults'); const message = $('mediaMsg');
-  clearMediaObjectUrls(); card.style.display = ''; results.setAttribute('aria-busy', 'true'); setMediaState('Loading media index…', 'loading');
+  clearMediaObjectUrls(); card.style.display = ''; results.setAttribute('aria-busy', 'true'); setMediaState('Đang tải chỉ mục tư liệu…', 'loading');
   let data;
   try {
     const suffix = query ? ('?q=' + encodeURIComponent(query)) : '';
     data = await api('GET', '/api/jobs/' + encodeURIComponent(current) + '/media-explorer' + suffix);
   } catch (error) {
-    results.replaceChildren(); results.setAttribute('aria-busy', 'false'); setMediaState('Media Explorer could not load: ' + error.message, 'error'); message.textContent = 'Media Explorer load error'; return;
+    results.replaceChildren(); results.setAttribute('aria-busy', 'false'); setMediaState('Không tải được Trình khám phá tư liệu: ' + error.message, 'error'); message.textContent = 'Lỗi tải Trình khám phá tư liệu'; return;
   }
-  if (!data.present || !data.media_href) { card.style.display = 'none'; results.replaceChildren(); results.setAttribute('aria-busy', 'false'); return; }
+  if (!data.present || !data.media_href) {
+    results.replaceChildren();
+    results.setAttribute('aria-busy', 'false');
+    const video = $('sourceVideo');
+    if (video.dataset.src) { video.pause(); video.removeAttribute('src'); video.dataset.src = ''; video.load(); }
+    setMediaState('Chưa có dữ liệu tư liệu cho project này. Hãy import video MP4 rồi chạy pipeline để lập chỉ mục lời thoại và cảnh.', 'empty');
+    const jump = document.createElement('button'); jump.type = 'button'; jump.className = 'seek-button'; jump.style.marginTop = '10px'; jump.textContent = 'Tới bước import video';
+    jump.onclick = () => {
+      const retryCard = $('sourceRetryCard');
+      if (retryCard && !retryCard.hidden) { retryCard.scrollIntoView({behavior:'smooth', block:'center'}); const retry = $('sourceRetry'); if (retry) retry.focus(); }
+      else { openToolDialog('createPanel'); }
+    };
+    $('mediaState').appendChild(jump);
+    return;
+  }
   const exportBtn = $('mediaExportBtn');
   exportBtn.style.display = data.transcript_vtt_href ? '' : 'none'; exportBtn.onclick = data.transcript_vtt_href ? (() => downloadTranscript(data.transcript_vtt_href).catch(showError)) : null;
   const video = $('sourceVideo');
   if (video.dataset.src !== data.media_href) { video.dataset.src = data.media_href; video.src = data.media_href; }
-  const track = $('sourceCaptions'); track.removeAttribute('src');
+  const track = $('sourceCaptions'); track.removeAttribute('src'); track.default = true;
   track.srclang = data.source_language || 'und';
   track.label = 'Lời thoại nguồn' + (data.source_language ? ' (' + data.source_language + ')' : '');
-  if (data.transcript_vtt_href) { const captions = await authFetch(data.transcript_vtt_href); if (captions.startsWith('blob:')) mediaObjectUrls.push(captions); track.src = captions; track.default = true; track.addEventListener('load', () => { if (track.track) track.track.mode = 'showing'; }, {once:true}); }
   mediaExplorerData.transcript = Array.isArray(data.transcript) ? data.transcript : [];
   mediaExplorerData.shots = Array.isArray(data.shots) ? data.shots : [];
+  // Render captions from the transcript rows with client-side chunking so a
+  // long (~30s) transcript block never dumps 6-7 lines over the frame. We build
+  // the cues ourselves instead of loading the raw .vtt as a single track cue.
+  renderSourceCaptions(track, mediaExplorerData.transcript);
   $('transcriptCount').textContent = '(' + mediaExplorerData.transcript.length + ')'; $('sceneCount').textContent = '(' + mediaExplorerData.shots.length + ')';
   results.setAttribute('aria-busy', 'false'); renderMediaRows(); loadHighlights();
   if (pendingLibrarySeek && pendingLibrarySeek.job_id === current) {
@@ -3525,8 +3844,17 @@ $('sectionPreviewBtn').onclick = async () => {
   } catch (error) { $('sectionPreviewMsg').textContent = error.message; $('sectionPreviewBtn').disabled = false; }
 };
 
+// Keep the Timeline/Continuity card on screen even when there is nothing to
+// edit yet; show a status line and a next action instead of hiding the card.
+function setEditorState(message) {
+  const note = $('editorState');
+  if (!note) return;
+  if (message) { note.textContent = message; note.hidden = false; }
+  else { note.textContent = ''; note.hidden = true; }
+}
 async function renderEditor() {
   const card = $('editorCard');
+  card.style.display = '';
   let timelineData, tracksData;
   try {
     [timelineData, tracksData] = await Promise.all([
@@ -3534,12 +3862,12 @@ async function renderEditor() {
       api('GET', '/api/jobs/' + encodeURIComponent(current) + '/person-tracks'),
     ]);
   } catch (error) {
-    card.style.display = 'none';
     $('timelineList').replaceChildren();
     $('continuityTracks').replaceChildren();
+    setEditorState('Chưa có dòng thời gian để biên tập. Chạy pipeline tới bước kế hoạch cảnh để tạo các clip có thể chỉnh sửa.');
     return;
   }
-  card.style.display = '';
+  setEditorState('');
   const selector = $('sectionPreviewSelect');
   const previousSection = selector.value;
   const sectionRows = [...new Map((timelineData.clips || [])
@@ -3562,16 +3890,16 @@ async function renderEditor() {
     title.textContent = (track.alias || track.label) + (track.alias ? ' · ' + track.label : '');
     const meta = document.createElement('div');
     meta.className = 'muted';
-    meta.textContent = 'confidence ' + Number(track.mean_confidence || 0).toFixed(2)
-      + (track.ambiguous ? ' · ambiguous' : '')
-      + ' · ' + ((track.appearances || []).length) + ' scenes';
+    meta.textContent = 'độ tin cậy ' + Number(track.mean_confidence || 0).toFixed(2)
+      + (track.ambiguous ? ' · không rõ ràng' : '')
+      + ' · ' + ((track.appearances || []).length) + ' cảnh';
     const summary = document.createElement('div');
     summary.textContent = track.appearance_summary || track.description || '';
     const clothing = (track.traits || []).filter(x => x.trait_type === 'clothing').map(x => x.value);
     if (clothing.length) {
       const details = document.createElement('div');
       details.className = 'muted';
-      details.textContent = 'Clothing: ' + clothing.join(' → ');
+      details.textContent = 'Trang phục: ' + clothing.join(' → ');
       item.append(title, meta, summary, details);
     } else item.append(title, meta, summary);
     const aliasRow = document.createElement('div');
@@ -3601,27 +3929,32 @@ async function renderEditor() {
     item.className = 'timeline-card' + (clip.locked ? ' locked' : '');
     const source = clip.source_clip || {};
     const heading = document.createElement('strong');
-    heading.textContent = '#' + (clip.timeline_index + 1) + ' · ' + (clip.section || 'Section')
+    heading.textContent = '#' + (clip.timeline_index + 1) + ' · ' + (clip.section || 'Phần')
       + ' · ' + formatTime(source.start_seconds) + '–' + formatTime(source.end_seconds);
     const meta = document.createElement('div'); meta.className = 'muted';
-    meta.textContent = 'Section ' + clip.section_index + ' · shot ' + clip.shot_index + '/' + clip.shot_count
-      + ' · output ' + formatTime(clip.start_seconds) + ' +' + Number(clip.duration_seconds || 0).toFixed(1) + 's';
+    meta.textContent = 'Phần ' + clip.section_index + ' · cảnh ' + clip.shot_index + '/' + clip.shot_count
+      + ' · đầu ra ' + formatTime(clip.start_seconds) + ' +' + Number(clip.duration_seconds || 0).toFixed(1) + 's';
     const controls = document.createElement('div'); controls.className = 'timeline-controls';
 
-    const lock = document.createElement('button'); lock.type = 'button';
-    lock.textContent = clip.locked ? 'Unlock' : 'Lock';
-    lock.onclick = () => timelineAction({action:'lock', clip_index:clip.timeline_index, locked:!clip.locked}).catch(showError);
+    // Three most-used clip actions stay inline; the rest move to an overflow menu.
+    const preview = document.createElement('button'); preview.type = 'button'; preview.textContent = 'Xem trước';
+    preview.onclick = () => seekSource(source.start_seconds);
 
-    const trim = document.createElement('button'); trim.type = 'button'; trim.textContent = 'Trim';
+    const trim = document.createElement('button'); trim.type = 'button'; trim.textContent = 'Cắt';
     trim.onclick = () => {
-      const start = prompt('Source start (seconds)', String(source.start_seconds ?? 0));
+      const start = prompt('Mốc đầu nguồn (giây)', String(source.start_seconds ?? 0));
       if (start === null) return;
-      const end = prompt('Source end (seconds)', String(source.end_seconds ?? 0));
+      const end = prompt('Mốc cuối nguồn (giây)', String(source.end_seconds ?? 0));
       if (end === null) return;
       timelineAction({action:'trim', clip_index:clip.timeline_index, start_seconds:Number(start), end_seconds:Number(end)}).catch(showError);
     };
 
-    const replace = document.createElement('button'); replace.type = 'button'; replace.textContent = 'Replace shot';
+    const lock = document.createElement('button'); lock.type = 'button';
+    lock.textContent = clip.locked ? 'Mở khóa' : 'Khóa';
+    lock.onclick = () => timelineAction({action:'lock', clip_index:clip.timeline_index, locked:!clip.locked}).catch(showError);
+
+    // Secondary actions live behind a "⋯ Thêm" overflow menu (native <details>).
+    const replace = document.createElement('button'); replace.type = 'button'; replace.textContent = 'Thay cảnh';
     replace.onclick = () => {
       const shot = prompt('Shot ID thay thế');
       if (!shot) return;
@@ -3638,31 +3971,37 @@ async function renderEditor() {
       }
     };
 
-    const up = document.createElement('button'); up.type = 'button'; up.textContent = '↑';
+    const up = document.createElement('button'); up.type = 'button'; up.textContent = 'Chuyển lên ↑';
     up.disabled = clip.timeline_index <= 0;
     up.onclick = () => timelineAction({action:'reorder', from_index:clip.timeline_index, to_index:clip.timeline_index - 1}).catch(showError);
 
-    const down = document.createElement('button'); down.type = 'button'; down.textContent = '↓';
+    const down = document.createElement('button'); down.type = 'button'; down.textContent = 'Chuyển xuống ↓';
     down.disabled = clip.timeline_index >= (timelineData.clips || []).length - 1;
     down.onclick = () => timelineAction({action:'reorder', from_index:clip.timeline_index, to_index:clip.timeline_index + 1}).catch(showError);
 
-    const regen = document.createElement('button'); regen.type = 'button'; regen.textContent = 'Regenerate section';
+    const regen = document.createElement('button'); regen.type = 'button'; regen.textContent = 'Dựng lại phần';
     regen.onclick = async () => {
-      const instruction = prompt('Yêu cầu cho visual section này', 'more relevant visuals');
+      const instruction = prompt('Yêu cầu cho phần hình ảnh này', 'more relevant visuals');
       if (instruction === null) return;
       await api(
         'POST',
         '/api/jobs/' + encodeURIComponent(current) + '/sections/' + clip.section_index + '/regenerate',
         {instruction}
       );
-      $('editorMsg').textContent = 'Đã regenerate visual cho section ' + clip.section_index + '.';
+      $('editorMsg').textContent = 'Đã dựng lại hình ảnh cho phần ' + clip.section_index + '.';
       await renderEditor(); await loadStatus();
     };
 
-    const preview = document.createElement('button'); preview.type = 'button'; preview.textContent = 'Preview';
-    preview.onclick = () => seekSource(source.start_seconds);
+    const more = document.createElement('details'); more.className = 'clip-more';
+    const moreSummary = document.createElement('summary'); moreSummary.textContent = '⋯ Thêm';
+    moreSummary.setAttribute('aria-label', 'Thêm thao tác cho clip');
+    const moreMenu = document.createElement('div'); moreMenu.className = 'clip-more-menu';
+    moreMenu.append(replace, broll, up, down, regen);
+    // Close the menu after choosing an action or clicking outside.
+    moreMenu.addEventListener('click', () => { more.open = false; });
+    more.append(moreSummary, moreMenu);
 
-    controls.append(lock, trim, replace, broll, up, down, regen, preview);
+    controls.append(preview, trim, lock, more);
     item.append(heading, meta, controls); list.append(item);
   }
 }
@@ -3846,7 +4185,7 @@ async function loadSavedSearches() {
 
 async function saveLibrarySearch() {
   const state = librarySearchState();
-  if (!state.query) { $('libraryResults').textContent = 'Nhập query trước khi lưu.'; return; }
+  if (!state.query) { $('libraryResults').textContent = 'Nhập từ khóa tìm kiếm trước khi lưu.'; return; }
   await api('POST', '/api/library-searches', state);
   await loadSavedSearches();
 }
@@ -3878,9 +4217,9 @@ async function searchLibrary() {
       };
       const meta = document.createElement('div');
       meta.className = 'result-meta';
-      meta.append(makeChip(item.kind === 'visual' ? 'Visual' : 'Transcript', 'kind-chip'));
+      meta.append(makeChip(item.kind === 'visual' ? 'Hình ảnh' : 'Lời thoại', 'kind-chip'));
       if (item.semantic_score !== null && item.semantic_score !== undefined) {
-        meta.append(makeChip('Semantic ' + Number(item.semantic_score).toFixed(2), 'kind-chip'));
+        meta.append(makeChip('Ngữ nghĩa ' + Number(item.semantic_score).toFixed(2), 'kind-chip'));
       }
       for (const value of [
         ...(item.tags || []).slice(0, 2),
@@ -3928,9 +4267,11 @@ async function loadJobs() {
     const available = new Set(jobs.filter(job => !job.running && !job.uploading).map(job => job.job_id));
     for (const id of selectedProjects) if (!available.has(id)) selectedProjects.delete(id);
     const el = $('jobList');
+    $('emptyProjectsBtn').hidden = !jobs.length;
+    $('projectSummaryLabel').textContent = current || (jobs.length ? 'Chọn project' : 'Chưa có project');
     if (!jobs.length) {
-      el.textContent = 'Chưa có project. Chọn video MP4 để tạo project đầu tiên.';
-      if (!current) { $('createPanel').open = true; $('projectPanel').open = false; }
+      el.textContent = 'Chưa có project.';
+      $('projectPanel').open = false;
       syncProjectSelection();
       return;
     }
@@ -3997,8 +4338,10 @@ function selectJob(id) {
   mediaLoaded = null;
   editorLoaded = null;
   setWorkspaceView('explore');
-  $('createPanel').open = false;
-  if (matchMedia('(max-width: 820px)').matches) $('projectPanel').open = false;
+  closeToolDialog('createPanel');
+  closeToolDialog('libraryPanel');
+  $('projectPanel').open = false;
+  $('projectSummaryLabel').textContent = id;
   current = id;
   $('empty').style.display = 'none';
   $('detail').style.display = '';
@@ -4069,6 +4412,15 @@ async function loadMidroll() {
     $('midrollLine').value = state.staged?.narration || state.draft?.line || '';
     $('midrollDraftBtn').disabled = !!state.staged || !state.approved;
     $('midrollStageBtn').disabled = !!state.staged || !state.draft;
+    const insertion = state.insertion || {};
+    const location = insertion.location_label || 'Chưa xác định vị trí';
+    $('midrollStatus').textContent = insertion.status === 'inserted'
+      ? ('CTA đã chèn · ' + location + (state.approved ? ' · đã duyệt' : ' · cần duyệt lại kịch bản'))
+      : insertion.status === 'draft'
+        ? ('CTA đã soạn · ' + location + ' · chưa chèn')
+        : 'CTA chưa được tạo hoặc chèn vào video.';
+    $('midrollStatus').className = 'cta-status ' + (insertion.status === 'inserted' ? 'ok' : insertion.status === 'draft' ? 'warn' : 'muted');
+    $('midrollPanel').open = insertion.status === 'draft';
     $('midrollMsg').textContent = state.staged
       ? (state.approved ? 'CTA đã duyệt; chạy pipeline để tạo bản video mới.' : 'CTA đã chèn. Kiểm tra kịch bản và bấm Duyệt kịch bản.')
       : state.draft ? ('AGY đã soạn câu cho mốc ' + Math.round(state.draft.start_seconds) + ' giây.') : '';
@@ -4102,6 +4454,38 @@ $('midrollStageBtn').onclick = async () => {
     $('midrollStageBtn').disabled = false;
   }
 };
+
+function openToolDialog(id) {
+  const dialog = $(id);
+  if (!dialog || dialog.open) return;
+  $('projectPanel').open = false;
+  document.querySelectorAll('dialog.tool-dialog[open]').forEach((other) => {
+    if (other !== dialog) other.close();
+  });
+  dialog.showModal();
+}
+
+function closeToolDialog(id) {
+  const dialog = $(id);
+  if (dialog && dialog.open) dialog.close();
+}
+
+$('openCreateProject').onclick = () => openToolDialog('createPanel');
+$('openBrandSettings').onclick = () => openToolDialog('brandPanel');
+$('openLibraryHub').onclick = () => openToolDialog('libraryPanel');
+$('closeCreateProject').onclick = () => closeToolDialog('createPanel');
+$('closeBrandSettings').onclick = () => closeToolDialog('brandPanel');
+$('closeLibraryHub').onclick = () => closeToolDialog('libraryPanel');
+$('emptyCreateBtn').onclick = () => openToolDialog('createPanel');
+$('emptyProjectsBtn').onclick = () => { $('projectPanel').open = true; };
+
+const projectPanel = $('projectPanel');
+document.addEventListener('pointerdown', (event) => {
+  if (projectPanel.open && !projectPanel.contains(event.target)) projectPanel.open = false;
+});
+document.addEventListener('keydown', (event) => {
+  if (event.key === 'Escape') projectPanel.open = false;
+});
 
 function badge(stage) {
   return `<span class="badge ${stage.status}" title="${stage.status_hint||''}">${stage.status_label}</span>`;
@@ -4142,6 +4526,13 @@ async function loadStatus() {
     : renderStage?.status === 'failed' ? 'Bước dựng video lỗi: xem thông báo ở tiến trình rồi chạy lại.'
     : 'Chạy pipeline để tạo kịch bản và các tệp cần thiết.';
   const readyForDownload = !!(s.has_final_video && qaStage?.status === 'ready');
+  // Keep reviewFocus aligned with nextAction so "Duyệt & xuất" opens the one
+  // block that needs attention (same priority order as nextAction above).
+  reviewFocus = readyForDownload ? 'export'
+    : (scriptStage?.status === 'ready' && !s.approvals.script_approved) ? 'script'
+    : s.has_thumbnail ? 'thumbnail'
+    : s.approvals.script_approved && !s.approvals.metadata_approved ? 'metadata'
+    : 'script';
   $('exportCard').hidden = !readyForDownload;
   $('reviewAction').hidden = !(scriptStage?.status === 'ready' && !s.approvals.script_approved);
   $('quickDownload').hidden = !readyForDownload;
@@ -4198,7 +4589,17 @@ async function loadStatus() {
   if (s.has_media_index && editorLoaded !== editorState) {
     await renderEditor();
     editorLoaded = editorState;
-  } else if (!s.has_media_index) { editorLoaded = null; $('editorCard').style.display = 'none'; }
+  } else if (!s.has_media_index) {
+    // Keep the editor card visible with guidance instead of hiding it.
+    editorLoaded = null;
+    $('editorCard').style.display = '';
+    $('timelineList').replaceChildren();
+    $('continuityTracks').replaceChildren();
+    setEditorState(s.is_indexing
+      ? 'Đang lập chỉ mục tư liệu. Dòng thời gian sẽ sẵn sàng để biên tập ngay khi lập chỉ mục xong.'
+      : !s.has_source_video ? 'Import video MP4, sau đó chạy pipeline để tạo dòng thời gian có thể chỉnh sửa.'
+      : 'Chạy pipeline tới bước kế hoạch cảnh để tạo dòng thời gian có thể chỉnh sửa.');
+  }
 
   if (s.has_thumbnail) {
     await renderThumbnails();
@@ -4228,6 +4629,9 @@ async function loadStatus() {
   }
 
   renderMeta(s.approvals);
+  // If the review view is open, keep it focused on the block that matches the
+  // freshly computed next action (reviewFocus) after state-driven visibility.
+  if (!$('view-review').hidden) applyReviewFocus();
   if (poller) { clearInterval(poller); poller = null; }
   if (s.running || s.is_indexing || s.section_preview?.running) { poller = setInterval(loadStatus, 1500); }
   if ($('sectionPreviewPanel').open && $('sectionPreviewSelect').value) {
@@ -4298,8 +4702,7 @@ $('createForm').onsubmit = async (e) => {
   const file = $('sourceFile').files[0];
   const fd = new FormData(e.target);
   const payload = Object.fromEntries(fd.entries());
-  payload.job_id = slugifyJobId(payload.job_id || '');
-  if (!payload.job_id) { $('createMsg').textContent = 'Mã project chưa hợp lệ, hãy nhập chữ hoặc số.'; return; }
+  payload.job_id = autoJobId(payload.movie_title, file);
   payload.creative_brief = {
     review_thesis: String(payload.review_thesis || '').trim(),
     tone: String(payload.tone || '').trim(),
@@ -4316,9 +4719,9 @@ $('createForm').onsubmit = async (e) => {
   try {
     created = await api('POST', '/api/jobs', payload);
     if (file) await uploadVideo(created.job_id, file);
-    $('createMsg').textContent = file ? 'Đã tạo và import video cho project ' + created.job_id + '.' : 'Đã tạo project ' + created.job_id + '.';
+    // The project code is auto-generated and kept hidden; confirm by name only.
+    $('createMsg').textContent = file ? 'Đã tạo project và import video.' : 'Đã tạo project mới.';
     e.target.reset();
-    updateJobIdHint();
     await loadJobs();
     selectJob(created.job_id);
   } catch (err) {
@@ -4413,7 +4816,8 @@ $('deleteForm').onsubmit = async event => {
       $('sourceVideo').removeAttribute('src'); $('sourceVideo').load();
       $('video').removeAttribute('src'); delete $('video').dataset.src; $('video').load();
       $('detail').style.display = 'none'; $('empty').style.display = '';
-      $('projectPanel').open = true;
+      $('projectPanel').open = false;
+      $('projectSummaryLabel').textContent = 'Chọn project';
     }
     $('bulkMsg').textContent = result.failed
       ? 'Đã xóa ' + deleted.length + ' project; không xóa được ' + result.failed + '. Kiểm tra project còn lại.'

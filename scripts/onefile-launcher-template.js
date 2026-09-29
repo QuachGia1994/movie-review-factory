@@ -156,6 +156,7 @@ var path = require("path");
 var os = require("os");
 var crypto = require("crypto");
 var childProcess = require("child_process");
+var http = require("http");
 
 var APP_NAME = "MovieReviewFactory";
 var VERSION = __MRF_VERSION__;
@@ -951,18 +952,6 @@ function lockPath(scriptDir) {
   return path.join(appDataRoot(), "server-" + sha12(scriptDir.toLowerCase()) + ".json");
 }
 
-function pidAlive(pid) {
-  if (!pid || typeof pid !== "number") {
-    return false;
-  }
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    return false;
-  }
-}
-
 function readLock(file) {
   try {
     return JSON.parse(fs.readFileSync(file, "utf8"));
@@ -1077,20 +1066,158 @@ function selfTest(py, runtime, env) {
   return true;
 }
 
+var APP_FINGERPRINT = "Xưởng Review Phim";
+
+function killTree(pid) {
+  try {
+    if (process.platform === "win32") {
+      childProcess.spawnSync("taskkill", ["/PID", String(pid), "/T", "/F"], { windowsHide: true, stdio: "ignore" });
+    } else {
+      process.kill(pid, "SIGTERM");
+    }
+  } catch (error) {}
+}
+
+function listeningPorts() {
+  var found = [];
+  var result;
+  if (process.platform === "win32") {
+    result = childProcess.spawnSync("netstat", ["-ano", "-p", "tcp"], { encoding: "utf8", windowsHide: true });
+    String(result.stdout || "").split(/\r?\n/).forEach(function (line) {
+      var match = line.match(/^\s*TCP\s+(?:127\.0\.0\.1|0\.0\.0\.0|\[::1?\]):(\d+)\s+\S+\s+LISTENING\s+(\d+)/i);
+      if (match) {
+        found.push({ port: parseInt(match[1], 10), pid: parseInt(match[2], 10) });
+      }
+    });
+  } else {
+    result = childProcess.spawnSync("lsof", ["-nP", "-iTCP", "-sTCP:LISTEN", "-Fpn"], { encoding: "utf8" });
+    var pid = 0;
+    String(result.stdout || "").split(/\r?\n/).forEach(function (line) {
+      if (line.charAt(0) === "p") {
+        pid = parseInt(line.slice(1), 10);
+      } else if (line.charAt(0) === "n") {
+        var match = line.match(/(?:127\.0\.0\.1|\*|\[::1?\]):(\d+)$/);
+        if (match) {
+          found.push({ port: parseInt(match[1], 10), pid: pid });
+        }
+      }
+    });
+  }
+  return found.filter(function (entry, index) {
+    return entry.pid !== process.pid && found.findIndex(function (other) {
+      return other.port === entry.port && other.pid === entry.pid;
+    }) === index;
+  });
+}
+
+function isApp(port, done) {
+  var settled = false;
+  function finish(value) {
+    if (!settled) {
+      settled = true;
+      done(value);
+    }
+  }
+  var request = http.get({ host: "127.0.0.1", port: port, path: "/", timeout: 1000 }, function (response) {
+    var body = "";
+    response.setEncoding("utf8");
+    response.on("data", function (chunk) {
+      if (body.length < 300000) {
+        body += chunk;
+      }
+    });
+    response.on("end", function () {
+      finish(body.indexOf(APP_FINGERPRINT) !== -1);
+    });
+    response.on("error", function () {
+      finish(false);
+    });
+  });
+  request.on("timeout", function () {
+    request.destroy();
+    finish(false);
+  });
+  request.on("error", function () {
+    finish(false);
+  });
+}
+
+function stopPreviousServers(lockFile, done) {
+  var candidates = listeningPorts();
+  var targets = [];
+  var pending = candidates.length;
+
+  function finishStop() {
+    try {
+      fs.unlinkSync(lockFile);
+    } catch (error) {}
+    done();
+  }
+
+  function waitFreed(attempt) {
+    var remaining = targets.length;
+    var alive = 0;
+    targets.forEach(function (entry) {
+      isApp(entry.port, function (running) {
+        if (running) {
+          alive += 1;
+        }
+        remaining -= 1;
+        if (remaining > 0) {
+          return;
+        }
+        if (alive && attempt < 10) {
+          setTimeout(function () { waitFreed(attempt + 1); }, 500);
+        } else {
+          finishStop();
+        }
+      });
+    });
+  }
+
+  function killTargets() {
+    if (!targets.length) {
+      finishStop();
+      return;
+    }
+    var seen = {};
+    targets.forEach(function (entry) {
+      log("Dừng server cũ: cổng " + entry.port + " (PID " + entry.pid + ")");
+      if (!seen[entry.pid]) {
+        seen[entry.pid] = true;
+        killTree(entry.pid);
+      }
+    });
+    waitFreed(0);
+  }
+
+  if (!pending) {
+    killTargets();
+    return;
+  }
+  candidates.forEach(function (entry) {
+    isApp(entry.port, function (running) {
+      if (running) {
+        targets.push(entry);
+      }
+      pending -= 1;
+      if (pending === 0) {
+        killTargets();
+      }
+    });
+  });
+}
+
 function startServer(py, runtime, jobs, scriptDir, env) {
   ensureDir(jobs);
   ensureDir(appDataRoot());
   var lockFile = lockPath(scriptDir);
-  var existing = readLock(lockFile);
-  if (existing && pidAlive(existing.pid) && existing.url) {
-    log("Server đã chạy: " + existing.url);
-    openBrowser(existing.url);
-    return;
-  }
-  try {
-    fs.unlinkSync(lockFile);
-  } catch (error) {}
+  stopPreviousServers(lockFile, function () {
+    launchServer(py, runtime, jobs, scriptDir, env, lockFile);
+  });
+}
 
+function launchServer(py, runtime, jobs, scriptDir, env, lockFile) {
   var requestedPort = argValue("--port");
   var port = requestedPort ? parseInt(requestedPort, 10) : 0;
   if (!isFinite(port) || port < 0 || port > 65535) {
