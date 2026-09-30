@@ -51,6 +51,39 @@ def test_creative_brief_legacy_default_and_prompt_shape():
     }
 
 
+def test_prompt_creative_brief_surfaces_retention_advisory():
+    from movie_review_factory import analytics
+
+    advice = analytics.retention_advice(reports=[
+        {"id": "a", "measurements": {"intro_drop_percentage_points": 42.0,
+                                     "cta_drop_percentage_points": None}, "ctr_percent": None},
+    ])
+    config = JobConfig(job_id="advice")
+    prompt = prompt_creative_brief(config, retention_advice=advice)
+    assert "retention_advisory" in prompt
+    hook_rows = [row for row in prompt["retention_advisory"] if row["target"] == "hook"]
+    assert hook_rows
+    assert "mở đầu" in hook_rows[0]["message"]
+    # advisory is additive only: it must not mutate the editorial fields
+    assert prompt["desired_length_minutes"] == config.target_minutes
+
+
+def test_prompt_creative_brief_without_advice_keeps_legacy_shape():
+    config = JobConfig(job_id="advice")
+    assert "retention_advisory" not in prompt_creative_brief(config)
+    assert prompt_creative_brief(config, retention_advice=None) == prompt_creative_brief(config)
+
+
+def test_prompt_creative_brief_disabled_advice_adds_nothing():
+    from movie_review_factory import analytics
+
+    advice = analytics.retention_advice(
+        reports=[{"id": "a", "measurements": {"intro_drop_percentage_points": 90.0}}],
+        enabled=False,
+    )
+    assert "retention_advisory" not in prompt_creative_brief(JobConfig(job_id="advice"), retention_advice=advice)
+
+
 def test_tag_script_span_records_quote_and_resets_approval():
     script = {"approved": True, "sections": [{"narration": "Ben chạy. Đây là điểm hay."}]}
     tagged = tag_script_span(script, 0, 0, 9, "plot_recap", ["scene:2"])

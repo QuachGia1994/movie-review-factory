@@ -41,6 +41,41 @@ def test_select_dramatic_scene_returns_none_when_empty() -> None:
     assert hook_crafter.select_dramatic_scene([{"index": 1, "start_seconds": 3, "end_seconds": 3}]) is None
 
 
+def test_plan_hook_attaches_hook_advisory_without_changing_window() -> None:
+    from movie_review_factory import analytics
+
+    scenes = [
+        {"index": 1, "start_seconds": 0, "end_seconds": 10, "text": "quiet talk"},
+        {"index": 2, "start_seconds": 10, "end_seconds": 30, "text": "gun fight explosion",
+         "visual_actions": ["shoot", "run"]},
+    ]
+    advice = analytics.retention_advice(
+        reports=[{"id": "a", "measurements": {"intro_drop_percentage_points": 45.0}}]
+    )
+    base = hook_crafter.plan_hook(scenes)
+    advised = hook_crafter.plan_hook(scenes, advice=advice)
+    assert "advisory" not in base
+    assert advised.get("advisory")
+    # advisory is annotation only: the selected scene and teaser window are unchanged
+    assert advised["scene_index"] == base["scene_index"]
+    assert advised["start_seconds"] == base["start_seconds"]
+    assert advised["end_seconds"] == base["end_seconds"]
+
+
+def test_hook_advisory_ignores_non_hook_targets() -> None:
+    from movie_review_factory import analytics
+
+    advice = analytics.retention_advice(
+        reports=[{"id": "a", "measurements": {}, "ctr_percent": 2.0}]  # only a thumbnail suggestion
+    )
+    assert hook_crafter.hook_advisory(advice) == []
+
+
+def test_hook_advisory_empty_when_missing_or_disabled() -> None:
+    assert hook_crafter.hook_advisory(None) == []
+    assert hook_crafter.hook_advisory({"enabled": False, "suggestions": []}) == []
+
+
 def test_hook_teaser_range_clamps_long_scene_and_keeps_short_scene() -> None:
     long_scene = hook_crafter.hook_teaser_range({"start_seconds": 100.0, "end_seconds": 140.0})
     assert long_scene["duration_seconds"] == pytest.approx(4.0)

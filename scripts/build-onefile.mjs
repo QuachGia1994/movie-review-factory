@@ -33,6 +33,8 @@ const runtimeFiles = [
   "media_intelligence.py",
   "midroll.py",
   "narration_alignment.py",
+  "tts_providers.py",
+  "batch_queue.py",
   "models.py",
   "pipeline.py",
   "pool_scheduler.py",

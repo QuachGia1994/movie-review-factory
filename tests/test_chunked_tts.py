@@ -21,6 +21,27 @@ def test_split_preserves_vietnamese_words_and_original_narration():
     ]
 
 
+def test_network_provider_tts_flows_through_chunked_pipeline(tmp_path: Path):
+    """A network provider (HTTP mocked) drops into synthesize_chunked offline."""
+    from movie_review_factory import tts_providers
+
+    def fake_request(url, *, method="GET", headers=None, data=None, timeout=60.0):
+        return 200, b"MP3BYTES"
+
+    synth = tts_providers.build_synthesize(
+        "elevenlabs", api_key="k", http_request=fake_request, probe_duration=lambda _p: 1.0,
+    )
+    output = tmp_path / "narration.mp3"
+    boundaries = synthesize_chunked(
+        "Xin chào các bạn yêu điện ảnh", "voice", output, synthesize=synth,
+        communicate_factory=None, no_audio_error=RuntimeError,
+        probe_duration=lambda _p: 1.0,
+        concat_audio=lambda *_: pytest.fail("single chunk must not remux"),
+    )
+    assert output.read_bytes() == b"MP3BYTES"
+    assert boundaries
+
+
 def test_short_narration_preserves_single_tts_stream_without_remuxing(tmp_path: Path):
     calls = []
 

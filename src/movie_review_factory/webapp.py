@@ -167,6 +167,9 @@ class JobsService:
         self._reindex: dict[str, dict] = {}
         self._uploads: set[str] = set()
         self._deleting: set[str] = set()
+        # Overnight batch queue (roadmap P2.1): one sequential worker runs many
+        # pasted links to the script-review gate; state is polled by the dashboard.
+        self._batch: dict = {"running": False, "stop": False, "items": [], "started_at": None}
         self._lock = threading.Lock()
         self._version_lock = threading.Lock()
         # Background indexing queue (roadmap #14): a single FIFO worker builds
@@ -320,6 +323,12 @@ class JobsService:
             for check in qa.get("checks", []) if isinstance(check, dict)
             and (check.get("passed") is False or check.get("review_required"))
         ]
+        voice_meta = self._read_json(root, "voice.json")
+        info["voice"] = {
+            "engine": voice_meta.get("engine"),
+            "voice": voice_meta.get("voice"),
+            "timing_mode": voice_meta.get("timing_mode"),
+        } if voice_meta else None
         info["artifacts"] = self.list_artifacts(job_id)
         info["has_final_video"] = (root / "final.mp4").exists()
         info["has_thumbnail"] = (root / "thumbnail.jpg").exists()
@@ -978,7 +987,8 @@ class JobsService:
         return {"name": path.name, "href": f"/api/jobs/{job_id}/artifacts/{path.name}"}
 
     def list_analytics(self, job_id: str) -> dict:
-        return {"imports": analytics.list_imports(self._require_job(job_id))}
+        root = self._require_job(job_id)
+        return {"imports": analytics.list_imports(root), "advice": analytics.retention_advice(root)}
 
     def import_analytics(self, job_id: str, format_name: str, data: bytes,
                          cta_seconds: str | None, notes: str) -> dict:
@@ -1181,6 +1191,8 @@ class JobsService:
             brand_bottom_band=float(payload.get("brand_bottom_band") or 0),
             watermark_removal=watermark_removal,
             copyright_bypass=str(payload.get("copyright_bypass") or "off"),
+            tts_provider=str(payload.get("tts_provider") or "edge"),
+            tts_voice=str(payload.get("tts_voice") or "").strip(),
         )
         pipeline.create_job(root, config)
         return self.status(job_id)
@@ -1368,6 +1380,103 @@ class JobsService:
             finally:
                 self._deleting.difference_update(job_ids)
         return {"deleted": deleted, "failed": failed}
+
+    def batch_status(self) -> dict:
+        """Current overnight-queue state (safe copy) plus status counts."""
+        with self._lock:
+            items = [dict(item) for item in self._batch["items"]]
+            running = bool(self._batch["running"])
+            started_at = self._batch["started_at"]
+        counts: dict[str, int] = {}
+        for item in items:
+            counts[item["status"]] = counts.get(item["status"], 0) + 1
+        return {"running": running, "started_at": started_at, "items": items, "counts": counts}
+
+    def stop_batch(self) -> dict:
+        """Ask the queue to stop after the current job; remaining items are cancelled."""
+        with self._lock:
+            if self._batch["running"]:
+                self._batch["stop"] = True
+        return self.batch_status()
+
+    def start_batch(self, payload: dict, *, process=None) -> dict:
+        """Queue many links and run each to the script-review gate, one at a time.
+
+        Respects the approval gate: each job stops at ``script`` (never auto-approved),
+        so the operator reviews drafts afterwards. Fault-tolerant per item - a bad
+        link is logged on its row and the queue continues. ``process`` is injectable
+        for tests; production builds the real create -> download -> run worker.
+        """
+        from . import batch_queue
+
+        urls = batch_queue.parse_batch_input(str(payload.get("links") or ""))
+        confirm_rights = bool(payload.get("confirm_rights"))
+        if process is None and not confirm_rights:
+            raise link_download.RightsConfirmationRequired(
+                "Xác nhận bạn có quyền dùng các video này trước khi chạy hàng đợi."
+            )
+        language = str(payload.get("language") or "vi")
+        sub_langs = str(payload.get("sub_langs") or "vi,en")
+        with self._lock:
+            if self._batch["running"]:
+                raise RuntimeError("hàng đợi đang chạy; chờ xong hoặc bấm dừng")
+            self._batch = {"running": True, "stop": False,
+                           "items": batch_queue.initial_items(urls),
+                           "started_at": datetime.now(timezone.utc).isoformat()}
+
+        worker_process = process or self._build_batch_process(
+            confirm_rights=confirm_rights, language=language, sub_langs=sub_langs)
+
+        def on_event(item: dict) -> None:
+            with self._lock:
+                for row in self._batch["items"]:
+                    if row["index"] == item["index"]:
+                        row.update(status=item["status"], job_id=item["job_id"], error=item["error"])
+                        break
+
+        def should_stop() -> bool:
+            with self._lock:
+                return bool(self._batch["stop"])
+
+        def worker() -> None:
+            try:
+                results = batch_queue.run_batch(urls, process=worker_process,
+                                                on_event=on_event, should_stop=should_stop)
+                try:
+                    batch_queue.notify_batch_complete(results)
+                except Exception:  # a webhook problem must never fail the queue
+                    pass
+            finally:
+                with self._lock:
+                    self._batch["running"] = False
+                    self._batch["stop"] = False
+
+        threading.Thread(target=worker, name="mrf-batch-queue", daemon=True).start()
+        return self.batch_status()
+
+    def _build_batch_process(self, *, confirm_rights: bool, language: str, sub_langs: str):
+        """Real per-item worker: create job -> download link -> run to script gate."""
+        from . import batch_queue
+
+        def process(url: str, index: int) -> str:
+            job_id = batch_queue.slug_for(url, index)
+            root = self.jobs_root / job_id
+            suffix = 1
+            while root.exists():
+                suffix += 1
+                job_id = f"{batch_queue.slug_for(url, index)}-{suffix}"
+                root = self.jobs_root / job_id
+            pipeline.create_job(root, JobConfig(job_id=job_id, language=language))
+            result = link_download.download_video(
+                url, root, confirm_rights=confirm_rights, sub_langs=sub_langs)
+            manifest = pipeline.load_manifest(root)
+            manifest.config.source_video = Path(result["source_video"]).resolve()
+            pipeline.save_manifest(root, manifest)
+            # Approval gate stays intact: stop at the script draft, never auto-approve.
+            pipeline.run_job(root, until=SCRIPT_REVIEW_STAGE)
+            return job_id
+
+        return process
 
     def start_run(self, job_id: str, *, until: str | None = None) -> dict:
         root = self._require_job(job_id)
@@ -2129,6 +2238,9 @@ class MRFRequestHandler(BaseHTTPRequestHandler):
         if parts == ["jobs"]:
             self._send_json(200, {"jobs": self.service.list_jobs()})
             return
+        if parts == ["batch"]:
+            self._send_json(200, self.service.batch_status())
+            return
         if parts == ["creator-library", "search"]:
             self._send_json(200, self.service.search_creator_projects((query.get("q") or [""])[0]))
             return
@@ -2262,6 +2374,12 @@ class MRFRequestHandler(BaseHTTPRequestHandler):
             return
         if parts == ["jobs"]:
             self._send_json(201, self.service.create_job(self._read_body()))
+            return
+        if parts == ["batch"]:
+            self._send_json(202, self.service.start_batch(self._read_body()))
+            return
+        if parts == ["batch", "stop"]:
+            self._send_json(200, self.service.stop_batch())
             return
         if parts == ["link-probe"]:
             body = self._read_body()
@@ -3053,6 +3171,25 @@ INDEX_HTML = """<!DOCTYPE html>
               <option value="balanced" selected>Cân bằng (Lật ngang, Zoom 5%, chỉnh màu)</option>
               <option value="aggressive">Mạnh (Lật ngang, Zoom 8%, chỉnh màu, 1.06x)</option>
             </select>
+            <label>Giọng đọc (TTS)</label>
+            <select name="tts_provider">
+              <option value="edge" selected>Edge-TTS (miễn phí, mặc định)</option>
+              <option value="fptai">FPT.AI Voice (cần MRF_FPTAI_API_KEY)</option>
+              <option value="elevenlabs">ElevenLabs (cần MRF_ELEVENLABS_API_KEY)</option>
+            </select>
+            <label>Voice ID / tên giọng (chỉ cho FPT.AI / ElevenLabs, tùy chọn)</label>
+            <input name="tts_voice" list="ttsVoiceHints" placeholder="vd: banmai (FPT.AI) hoặc 21m00Tcm4TlvDq8ikWAM (ElevenLabs)">
+            <datalist id="ttsVoiceHints">
+              <option value="banmai">FPT.AI · Ban Mai (nữ, miền Bắc)</option>
+              <option value="lannhi">FPT.AI · Lan Nhi (nữ, miền Nam)</option>
+              <option value="leminh">FPT.AI · Lê Minh (nam, miền Bắc)</option>
+              <option value="minhquang">FPT.AI · Minh Quang (nam, miền Nam)</option>
+              <option value="thuminh">FPT.AI · Thu Minh (nữ)</option>
+              <option value="21m00Tcm4TlvDq8ikWAM">ElevenLabs · Rachel</option>
+              <option value="AZnzlk1XvdvUeBnXmlld">ElevenLabs · Domi</option>
+              <option value="EXAVITQu4vr4xnSDxMaL">ElevenLabs · Bella</option>
+            </datalist>
+            <p class="muted">Bỏ trống để dùng giọng mặc định. API key đặt qua biến môi trường, không lưu vào project.</p>
             <label>Che dải watermark phía trên (0–20% chiều cao)</label>
             <input name="brand_top_band" type="number" value="0" min="0" max="0.2" step="0.01">
             <label>Che dải tiêu đề cũ phía dưới (0–20% chiều cao)</label>
@@ -3185,6 +3322,20 @@ INDEX_HTML = """<!DOCTYPE html>
         <button id="emptyProjectsBtn" type="button" hidden>Mở project có sẵn</button>
       </div>
       <div class="empty-help">Sau khi tạo, project mở thẳng vào workspace và giữ toàn bộ tiến trình ở một nơi.</div>
+      <details id="batchPanel" style="margin-top:14px; text-align:left; width:100%; max-width:640px">
+        <summary style="cursor:pointer; font-weight:600">Hàng đợi hàng loạt (chạy qua đêm)</summary>
+        <p class="muted">Dán nhiều link, mỗi dòng một link. Hệ thống tải và dựng tuần tự tới bước duyệt kịch bản cho từng video; lỗi một video sẽ bỏ qua và chạy tiếp. Xong vào từng project bấm duyệt.</p>
+        <textarea id="batchLinks" rows="5" style="width:100%" placeholder="https://..."></textarea>
+        <label class="row" style="gap:6px; align-items:center; margin-top:6px">
+          <input id="batchRights" type="checkbox" style="width:auto"> Tôi có quyền sử dụng các video này
+        </label>
+        <div class="row" style="margin-top:8px; gap:8px">
+          <button id="batchStartBtn" type="button" class="primary">Chạy hàng đợi</button>
+          <button id="batchStopBtn" type="button" class="danger" hidden>Dừng hàng đợi</button>
+        </div>
+        <div id="batchMsg" class="muted" role="status" style="margin-top:6px"></div>
+        <div id="batchList" style="margin-top:6px"></div>
+      </details>
     </div>
     <div id="detail" style="display:none">
       <div class="card">
@@ -3208,6 +3359,7 @@ INDEX_HTML = """<!DOCTYPE html>
         <div style="margin-top:10px" class="progress"><div id="progBar"></div></div>
         <div id="progText" class="muted" style="margin-top:6px"></div>
         <div id="runErr" class="err" style="margin-top:6px"></div>
+        <div id="voiceInfo" class="muted" style="margin-top:6px"></div>
         <details class="stages-panel"><summary>Tiến trình các bước</summary><div id="stages"></div></details>
       </div>
 
@@ -3247,6 +3399,7 @@ INDEX_HTML = """<!DOCTYPE html>
         <details id="analyticsPanel">
           <summary>Học từ số liệu YouTube Studio</summary>
           <p class="muted">Sau khi tải gói bàn giao và đăng video thủ công, nhập CSV/JSON retention đã đo. Số liệu gắn với đúng phiên bản xuất; không dự đoán lượt xem.</p>
+          <button id="studioGuideBtn" type="button">Cách lấy file CSV từ Studio (30 giây)</button>
           <label for="studioExport">File Studio (CSV/JSON, tối đa 2 MB)</label>
           <input id="studioExport" type="file" accept=".csv,.json,text/csv,application/json">
           <div class="filter-grid">
@@ -3256,6 +3409,20 @@ INDEX_HTML = """<!DOCTYPE html>
           <button id="analyticsUploadBtn" type="button">Nhập số liệu đã đo</button>
           <span id="analyticsMsg" role="status" class="muted"></span>
           <div id="analyticsResults" role="status" class="muted"></div>
+          <div id="analyticsAdvice" role="status" class="muted"></div>
+          <dialog id="studioGuide" style="max-width:540px; border:1px solid var(--border, rgba(128,128,128,.35)); border-radius:10px; padding:18px">
+            <h3 style="margin:0 0 8px">Lấy file CSV giữ chân người xem từ YouTube Studio</h3>
+            <ol style="padding-left:18px; line-height:1.7; margin:0">
+              <li>Sau khi đăng video 24–48h, mở <a href="https://studio.youtube.com" target="_blank" rel="noopener noreferrer">YouTube Studio</a>.</li>
+              <li>Mở video → tab <strong>Số liệu phân tích</strong> (Analytics) → <strong>Mức độ tương tác</strong> (Engagement).</li>
+              <li>Tại biểu đồ <strong>Mức giữ chân người xem</strong> (Audience retention), bấm <strong>Chế độ nâng cao</strong> (Advanced mode) ở góc trên bên phải.</li>
+              <li>Bấm <strong>Xuất dữ liệu</strong> (Export) → chọn <strong>Giá trị phân tách bằng dấu phẩy (.csv)</strong>.</li>
+              <li>File cần có cột <code>time_seconds</code> và <code>retention_percent</code> (0–100); có thể thêm <code>impressions</code>, <code>ctr_percent</code>. Kéo vào ô “File Studio” phía trên rồi bấm “Nhập số liệu đã đo”.</li>
+            </ol>
+            <div class="row" style="justify-content:flex-end; margin-top:12px">
+              <button id="studioGuideClose" type="button">Đã hiểu</button>
+            </div>
+          </dialog>
         </details>
         <h3 style="margin-top:16px; border-top:1px solid var(--border, rgba(128,128,128,.25)); padding-top:12px">Cổng xuất bản</h3>
         <div class="gate">
@@ -4756,6 +4923,7 @@ function selectJob(id) {
   $('versionsPanel').open = false;
   $('analyticsPanel').open = false;
   $('analyticsResults').replaceChildren();
+  $('analyticsAdvice').replaceChildren();
   $('analyticsMsg').textContent = '';
   $('versionSelect').replaceChildren();
   $('versionMsg').textContent = '';
@@ -4923,6 +5091,13 @@ async function loadStatus() {
     + (s.running ? ' · đang chạy…' : '')
     + (s.is_indexing ? ` · đang lập chỉ mục nền${s.indexing && s.indexing.stage ? ` (${s.indexing.stage} ${s.indexing.done}/${s.indexing.total})` : ''}…` : '');
   $('runErr').textContent = s.run_error_vi ? ('Lỗi chạy: ' + s.run_error_vi) : '';
+  if ($('voiceInfo')) {
+    const vm = s.voice;
+    $('voiceInfo').textContent = vm && vm.engine
+      ? ('Giọng đọc: ' + vm.engine + (vm.voice ? ' · ' + vm.voice : '')
+         + (vm.timing_mode === 'estimated_word_timing' ? ' · nhịp từ ước lượng' : ''))
+      : '';
+  }
   $('runBtn').disabled = !!s.running || !!s.uploading || !s.has_source_video || !!(s.reindex && s.reindex.running);
   $('stopBtn').hidden = !s.running;
   $('stopBtn').disabled = !s.can_stop;
@@ -5398,9 +5573,28 @@ $('shortExportBtn').onclick = async () => {
     button.disabled = false;
   }
 };
-function renderAnalytics(imports) {
+function renderAdvice(advice) {
+  const box = $('analyticsAdvice');
+  box.replaceChildren();
+  if (!advice || !advice.enabled || !(advice.suggestions || []).length) return;
+  const title = document.createElement('div');
+  title.textContent = 'Gợi ý cho video sau (advisory, không tự đổi kịch bản):';
+  box.appendChild(title);
+  for (const s of advice.suggestions) {
+    const row = document.createElement('div');
+    row.textContent = '• ' + (s.message_vi || '');
+    box.appendChild(row);
+  }
+  if (advice.low_confidence) {
+    const note = document.createElement('div');
+    note.textContent = '(Mẫu còn ít — chỉ nên tham khảo.)';
+    box.appendChild(note);
+  }
+}
+function renderAnalytics(imports, advice) {
   const panel = $('analyticsResults');
   panel.replaceChildren();
+  renderAdvice(advice);
   if (!imports.length) { panel.textContent = 'Chưa nhập số liệu cho project này.'; return; }
   const report = imports[0];
   const m = report.measurements || {};
@@ -5424,7 +5618,7 @@ async function loadAnalytics() {
   if (!current) return;
   const project = current;
   const data = await api('GET', '/api/jobs/' + encodeURIComponent(project) + '/analytics');
-  if (current === project) renderAnalytics(data.imports || []);
+  if (current === project) renderAnalytics(data.imports || [], data.advice);
 }
 $('analyticsPanel').addEventListener('toggle', () => {
   if ($('analyticsPanel').open) loadAnalytics().catch(error => { $('analyticsMsg').textContent = error.message; });
@@ -5450,6 +5644,41 @@ $('analyticsUploadBtn').onclick = async () => {
   } catch (error) { $('analyticsMsg').textContent = error.message; }
   finally { button.disabled = false; }
 };
+$('studioGuideBtn').onclick = () => { const d = $('studioGuide'); if (d.showModal) { try { d.showModal(); } catch (e) { d.setAttribute('open', ''); } } else { d.setAttribute('open', ''); } };
+$('studioGuideClose').onclick = () => { const d = $('studioGuide'); if (d.close) { try { d.close(); } catch (e) { d.removeAttribute('open'); } } else { d.removeAttribute('open'); } };
+let batchPoller = null;
+function renderBatch(state) {
+  const list = $('batchList');
+  list.replaceChildren();
+  const label = {pending:'chờ', running:'đang chạy', ready:'xong (chờ duyệt)', failed:'lỗi', cancelled:'đã hủy'};
+  for (const it of (state.items || [])) {
+    const row = document.createElement('div');
+    row.textContent = '#' + (it.index + 1) + ' · ' + (label[it.status] || it.status)
+      + (it.job_id ? ' · ' + it.job_id : '') + (it.error ? ' · ' + it.error : '') + ' · ' + it.url;
+    list.appendChild(row);
+  }
+  $('batchStopBtn').hidden = !state.running;
+  $('batchStartBtn').disabled = !!state.running;
+  if (state.running && !batchPoller) batchPoller = setInterval(loadBatch, 2000);
+  if (!state.running && batchPoller) { clearInterval(batchPoller); batchPoller = null; }
+}
+async function loadBatch() {
+  try { renderBatch(await api('GET', '/api/batch')); }
+  catch (e) { if (batchPoller) { clearInterval(batchPoller); batchPoller = null; } }
+}
+$('batchStartBtn').onclick = async () => {
+  $('batchMsg').textContent = 'Đang khởi động hàng đợi…';
+  try {
+    const state = await api('POST', '/api/batch', { links: $('batchLinks').value, confirm_rights: $('batchRights').checked });
+    $('batchMsg').textContent = 'Hàng đợi đang chạy nền. Có thể đóng tab; tiến trình vẫn chạy.';
+    renderBatch(state);
+    await loadJobs();
+  } catch (e) { $('batchMsg').textContent = e.message; }
+};
+$('batchStopBtn').onclick = async () => {
+  try { renderBatch(await api('POST', '/api/batch/stop', {})); } catch (e) { $('batchMsg').textContent = e.message; }
+};
+$('batchPanel').addEventListener('toggle', () => { if ($('batchPanel').open) loadBatch(); });
 $('handoffBtn').onclick = async () => {
   const button = $('handoffBtn');
   button.disabled = true;

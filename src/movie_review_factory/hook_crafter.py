@@ -134,19 +134,43 @@ def hook_teaser_range(
     }
 
 
-def plan_hook(scenes: list[dict], **kwargs: object) -> dict | None:
-    """Full teaser plan for the most dramatic scene, or None when unavailable."""
+def hook_advisory(advice: dict | None) -> list[str]:
+    """Hook-relevant advisory lines from :func:`analytics.retention_advice` (read-only).
+
+    Returns the Vietnamese suggestion strings whose target is the opening hook, or an
+    empty list when advice is missing / disabled. Never changes the teaser window.
+    """
+    if not isinstance(advice, dict) or not advice.get("enabled"):
+        return []
+    return [
+        item["message_vi"]
+        for item in advice.get("suggestions") or []
+        if isinstance(item, dict) and item.get("target") == "hook" and item.get("message_vi")
+    ]
+
+
+def plan_hook(scenes: list[dict], *, advice: dict | None = None, **kwargs: object) -> dict | None:
+    """Full teaser plan for the most dramatic scene, or None when unavailable.
+
+    ``advice`` (optional, from :func:`analytics.retention_advice`) only *annotates*
+    the plan with read-only ``advisory`` notes about early drop-off; it never changes
+    the selected scene or the teaser window.
+    """
     scene = select_dramatic_scene(scenes)
     if scene is None:
         return None
     window = hook_teaser_range(scene, **kwargs)  # type: ignore[arg-type]
     score = dramatic_score(scene)
-    return {
+    plan = {
         "scene_index": int(scene.get("index") or 0),
         "dramatic_score": round(score, 6),
         "reason": "top dramatic scene" if score > 0 else "longest scene (no drama cue found)",
         **window,
     }
+    notes = hook_advisory(advice)
+    if notes:
+        plan["advisory"] = notes
+    return plan
 
 
 def build_teaser_command(
@@ -239,7 +263,8 @@ def build_hook_teaser(
         raise FileNotFoundError("hook teaser requires the configured source video")
     ratio = ratio or getattr(manifest.config, "aspect_ratio", None) or "16:9"
     width, height = RENDER_CANVASES.get(ratio, RENDER_CANVASES["16:9"])
-    plan = plan_hook(_load_scenes(root))
+    from .analytics import retention_advice  # lazy import avoids a module import cycle
+    plan = plan_hook(_load_scenes(root), advice=retention_advice(root))
     if plan is None:
         raise ValueError("no usable scene found for a hook teaser")
     encoder = ffmpeg or shutil.which("ffmpeg")

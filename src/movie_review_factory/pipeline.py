@@ -1301,6 +1301,21 @@ def _research(root: Path, manifest: JobManifest) -> tuple[list[Artifact], str]:
     return [_write_json(root, "research.json", data)], "research brief scaffold written"
 
 
+def _retention_advice_for(root: Path) -> dict | None:
+    """Read-only retention advice for the content-agent context (never mutates output).
+
+    Lazy import avoids an analytics<->pipeline cycle; failure-safe so a malformed
+    analytics folder can never break the critical generation path. Returns ``None``
+    when unavailable, which keeps :func:`prompt_creative_brief` at its legacy shape.
+    """
+    try:
+        from . import analytics
+
+        return analytics.retention_advice(root)
+    except Exception:
+        return None
+
+
 # --- outline: section/time-budget scaffold ----------------------------------
 
 @register_stage("outline")
@@ -1320,7 +1335,7 @@ def _outline(root: Path, manifest: JobManifest) -> tuple[list[Artifact], str]:
             "Return 3-8 sections with relative time budgets."
         ),
         context={
-            "creative_brief": prompt_creative_brief(cfg),
+            "creative_brief": prompt_creative_brief(cfg, retention_advice=_retention_advice_for(root)),
             "movie_title": _movie_title(cfg),
             "language": cfg.language,
             "target_minutes": target_min,
@@ -1426,7 +1441,7 @@ def _script(root: Path, manifest: JobManifest) -> tuple[list[Artifact], str]:
             "Treat creative brief as editorial preferences, not film facts."
         ),
         context={
-            "creative_brief": __import__("movie_review_factory.creative_brief", fromlist=["prompt_creative_brief"]).prompt_creative_brief(cfg),
+            "creative_brief": __import__("movie_review_factory.creative_brief", fromlist=["prompt_creative_brief"]).prompt_creative_brief(cfg, retention_advice=_retention_advice_for(root)),
             "movie_title": _movie_title(cfg),
             "language": cfg.language,
             "target_minutes": cfg.target_minutes,
@@ -2304,36 +2319,59 @@ def _tts(root: Path, manifest: JobManifest) -> tuple[list[Artifact], str]:
     if not sections:
         raise SkipStage("script has no non-empty narration to synthesize")
 
-    try:
-        import edge_tts
-    except ImportError as exc:
-        raise SkipStage("edge-tts not installed - install the tts extra") from exc
-    from . import narration_alignment
+    from . import narration_alignment, tts_providers
     from .chunked_tts import synthesize_chunked
 
     cfg = manifest.config
-    voice = VOICE_BY_LANGUAGE.get(cfg.language, DEFAULT_TTS_VOICE)
+    provider = tts_providers.resolve_provider(cfg)
     narration = "\n\n".join(section["narration"] for section in sections)
     audio_path = root / "narration.mp3"
     ffmpeg = shutil.which("ffmpeg")
     ffprobe = shutil.which("ffprobe")
     if len(narration) > 500 and (not ffmpeg or not ffprobe):
         raise SkipStage("ffmpeg/ffprobe not on PATH - install FFmpeg for long narration")
-    no_audio_error = getattr(getattr(edge_tts, "exceptions", None), "NoAudioReceived", None)
-    if no_audio_error is None:
+
+    if provider == "edge":
+        try:
+            import edge_tts
+        except ImportError as exc:
+            raise SkipStage("edge-tts not installed - install the tts extra") from exc
+        voice = VOICE_BY_LANGUAGE.get(cfg.language, DEFAULT_TTS_VOICE)
+        no_audio_error = getattr(getattr(edge_tts, "exceptions", None), "NoAudioReceived", None)
+        if no_audio_error is None:
+            no_audio_error = type("_NoAudioReceived", (Exception,), {})
+        prosody = _tts_prosody()
+        communicate_factory = edge_tts.Communicate
+        if prosody:
+            # Bake the prosody into the factory so chunked_tts / narration_alignment
+            # keep their existing (text, voice, boundary=...) call signature.
+            def communicate_factory(text, voice, _prosody=prosody, _factory=edge_tts.Communicate, **kwargs):
+                return _factory(text, voice, **_prosody, **kwargs)
+        synthesize = narration_alignment.synthesize_with_boundaries
+        engine = "edge-tts"
+        timing_mode = "tts_word_boundary"
+    else:
+        # FPT.AI / ElevenLabs: audio-only providers. Keys come from env (never the
+        # manifest); ffprobe is required to estimate word timing from chunk duration.
+        api_key = tts_providers.provider_api_key(provider)
+        if not api_key:
+            raise SkipStage(tts_providers.missing_key_message(provider))
+        if not ffprobe:
+            raise SkipStage("ffprobe not on PATH - required to time non-edge TTS providers")
+        voice = tts_providers.resolve_voice(provider, cfg=cfg)
+        prosody = {}
+        communicate_factory = None
         no_audio_error = type("_NoAudioReceived", (Exception,), {})
-    prosody = _tts_prosody()
-    communicate_factory = edge_tts.Communicate
-    if prosody:
-        # Bake the prosody into the factory so chunked_tts / narration_alignment
-        # keep their existing (text, voice, boundary=...) call signature.
-        def communicate_factory(text, voice, _prosody=prosody, _factory=edge_tts.Communicate, **kwargs):
-            return _factory(text, voice, **_prosody, **kwargs)
+        synthesize = tts_providers.build_synthesize(
+            provider, api_key=api_key, ffprobe_bin=ffprobe or "ffprobe",
+        )
+        engine = provider
+        timing_mode = "estimated_word_timing"
 
     boundaries = synthesize_chunked(
         narration, voice, audio_path,
         communicate_factory=communicate_factory,
-        synthesize=narration_alignment.synthesize_with_boundaries,
+        synthesize=synthesize,
         no_audio_error=no_audio_error,
         ffmpeg_bin=ffmpeg or "ffmpeg",
         ffprobe_bin=ffprobe or "ffprobe",
@@ -2343,19 +2381,19 @@ def _tts(root: Path, manifest: JobManifest) -> tuple[list[Artifact], str]:
     metadata = {
         "job_id": cfg.job_id,
         "language": cfg.language,
-        "engine": "edge-tts",
+        "engine": engine,
         "voice": voice,
         "prosody": prosody,
         "audio_file": audio_path.name,
         "section_count": len(sections),
         "sections": sections,
         "word_boundaries": boundaries,
-        "timing_mode": "tts_word_boundary",
+        "timing_mode": timing_mode,
     }
     return [
         _write_json(root, "voice.json", metadata),
         Artifact(name=audio_path.name, path=audio_path, status="ready"),
-    ], f"synthesized narration.mp3 from {len(sections)} sections"
+    ], f"synthesized narration.mp3 from {len(sections)} sections ({engine})"
 
 
 # --- alignment: fit captions to the synthesized narration ------------------

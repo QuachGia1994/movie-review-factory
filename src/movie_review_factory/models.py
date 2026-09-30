@@ -75,6 +75,14 @@ class JobConfig(BaseModel):
     watermark_removal: WatermarkRemoval = Field(default_factory=WatermarkRemoval)
     # Optional Content ID bypass profile: 'off', 'light', 'balanced', 'aggressive'.
     copyright_bypass: str = Field(default="off", max_length=30)
+    # Optional TTS provider: 'edge' (default, free/offline), 'fptai', or 'elevenlabs'.
+    # Provider API keys are read from env only (MRF_FPTAI_API_KEY /
+    # MRF_ELEVENLABS_API_KEY) and are never persisted in the manifest.
+    tts_provider: str = Field(default="edge", max_length=30)
+    # Optional voice id/name for the fptai / elevenlabs providers (e.g. FPT.AI
+    # 'banmai' or an ElevenLabs voice id). Empty falls back to MRF_TTS_VOICE then a
+    # per-provider default. Ignored by the edge provider. Not a secret.
+    tts_voice: str = Field(default="", max_length=120)
 
 
 class Artifact(BaseModel):

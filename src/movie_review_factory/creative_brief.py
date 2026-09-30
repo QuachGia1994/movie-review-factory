@@ -7,8 +7,14 @@ from typing import Literal
 from .models import JobConfig
 
 
-def prompt_creative_brief(config: JobConfig) -> dict:
-    """Expose the saved editorial choices to outline and script generation."""
+def prompt_creative_brief(config: JobConfig, *, retention_advice: dict | None = None) -> dict:
+    """Expose the saved editorial choices to outline and script generation.
+
+    ``retention_advice`` (optional, from :func:`analytics.retention_advice`) is
+    surfaced as read-only ADVISORY guidance under ``retention_advisory`` — it never
+    mutates the brief or the generated script; the creator / content agent decides
+    whether to act on it. Omit it (the default) to keep the exact legacy shape.
+    """
     brief = config.creative_brief
     result = {
         "desired_length_minutes": config.target_minutes,
@@ -20,7 +26,27 @@ def prompt_creative_brief(config: JobConfig) -> dict:
             item.strip() for item in brief.forbidden_claims if item.strip()
         ],
     }
-    return {key: value for key, value in result.items() if value and value != "unspecified"}
+    prompt = {key: value for key, value in result.items() if value and value != "unspecified"}
+    advisory = _retention_advisory(retention_advice)
+    if advisory:
+        prompt["retention_advisory"] = advisory
+    return prompt
+
+
+def _retention_advisory(advice: dict | None) -> list[dict]:
+    """Flatten :func:`analytics.retention_advice` output into read-only advisory rows."""
+    if not isinstance(advice, dict) or not advice.get("enabled"):
+        return []
+    rows = [
+        {"code": item.get("code"), "severity": item.get("severity"),
+         "target": item.get("target"), "message": item["message_vi"]}
+        for item in advice.get("suggestions") or []
+        if isinstance(item, dict) and item.get("message_vi")
+    ]
+    if rows and advice.get("low_confidence"):
+        rows.append({"code": "low_confidence", "severity": "info", "target": "all",
+                     "message": "Mẫu số liệu còn ít — chỉ nên tham khảo, không đổi lớn."})
+    return rows
 
 
 def tag_script_span(

@@ -76,6 +76,8 @@ def test_onefile_build_is_deterministic_and_resolves_placeholders() -> None:
         "movie_review_factory/media_intelligence.py",
         "movie_review_factory/midroll.py",
         "movie_review_factory/narration_alignment.py",
+        "movie_review_factory/tts_providers.py",
+        "movie_review_factory/batch_queue.py",
         "movie_review_factory/migrations/__init__.py",
         "movie_review_factory/migrations/001_media_intelligence.sql",
         "movie_review_factory/migrations/002_visual_memory.sql",

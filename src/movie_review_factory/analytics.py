@@ -267,3 +267,108 @@ def list_imports(root: Path) -> list[dict]:
         except (OSError, ValueError):
             continue
     return sorted(reports, key=lambda item: (item.get("created_at", ""), item["id"]), reverse=True)
+
+
+# --- advisory (read-only) ---------------------------------------------------
+# Turn measured Studio retention into suggestions for the *next* video. Strictly
+# ADVISORY: nothing here edits a script, brief, hook, or thumbnail — the creator /
+# content agent decides. Off switch: pass ``enabled=False`` or set the env var
+# ``MRF_RETENTION_ADVICE`` to 0/off/false/no.
+INTRO_DROP_ADVICE_THRESHOLD = 35.0   # intro_drop (pp) above this -> opening hook too slow
+CTA_DROP_ADVICE_THRESHOLD = 25.0     # cta_drop (pp) above this -> CTA placed badly
+CTR_ADVICE_THRESHOLD = 4.0           # ctr_percent below this -> thumbnail underperforming
+ADVICE_RECENT_DEFAULT = 5            # how many newest reports to average
+ADVICE_MIN_CONFIDENT_SAMPLES = 3     # fewer than this -> flag low confidence
+ADVICE_ENV_FLAG = "MRF_RETENTION_ADVICE"
+
+
+def _advice_enabled(enabled: bool | None) -> bool:
+    if enabled is not None:
+        return bool(enabled)
+    return os.environ.get(ADVICE_ENV_FLAG, "").strip().lower() not in ("0", "off", "false", "no")
+
+
+def _avg(values: list[float]) -> float | None:
+    return round(sum(values) / len(values), 4) if values else None
+
+
+def retention_advice(root: Path | None = None, *, reports: list[dict] | None = None,
+                     enabled: bool | None = None, recent: int = ADVICE_RECENT_DEFAULT) -> dict:
+    """Read-only suggestions for the next video from measured Studio retention.
+
+    Averages the ``recent`` newest measurements (from ``reports`` when given, else
+    ``list_imports(root)``) and flags the fixed thresholds. It never mutates any
+    script/brief/hook/thumbnail; callers surface the suggestions and a human or the
+    content agent decides. Small samples set ``low_confidence`` so one or two videos
+    never drive a big change. Disable with ``enabled=False`` or
+    ``MRF_RETENTION_ADVICE=0``.
+    """
+    thresholds = {"intro_drop": INTRO_DROP_ADVICE_THRESHOLD,
+                  "cta_drop": CTA_DROP_ADVICE_THRESHOLD, "ctr": CTR_ADVICE_THRESHOLD}
+    if not _advice_enabled(enabled):
+        return {"enabled": False, "advisory_only": True, "sample_size": 0,
+                "signals": {}, "thresholds": thresholds, "low_confidence": False,
+                "suggestions": []}
+    if reports is None:
+        reports = list_imports(root) if root is not None else []
+    considered = [r for r in reports if isinstance(r, dict)][:max(0, int(recent))]
+
+    intro_values: list[float] = []
+    cta_values: list[float] = []
+    ctr_values: list[float] = []
+    for report in considered:
+        raw = report.get("measurements")
+        measurements = raw if isinstance(raw, dict) else {}
+        intro = measurements.get("intro_drop_percentage_points")
+        cta = measurements.get("cta_drop_percentage_points")
+        ctr = report.get("ctr_percent")
+        if isinstance(intro, (int, float)) and not isinstance(intro, bool):
+            intro_values.append(float(intro))
+        if isinstance(cta, (int, float)) and not isinstance(cta, bool):
+            cta_values.append(float(cta))
+        if isinstance(ctr, (int, float)) and not isinstance(ctr, bool):
+            ctr_values.append(float(ctr))
+
+    signals = {"intro_drop_avg": _avg(intro_values), "cta_drop_avg": _avg(cta_values),
+               "ctr_avg": _avg(ctr_values)}
+    suggestions: list[dict] = []
+    intro_avg = signals["intro_drop_avg"]
+    if intro_avg is not None and intro_avg > INTRO_DROP_ADVICE_THRESHOLD:
+        suggestions.append({
+            "code": "intro_hook_too_slow", "target": "hook", "severity": "high",
+            "metric": "intro_drop_percentage_points", "value": intro_avg,
+            "threshold": INTRO_DROP_ADVICE_THRESHOLD,
+            "message_vi": (f"Khán giả rời nhiều ở đoạn mở đầu (rơi ~{intro_avg:g} điểm % quanh giây 30). "
+                           "Gợi ý: rút hook xuống dưới 15 giây, cắt cảnh nhanh hơn trong 60 giây đầu, "
+                           "tăng nhịp đọc mở đầu. Chưa tự đổi kịch bản."),
+            "message_en": (f"High early drop-off (~{intro_avg:g} pp around 0:30). Suggestion: cut the hook "
+                           "below 15s, speed up the first 60s, lift the opening TTS pace. Advisory only."),
+        })
+    cta_avg = signals["cta_drop_avg"]
+    if cta_avg is not None and cta_avg > CTA_DROP_ADVICE_THRESHOLD:
+        suggestions.append({
+            "code": "cta_placement", "target": "script", "severity": "medium",
+            "metric": "cta_drop_percentage_points", "value": cta_avg,
+            "threshold": CTA_DROP_ADVICE_THRESHOLD,
+            "message_vi": (f"Khán giả rời ngay khi kêu gọi đăng ký (rơi ~{cta_avg:g} điểm % quanh CTA). "
+                           "Gợi ý: đẩy CTA về cuối hơn hoặc lồng ghép tự nhiên trong lời dẫn. Chưa tự đổi kịch bản."),
+            "message_en": (f"Viewers leave at the CTA (~{cta_avg:g} pp around the CTA). Suggestion: move the "
+                           "CTA later or make it in-narrative. Advisory only."),
+        })
+    ctr_avg = signals["ctr_avg"]
+    if ctr_avg is not None and ctr_avg < CTR_ADVICE_THRESHOLD:
+        suggestions.append({
+            "code": "thumbnail_ctr_low", "target": "thumbnail", "severity": "medium",
+            "metric": "ctr_percent", "value": ctr_avg, "threshold": CTR_ADVICE_THRESHOLD,
+            "message_vi": (f"CTR thumbnail thấp (~{ctr_avg:g}%). Gợi ý: tăng tương phản màu, cận mặt biểu cảm "
+                           "mạnh, giới hạn 3–4 từ giật gân trên thumbnail. Chưa tự đổi kịch bản."),
+            "message_en": (f"Low thumbnail CTR (~{ctr_avg:g}%). Suggestion: raise contrast, zoom on an "
+                           "expressive face, keep to 3–4 punchy words. Advisory only."),
+        })
+
+    return {
+        "enabled": True, "advisory_only": True, "sample_size": len(considered),
+        "signals": signals, "thresholds": thresholds,
+        "low_confidence": len(considered) < ADVICE_MIN_CONFIDENT_SAMPLES,
+        "suggestions": suggestions,
+    }

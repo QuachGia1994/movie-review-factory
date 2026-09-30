@@ -38,6 +38,69 @@ def _job_with_metadata(jobs_root: Path, job_id: str = "demo") -> Path:
     return root
 
 
+def test_status_exposes_tts_voice_info(tmp_path):
+    root = tmp_path / "demo"
+    pipeline.create_job(root, JobConfig(job_id="demo"))
+    (root / "voice.json").write_text(json.dumps({
+        "engine": "elevenlabs",
+        "voice": "21m00Tcm4TlvDq8ikWAM",
+        "timing_mode": "estimated_word_timing",
+        "word_boundaries": [{"offset": 0, "duration": 1, "text": "x"}],
+    }), encoding="utf-8")
+    voice = JobsService(tmp_path).status("demo")["voice"]
+    assert voice == {
+        "engine": "elevenlabs",
+        "voice": "21m00Tcm4TlvDq8ikWAM",
+        "timing_mode": "estimated_word_timing",
+    }
+
+
+def test_status_voice_is_none_without_voice_json(tmp_path):
+    root = tmp_path / "demo"
+    pipeline.create_job(root, JobConfig(job_id="demo"))
+    assert JobsService(tmp_path).status("demo")["voice"] is None
+
+
+def test_module_main_entry_exposes_cli_app():
+    import movie_review_factory.__main__ as entry
+    from movie_review_factory.cli import app as cli_app
+
+    assert callable(entry.main)
+    assert entry.app is cli_app
+
+
+def test_start_batch_runs_sequentially_and_is_fault_tolerant(tmp_path):
+    svc = JobsService(tmp_path)
+
+    def fake_process(url, index):
+        if "boom" in url:
+            raise RuntimeError("nguồn hỏng")
+        return f"job-{index}"
+
+    svc.start_batch(
+        {"links": "https://ok/a\nhttps://boom/b\nhttps://ok/c", "confirm_rights": True},
+        process=fake_process,
+    )
+    deadline = time.time() + 10
+    while time.time() < deadline and svc.batch_status()["running"]:
+        time.sleep(0.05)
+    status = svc.batch_status()
+    assert status["running"] is False
+    assert status["counts"].get("ready") == 2
+    assert status["counts"].get("failed") == 1
+    failed = [item for item in status["items"] if item["status"] == "failed"][0]
+    assert "boom" in failed["url"] and failed["error"]
+
+
+def test_start_batch_requires_rights_confirmation(tmp_path):
+    from movie_review_factory import link_download
+
+    svc = JobsService(tmp_path)
+    with pytest.raises(link_download.RightsConfirmationRequired):
+        svc.start_batch({"links": "https://ok/a", "confirm_rights": False})
+    assert svc.batch_status()["running"] is False
+
+
 def _job_with_thumbnails(jobs_root: Path, job_id: str = "thumbs") -> Path:
     root = jobs_root / job_id
     pipeline.create_job(root, JobConfig(job_id=job_id))
