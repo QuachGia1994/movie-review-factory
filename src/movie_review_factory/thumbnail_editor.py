@@ -47,9 +47,20 @@ def _fit_headline(headline: str) -> tuple[ImageFont.FreeTypeFont, list[str]]:
     raise ValueError("headline cannot fit legibly within two lines")
 
 
-def _draw_variant(source: Path, headline: str, channel: str, layout: str) -> tuple[Image.Image, list[dict]]:
+def _draw_variant(source: Path, headline: str, channel: str, layout: str, top_band: float = 0.0, bottom_band: float = 0.0) -> tuple[Image.Image, list[dict]]:
     with Image.open(source) as original:
         base = original.convert("RGB").resize((1280, 720), Image.Resampling.LANCZOS)
+    # Cover any residual top/bottom brand bands carried over from the source
+    # channel before printing the new branding, matching the render/thumbnail
+    # band cover (fractions of frame height, per branding.render_overlay).
+    if top_band > 0 or bottom_band > 0:
+        cover = ImageDraw.Draw(base)
+        top_px = round(720 * top_band)
+        bottom_px = round(720 * bottom_band)
+        if top_px > 0:
+            cover.rectangle((0, 0, 1280, top_px), fill=(0, 0, 0))
+        if bottom_px > 0:
+            cover.rectangle((0, 720 - bottom_px, 1280, 720), fill=(0, 0, 0))
     headline_font, lines = _fit_headline(headline)
     brand_font = _font(34)
     canvas = Image.new("RGBA", base.size)
@@ -111,6 +122,18 @@ def render_thumbnail_variants(job_root: Path, *, headline: str, channel_name: st
             raise ValueError("missing thumbnail candidate")
         source_names.append(name)
 
+    # Brand bands to cover on each variant, read from the job manifest when
+    # present (default 0 = no cover, e.g. unit fixtures without a manifest).
+    top_band = bottom_band = 0.0
+    manifest_file = root / "manifest.json"
+    if manifest_file.is_file():
+        try:
+            job_cfg = json.loads(manifest_file.read_text(encoding="utf-8")).get("config", {})
+            top_band = float(job_cfg.get("brand_top_band") or 0)
+            bottom_band = float(job_cfg.get("brand_bottom_band") or 0)
+        except (ValueError, OSError, TypeError):
+            top_band = bottom_band = 0.0
+
     variants = []
     with tempfile.TemporaryDirectory(prefix=".thumbnail-edits-", dir=root) as directory:
         staged = Path(directory)
@@ -121,7 +144,7 @@ def render_thumbnail_variants(job_root: Path, *, headline: str, channel_name: st
             ).hexdigest()[:12]
             full_name = f"thumbnail-edit-{i}-{revision}.jpg"
             preview_name = f"thumbnail-edit-{i}-{revision}-small.jpg"
-            image, layers = _draw_variant(root / source_name, headline, channel_name, layout)
+            image, layers = _draw_variant(root / source_name, headline, channel_name, layout, top_band, bottom_band)
             image.save(staged / full_name, quality=92, subsampling=0)
             image.resize((320, 180), Image.Resampling.LANCZOS).save(staged / preview_name, quality=90)
             variants.append({

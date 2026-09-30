@@ -3602,12 +3602,18 @@ def _thumbnail_timestamps(root: Path, source_duration: float) -> list[float]:
 def _thumbnail(root: Path, manifest: JobManifest) -> tuple[list[Artifact], str]:
     """Extract three clean source frames in the job aspect ratio and select a default primary."""
     cfg = manifest.config
-    source_path = Path(cfg.source_video) if cfg.source_video else root / "final.mp4"
+    # Prefer a watermark-cleaned source (source_clean.mp4, via _source_video)
+    # over the raw upload so the original channel's logo never reaches the
+    # thumbnail. We deliberately do NOT prefer final.mp4 here: it carries
+    # burned-in subtitles that would land on the cover. final.mp4 stays only as
+    # the last-resort fallback when no source video is available.
+    final_path = root / "final.mp4"
+    source_path = _source_video(root, cfg) if cfg.source_video else final_path
     if not source_path.exists():
-        fallback = root / "final.mp4"
-        if not fallback.exists():
+        if not final_path.exists():
             raise SkipStage("source video/final.mp4 missing - run render before thumbnail")
-        source_path = fallback
+        source_path = final_path
+    from_render = source_path == final_path
 
     ffmpeg = shutil.which("ffmpeg")
     if not ffmpeg:
@@ -3626,6 +3632,17 @@ def _thumbnail(root: Path, manifest: JobManifest) -> tuple[list[Artifact], str]:
         f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
         f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2"
     )
+    # A raw/cleaned source still shows the original channel's top/bottom brand
+    # bands (final.mp4 already burns these in, so skip when sampling it). Cover
+    # them with the same frame fractions the render uses (branding.render_overlay)
+    # so a competitor watermark can never survive onto the thumbnail.
+    if not from_render:
+        top_px = round(height * cfg.brand_top_band)
+        bottom_px = round(height * cfg.brand_bottom_band)
+        if top_px > 0:
+            video_filter += f",drawbox=x=0:y=0:w={width}:h={top_px}:color=black:t=fill"
+        if bottom_px > 0:
+            video_filter += f",drawbox=x=0:y={height - bottom_px}:w={width}:h={bottom_px}:color=black:t=fill"
 
     for index, timestamp in enumerate(timestamps, start=1):
         output = root / f"thumbnail-{index}.jpg"
