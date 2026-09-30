@@ -170,3 +170,62 @@ def test_provider_integrates_with_synthesize_chunked_single_chunk(tmp_path: Path
     )
     assert out.read_bytes().startswith(b"MP3:")
     assert boundaries and all("offset" in b for b in boundaries)
+
+
+def test_check_provider_edge_needs_no_key():
+    result = tts_providers.check_provider("edge")
+    assert result["provider"] == "edge"
+    assert result["ok"] is True
+
+
+def test_check_provider_missing_key_is_not_ok():
+    result = tts_providers.check_provider("elevenlabs", api_key=None)
+    assert result["ok"] is False
+    assert "MRF_ELEVENLABS_API_KEY" in result["detail"]
+
+
+def test_check_provider_rejects_unknown_provider():
+    result = tts_providers.check_provider("bogus", api_key="k")
+    assert result["ok"] is False
+
+
+def test_check_provider_elevenlabs_valid_reports_quota():
+    def fake_request(url, *, method="GET", headers=None, data=None, timeout=60.0):
+        assert method == "GET"
+        assert url == tts_providers.ELEVENLABS_SUBSCRIPTION_URL
+        assert (headers or {}).get("xi-api-key") == "secret"
+        return 200, b'{"character_count": 1000, "character_limit": 10000}'
+
+    result = tts_providers.check_provider("elevenlabs", api_key="secret", http_request=fake_request)
+    assert result["ok"] is True
+    assert "9,000" in result["detail"]
+
+
+def test_check_provider_elevenlabs_invalid_key_is_not_ok():
+    def fake_request(url, *, method="GET", headers=None, data=None, timeout=60.0):
+        return 401, b'{"detail": "unauthorized"}'
+
+    result = tts_providers.check_provider("elevenlabs", api_key="bad", http_request=fake_request)
+    assert result["ok"] is False
+    assert "401" in result["detail"]
+
+
+def test_check_provider_network_error_is_reported_not_raised():
+    def fake_request(url, *, method="GET", headers=None, data=None, timeout=60.0):
+        raise tts_providers.TTSProviderError("mạng lỗi")
+
+    result = tts_providers.check_provider("elevenlabs", api_key="secret", http_request=fake_request)
+    assert result["ok"] is False
+    assert "mạng lỗi" in result["detail"]
+
+
+def test_check_provider_fptai_present_key_is_ok_without_network():
+    calls = []
+
+    def fake_request(*args, **kwargs):
+        calls.append(1)
+        return 200, b""
+
+    result = tts_providers.check_provider("fptai", api_key="k", http_request=fake_request)
+    assert result["ok"] is True
+    assert calls == []  # FPT.AI presence check must not hit the network

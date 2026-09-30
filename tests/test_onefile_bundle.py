@@ -70,6 +70,7 @@ def test_onefile_build_is_deterministic_and_resolves_placeholders() -> None:
         "movie_review_factory/media_qa.py",
         "movie_review_factory/handoff.py",
         "movie_review_factory/hook_crafter.py",
+        "movie_review_factory/licensing.py",
         "movie_review_factory/link_download.py",
         "movie_review_factory/localization.py",
         "movie_review_factory/media_store.py",

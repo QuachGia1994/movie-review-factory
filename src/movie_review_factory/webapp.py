@@ -36,7 +36,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 
-from . import analytics, audio_mix, branding, cancellation, copyright_bypass, creative_brief, editor_ops, hook_crafter, link_download, localization, mask_detection, midroll, pipeline, semantic_search, versions
+from . import analytics, audio_mix, branding, cancellation, copyright_bypass, creative_brief, editor_ops, hook_crafter, licensing, link_download, localization, mask_detection, midroll, pipeline, semantic_search, tts_providers, versions
 from .content_agent import _terminate_process_tree
 from .media_store import MediaStore
 from .creator_library import CreatorLibrary
@@ -1940,6 +1940,23 @@ class JobsService:
         pipeline._write_json(root, "midroll-draft.json", draft)
         return draft
 
+    def license_status(self) -> dict:
+        """Current machine's license state (ok / reason / machine fingerprint)."""
+        return licensing.current_status().as_dict()
+
+    def activate_license(self, license_text) -> dict:
+        """Verify a pasted license for this machine and persist it only if valid."""
+        return licensing.activate(str(license_text or "")).as_dict()
+
+    def check_tts_connection(self, provider: str, *, http_request=None) -> dict:
+        """Check a TTS provider's key/connection using its env key (no manifest)."""
+        provider = (provider or "").strip().lower() or "edge"
+        return tts_providers.check_provider(
+            provider,
+            api_key=tts_providers.provider_api_key(provider),
+            http_request=http_request,
+        )
+
     def agy_pool_status(self) -> dict:
         from .agy_vision import pool_status
         return pool_status()
@@ -2002,8 +2019,9 @@ class _Server(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
 
-    def __init__(self, address: tuple[str, int], service: JobsService):
+    def __init__(self, address: tuple[str, int], service: JobsService, *, require_license: bool = False):
         self.service = service
+        self.require_license = require_license
         super().__init__(address, MRFRequestHandler)
 
 
@@ -2013,6 +2031,12 @@ class MRFRequestHandler(BaseHTTPRequestHandler):
     @property
     def service(self) -> JobsService:
         return self.server.service  # type: ignore[attr-defined]
+
+    def _license_blocked(self) -> bool:
+        """True only when this server enforces licensing and no valid license exists."""
+        if not getattr(self.server, "require_license", False):
+            return False
+        return not self.service.license_status()["ok"]
 
     # -- low-level responders ------------------------------------------------
 
@@ -2177,7 +2201,7 @@ class MRFRequestHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         route = parsed.path
         if route in ("/", "/index.html"):
-            self._send_html(INDEX_HTML)
+            self._send_html(ACTIVATION_HTML if self._license_blocked() else INDEX_HTML)
             return
         if not self._check_auth():
             self._send_401()
@@ -2223,6 +2247,12 @@ class MRFRequestHandler(BaseHTTPRequestHandler):
     def _route_get(self, parts: list[str], query: dict[str, list[str]]) -> None:
         # parts: [] | ["jobs"] | ["jobs", id] | ["jobs", id, "artifacts"] |
         #        ["jobs", id, "artifacts", name] | ["jobs", id, "metadata"]
+        if parts == ["license"]:
+            self._send_json(200, self.service.license_status())
+            return
+        if self._license_blocked():
+            self._send_json(402, {"error": "license required", "error_vi": "cần kích hoạt license"})
+            return
         if parts == ["brand"]:
             self._send_json(200, {**branding.load_settings(self.service.jobs_root), "logo_url": "/api/brand/logo"})
             return
@@ -2234,6 +2264,9 @@ class MRFRequestHandler(BaseHTTPRequestHandler):
             return
         if parts == ["agy-pool"]:
             self._send_json(200, self.service.agy_pool_status())
+            return
+        if parts == ["tts", "test"]:
+            self._send_json(200, self.service.check_tts_connection((query.get("provider") or [""])[0]))
             return
         if parts == ["jobs"]:
             self._send_json(200, {"jobs": self.service.list_jobs()})
@@ -2352,6 +2385,12 @@ class MRFRequestHandler(BaseHTTPRequestHandler):
         self._send_json(404, {"error": "not found", "error_vi": "không tìm thấy"})
 
     def _route_post(self, parts: list[str]) -> None:
+        if parts == ["license", "activate"]:
+            self._send_json(200, self.service.activate_license(self._read_body().get("license")))
+            return
+        if self._license_blocked():
+            self._send_json(402, {"error": "license required", "error_vi": "cần kích hoạt license"})
+            return
         if parts == ["brand"]:
             name = self._read_body().get("name")
             self._send_json(200, branding.save_name(self.service.jobs_root, name))
@@ -2561,13 +2600,13 @@ class MRFRequestHandler(BaseHTTPRequestHandler):
 
 
 def create_server(host: str = "127.0.0.1", port: int = 8765,
-                  jobs_root: Path | str = "jobs") -> _Server:
+                  jobs_root: Path | str = "jobs", *, require_license: bool = False) -> _Server:
     """Build (but do not start) the local web server."""
-    return _Server((host, port), JobsService(Path(jobs_root)))
+    return _Server((host, port), JobsService(Path(jobs_root)), require_license=require_license)
 
 
 def run_server(host: str = "127.0.0.1", port: int = 8765,
-               jobs_root: Path | str = "jobs") -> None:
+               jobs_root: Path | str = "jobs", *, require_license: bool = False) -> None:
     """Start the local web server and serve until interrupted."""
     # The dashboard's operator-facing strings are Vietnamese; force UTF-8 on the
     # console streams so a legacy Windows code page (e.g. cp1258) cannot raise
@@ -2577,7 +2616,7 @@ def run_server(host: str = "127.0.0.1", port: int = 8765,
             stream.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[attr-defined]
         except (AttributeError, ValueError):
             pass
-    server = create_server(host, port, jobs_root)
+    server = create_server(host, port, jobs_root, require_license=require_license)
     bound_host, bound_port = server.server_address[:2]
     print(f"Movie Review Factory UI: http://{bound_host}:{bound_port}  (jobs: {Path(jobs_root)})")
     print("Press Ctrl+C to stop.")
@@ -2591,6 +2630,66 @@ def run_server(host: str = "127.0.0.1", port: int = 8765,
 
 # --- single-page UI ----------------------------------------------------------
 # Vanilla HTML + JS (no framework, no build step). Kept as one inline document so the whole UI ships with the package and needs no static-file plumbing.
+
+ACTIVATION_HTML = """<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Kích hoạt — Xưởng Review Phim</title>
+<style>
+  body { margin:0; font-family: system-ui, "Segoe UI", Roboto, sans-serif; background:#0f1115; color:#e6e8ee;
+         display:flex; min-height:100vh; align-items:center; justify-content:center; }
+  .box { width:min(560px, 92vw); background:#171a21; border:1px solid #262b36; border-radius:12px; padding:24px; }
+  h1 { font-size:18px; margin:0 0 6px; }
+  p { color:#9aa3b2; font-size:13px; line-height:1.5; }
+  code { background:#0f1115; border:1px solid #262b36; border-radius:6px; padding:2px 6px; word-break:break-all; color:#e6e8ee; }
+  textarea { width:100%; min-height:90px; margin-top:10px; background:#0f1115; color:#e6e8ee;
+             border:1px solid #262b36; border-radius:8px; padding:10px; font:inherit; }
+  button { margin-top:12px; padding:9px 16px; border-radius:8px; border:1px solid #338ef7;
+           background:#338ef7; color:#fff; cursor:pointer; }
+  .msg { margin-top:10px; font-size:13px; min-height:18px; }
+</style>
+</head>
+<body>
+  <div class="box">
+    <h1>Cần kích hoạt bản quyền</h1>
+    <p id="reason">Phần mềm chưa được kích hoạt trên máy này.</p>
+    <p style="margin-top:8px">Mã máy (gửi cho nhà cung cấp để lấy license key):</p>
+    <p><code id="machine">…</code></p>
+    <label for="key" style="display:block;color:#9aa3b2;font-size:12px;margin-top:12px">Dán license key:</label>
+    <textarea id="key" placeholder="dán chuỗi license tại đây"></textarea>
+    <button id="activate" type="button">Kích hoạt</button>
+    <div class="msg" id="msg" role="status"></div>
+  </div>
+<script>
+  const $ = (id) => document.getElementById(id);
+  async function loadStatus() {
+    try {
+      const res = await fetch('/api/license');
+      const data = await res.json();
+      $('machine').textContent = data.machine || '(không đọc được)';
+      if (data.reason) $('reason').textContent = data.reason;
+    } catch (error) { $('msg').textContent = error.message; }
+  }
+  $('activate').onclick = async () => {
+    $('msg').textContent = 'Đang kiểm tra…';
+    try {
+      const res = await fetch('/api/license/activate', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({license: $('key').value.trim()}),
+      });
+      const data = await res.json();
+      if (data.ok) { $('msg').textContent = 'Đã kích hoạt. Đang mở…'; setTimeout(() => location.reload(), 700); }
+      else { $('msg').textContent = '✗ ' + (data.reason || data.error_vi || 'License không hợp lệ'); }
+    } catch (error) { $('msg').textContent = error.message; }
+  };
+  loadStatus();
+</script>
+</body>
+</html>
+"""
+
 
 INDEX_HTML = """<!DOCTYPE html>
 <html lang="vi">
@@ -2734,7 +2833,7 @@ INDEX_HTML = """<!DOCTYPE html>
   .media-tabs { display: flex; gap: 4px; margin-top: 10px; padding: 3px; border-radius: 9px; background: #0d1017; }
   .media-tab { flex: 1; padding: 6px 8px; border: 0; background: transparent; color: var(--text-dim); font-size: 12px; }
   .media-tab[aria-selected="true"] { color: #fff; background: #2a3242; box-shadow: 0 1px 3px rgba(0,0,0,.3); }
-  .media-list { display: grid; align-content: start; gap: 6px; padding: 10px; max-height: 620px; overflow-y: auto; overscroll-behavior: contain; scroll-behavior: smooth; }
+  .media-list { display: grid; align-content: start; gap: 6px; padding: 10px; flex: 1 1 auto; min-height: 0; overflow-y: auto; overscroll-behavior: contain; scroll-behavior: smooth; }
   .media-result { position: relative; display: grid; grid-template-columns: 116px minmax(0, 1fr); gap: 10px; align-items: start; border: 1px solid transparent; border-radius: 10px; padding: 9px; background: transparent; transition: border-color .15s, background .15s, transform .15s; }
   .media-result:hover { border-color: var(--line); background: #191e29; }
   .media-result.transcript-result { grid-template-columns: 1fr; cursor: pointer; }
@@ -2781,7 +2880,7 @@ INDEX_HTML = """<!DOCTYPE html>
   .media-topbar { padding: 9px 12px; }
   .player-pane { padding: 10px; }
   .source-frame video { max-height: 52dvh; }
-  .media-list { max-height: min(62dvh, 650px); }
+  @media (max-width: 1100px) { .media-list { max-height: min(62dvh, 650px); } }
   #view-review-form { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 320px), 1fr)); gap: 10px; align-items: start; }
   #view-review-form .card { min-width: 0; }
   @media (max-width: 820px) {
@@ -3082,7 +3181,7 @@ INDEX_HTML = """<!DOCTYPE html>
 </script>
 <div class="layout dashboard-shell">
   <aside class="top-toolbar" aria-label="Công cụ project">
-    <details class="card project-panel" id="projectPanel">
+    <details class="card project-panel" id="projectPanel" hidden>
       <summary>
         <span class="project-summary-prefix">Project</span>
         <strong id="projectSummaryLabel" class="project-label">Chưa chọn</strong>
@@ -3096,7 +3195,7 @@ INDEX_HTML = """<!DOCTYPE html>
         <div id="jobList" class="project-list" aria-live="polite">Đang tải…</div>
       </div>
     </details>
-    <button id="openCreateProject" class="primary toolbar-action" type="button">＋ Tạo project</button>
+    <button id="openCreateProject" class="primary toolbar-action" type="button" hidden>＋ Tạo project</button>
     <button id="openLibraryHub" class="toolbar-action" type="button">Thư viện</button>
     <button id="openBrandSettings" class="toolbar-action" type="button">Thương hiệu</button>
   </aside>
@@ -3190,6 +3289,10 @@ INDEX_HTML = """<!DOCTYPE html>
               <option value="EXAVITQu4vr4xnSDxMaL">ElevenLabs · Bella</option>
             </datalist>
             <p class="muted">Bỏ trống để dùng giọng mặc định. API key đặt qua biến môi trường, không lưu vào project.</p>
+            <div class="tts-check" style="margin-top:6px; display:flex; gap:8px; align-items:center; flex-wrap:wrap">
+              <button id="ttsTestBtn" type="button">Kiểm tra kết nối</button>
+              <span id="ttsTestMsg" class="muted" role="status"></span>
+            </div>
             <label>Che dải watermark phía trên (0–20% chiều cao)</label>
             <input name="brand_top_band" type="number" value="0" min="0" max="0.2" step="0.01">
             <label>Che dải tiêu đề cũ phía dưới (0–20% chiều cao)</label>
@@ -3322,7 +3425,7 @@ INDEX_HTML = """<!DOCTYPE html>
         <button id="emptyProjectsBtn" type="button" hidden>Mở project có sẵn</button>
       </div>
       <div class="empty-help">Sau khi tạo, project mở thẳng vào workspace và giữ toàn bộ tiến trình ở một nơi.</div>
-      <details id="batchPanel" style="margin-top:14px; text-align:left; width:100%; max-width:640px">
+      <details id="batchPanel" open style="margin-top:14px; text-align:left; width:100%; max-width:640px">
         <summary style="cursor:pointer; font-weight:600">Hàng đợi hàng loạt (chạy qua đêm)</summary>
         <p class="muted">Dán nhiều link, mỗi dòng một link. Hệ thống tải và dựng tuần tự tới bước duyệt kịch bản cho từng video; lỗi một video sẽ bỏ qua và chạy tiếp. Xong vào từng project bấm duyệt.</p>
         <textarea id="batchLinks" rows="5" style="width:100%" placeholder="https://..."></textarea>
@@ -3389,7 +3492,7 @@ INDEX_HTML = """<!DOCTYPE html>
             <button id="shortMarkStart" type="button">Lấy mốc đầu từ video</button>
             <button id="shortMarkEnd" type="button">Lấy mốc cuối từ video</button>
           </div>
-          <div class="row">
+          <div class="row" style="margin-top:12px; gap:8px">
             <button id="shortExportBtn" type="button">Xuất video ngắn</button>
             <a id="shortDownload" hidden download="short-review.mp4">Tải MP4 9:16</a>
             <a id="shortSrtDownload" hidden download="short-review.srt">Tải phụ đề SRT</a>
@@ -3623,7 +3726,7 @@ INDEX_HTML = """<!DOCTYPE html>
           <label>Bôi đen đoạn cần gắn nhãn</label><textarea id="tagNarration" rows="4" readonly></textarea>
           <div class="row"><select id="tagKind"><option value="plot_recap">Kể lại tình tiết</option><option value="opinion">Nhận xét riêng</option></select>
           <input id="tagEvidence" placeholder="scene:1 hoặc transcript:2"></div>
-          <button id="tagScriptBtn" type="button" disabled>Gắn nhãn đoạn đã chọn</button>
+          <button id="tagScriptBtn" type="button" disabled style="margin-top:10px">Gắn nhãn đoạn đã chọn</button>
           <div class="muted">Mốc chỉ xác nhận nguồn có tồn tại; người làm review cần đối chiếu nội dung.</div>
           <div id="tagScriptMsg" class="notice" role="status"></div>
         </details>
@@ -3814,6 +3917,18 @@ async function loadBrand() {
   $('brandPreviewName').textContent = brand.name;
   $('brandPreview').src = brand.logo_url + '?v=' + Date.now();
 }
+$('ttsTestBtn').onclick = async () => {
+  const select = document.querySelector('#createForm select[name="tts_provider"]');
+  const provider = select ? select.value : 'edge';
+  const msg = $('ttsTestMsg');
+  msg.textContent = 'Đang kiểm tra…';
+  try {
+    const data = await api('GET', '/api/tts/test?provider=' + encodeURIComponent(provider));
+    msg.textContent = (data.ok ? '✓ ' : '✗ ') + (data.detail || (data.ok ? 'OK' : 'Không kết nối được'));
+  } catch (error) {
+    msg.textContent = '✗ ' + error.message;
+  }
+};
 $('saveBrandName').onclick = async () => {
   try {
     const brand = await api('POST', '/api/brand', {name: $('brandName').value});
@@ -4916,6 +5031,8 @@ function selectJob(id) {
   current = id;
   $('empty').style.display = 'none';
   $('detail').style.display = '';
+  $('projectPanel').hidden = false;
+  $('openCreateProject').hidden = false;
   $('video').removeAttribute('src');
   delete $('video').dataset.src;
   $('video').load();
@@ -5049,7 +5166,7 @@ $('closeCreateProject').onclick = () => closeToolDialog('createPanel');
 $('closeBrandSettings').onclick = () => closeToolDialog('brandPanel');
 $('closeLibraryHub').onclick = () => closeToolDialog('libraryPanel');
 $('emptyCreateBtn').onclick = () => openToolDialog('createPanel');
-$('emptyProjectsBtn').onclick = () => { $('projectPanel').open = true; };
+$('emptyProjectsBtn').onclick = () => { $('projectPanel').hidden = false; $('projectPanel').open = true; };
 
 const projectPanel = $('projectPanel');
 document.addEventListener('pointerdown', (event) => {
@@ -5486,7 +5603,7 @@ $('deleteForm').onsubmit = async event => {
       clearThumbnailObjectUrls(); clearMediaObjectUrls();
       $('sourceVideo').removeAttribute('src'); $('sourceVideo').load();
       $('video').removeAttribute('src'); delete $('video').dataset.src; $('video').load();
-      $('detail').style.display = 'none'; $('empty').style.display = '';
+      $('detail').style.display = 'none'; $('empty').style.display = ''; $('projectPanel').hidden = true; $('openCreateProject').hidden = true;
       $('projectPanel').open = false;
       $('projectSummaryLabel').textContent = 'Chọn project';
     }

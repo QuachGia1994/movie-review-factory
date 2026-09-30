@@ -61,6 +61,85 @@ def test_status_voice_is_none_without_voice_json(tmp_path):
     assert JobsService(tmp_path).status("demo")["voice"] is None
 
 
+def test_check_tts_connection_edge_needs_no_key(tmp_path):
+    result = JobsService(tmp_path).check_tts_connection("edge")
+    assert result["provider"] == "edge"
+    assert result["ok"] is True
+
+
+def test_check_tts_connection_missing_key_is_not_ok(monkeypatch, tmp_path):
+    monkeypatch.delenv("MRF_ELEVENLABS_API_KEY", raising=False)
+    result = JobsService(tmp_path).check_tts_connection("elevenlabs")
+    assert result["ok"] is False
+    assert "MRF_ELEVENLABS_API_KEY" in result["detail"]
+
+
+def test_check_tts_connection_reads_env_key_and_uses_injected_transport(monkeypatch, tmp_path):
+    monkeypatch.setenv("MRF_ELEVENLABS_API_KEY", "secret")
+    seen = {}
+
+    def fake_request(url, *, method="GET", headers=None, data=None, timeout=60.0):
+        seen["key"] = (headers or {}).get("xi-api-key")
+        return 200, b'{"character_count": 0, "character_limit": 5000}'
+
+    result = JobsService(tmp_path).check_tts_connection("elevenlabs", http_request=fake_request)
+    assert result["ok"] is True
+    assert seen["key"] == "secret"
+
+
+def test_license_status_and_activate_via_service(monkeypatch, tmp_path):
+    from movie_review_factory import licensing
+
+    private, public = licensing.generate_keypair()
+    monkeypatch.setattr(licensing, "LICENSE_PUBLIC_KEY_B64", licensing.b64encode(public))
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+    monkeypatch.delenv(licensing.LICENSE_ENV, raising=False)
+    svc = JobsService(tmp_path)
+    assert svc.license_status()["ok"] is False
+    fingerprint = svc.license_status()["machine"]
+    payload = licensing.build_payload(machine=fingerprint, name="Svc")
+    key = licensing.encode_license(payload, licensing.ed25519_sign(private, licensing.payload_bytes(payload)))
+    assert svc.activate_license(key)["ok"] is True
+    assert svc.license_status()["ok"] is True
+
+
+def test_require_license_gate_blocks_then_activation_opens(monkeypatch, tmp_path):
+    from movie_review_factory import licensing
+
+    private, public = licensing.generate_keypair()
+    monkeypatch.setattr(licensing, "LICENSE_PUBLIC_KEY_B64", licensing.b64encode(public))
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+    monkeypatch.delenv(licensing.LICENSE_ENV, raising=False)
+
+    server = create_server("127.0.0.1", 0, tmp_path, require_license=True)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_address[1]}"
+    try:
+        with urllib.request.urlopen(base + "/", timeout=5) as resp:
+            assert "Cần kích hoạt" in resp.read().decode("utf-8")
+        with pytest.raises(urllib.error.HTTPError) as blocked:
+            urllib.request.urlopen(base + "/api/jobs", timeout=5)
+        assert blocked.value.code == 402
+        fingerprint = licensing.machine_fingerprint()
+        payload = licensing.build_payload(machine=fingerprint, name="UI")
+        key = licensing.encode_license(payload, licensing.ed25519_sign(private, licensing.payload_bytes(payload)))
+        activate = urllib.request.Request(
+            base + "/api/license/activate", method="POST",
+            data=json.dumps({"license": key}).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(activate, timeout=5) as resp:
+            assert json.loads(resp.read())["ok"] is True
+        with urllib.request.urlopen(base + "/api/jobs", timeout=5) as resp:
+            assert "jobs" in json.loads(resp.read())
+        with urllib.request.urlopen(base + "/", timeout=5) as resp:
+            assert "Bảng điều khiển" in resp.read().decode("utf-8")
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
 def test_module_main_entry_exposes_cli_app():
     import movie_review_factory.__main__ as entry
     from movie_review_factory.cli import app as cli_app

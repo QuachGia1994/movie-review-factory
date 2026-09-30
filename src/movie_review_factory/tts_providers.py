@@ -37,6 +37,7 @@ DEFAULT_VOICE = {"fptai": "banmai", "elevenlabs": "21m00Tcm4TlvDq8ikWAM"}
 
 FPTAI_TTS_URL = "https://api.fpt.ai/hmi/tts/v5"
 ELEVENLABS_TTS_URL = "https://api.elevenlabs.io/v1/text-to-speech/{voice}"
+ELEVENLABS_SUBSCRIPTION_URL = "https://api.elevenlabs.io/v1/user/subscription"
 ELEVENLABS_MODEL = "eleven_multilingual_v2"
 
 
@@ -198,3 +199,55 @@ def build_synthesize(
         return estimate_word_boundaries(text, duration)
 
     return synthesize
+
+
+def check_provider(
+    provider: str,
+    *,
+    api_key: str | None = None,
+    http_request: Callable | None = None,
+    timeout: float = 15.0,
+) -> dict:
+    """Cheaply check a provider's key/connectivity without spending synthesis credits.
+
+    Returns ``{"provider", "ok", "detail"}`` and never raises for an ordinary failure
+    (a transport or auth error is reported as ``ok=False`` so the UI can show it).
+    - ``edge``: no key required.
+    - ``elevenlabs``: GET the subscription endpoint - validates the key and reports the
+      remaining character quota at zero synthesis cost.
+    - ``fptai``: no free balance endpoint exists, so only key presence is verified; a
+      real (billable) synthesis probe is intentionally not run here.
+    """
+    provider = (provider or "").strip().lower()
+    if provider not in SUPPORTED_PROVIDERS:
+        return {"provider": provider, "ok": False,
+                "detail": f"Nhà cung cấp không hỗ trợ (chọn {', '.join(SUPPORTED_PROVIDERS)})."}
+    if provider == "edge":
+        return {"provider": provider, "ok": True, "detail": "Edge-TTS miễn phí, không cần API key."}
+    if not api_key:
+        return {"provider": provider, "ok": False, "detail": missing_key_message(provider)}
+    if provider == "fptai":
+        return {"provider": provider, "ok": True,
+                "detail": "Đã có API key. FPT.AI không có endpoint kiểm tra số dư miễn phí, "
+                          "nên chỉ xác nhận key tồn tại (chưa gọi tổng hợp tính phí)."}
+    request = http_request or _http_request
+    try:
+        status, payload = request(
+            ELEVENLABS_SUBSCRIPTION_URL, method="GET",
+            headers={"xi-api-key": api_key, "accept": "application/json"}, timeout=timeout,
+        )
+    except TTSProviderError as exc:
+        return {"provider": provider, "ok": False, "detail": str(exc)}
+    if status in (401, 403):
+        return {"provider": provider, "ok": False, "detail": f"API key không hợp lệ (HTTP {status})."}
+    if status != 200 or not payload:
+        return {"provider": provider, "ok": False, "detail": f"ElevenLabs trả về HTTP {status}."}
+    try:
+        info = json.loads(payload.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        info = {}
+    used = int(info.get("character_count") or 0)
+    limit = int(info.get("character_limit") or 0)
+    remaining = max(0, limit - used)
+    return {"provider": provider, "ok": True,
+            "detail": f"Kết nối OK. Còn {remaining:,}/{limit:,} ký tự trong hạn mức."}

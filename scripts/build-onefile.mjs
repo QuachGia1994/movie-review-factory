@@ -27,6 +27,7 @@ const runtimeFiles = [
   "media_qa.py",
   "handoff.py",
   "hook_crafter.py",
+  "licensing.py",
   "link_download.py",
   "localization.py",
   "media_store.py",

@@ -186,8 +186,15 @@ def serve(
     stdlib-only server. Binds to localhost by default.
     """
     from .webapp import run_server
+    from . import licensing
 
-    run_server(host=host, port=port, jobs_root=jobs_root)
+    status = licensing.current_status()
+    if not status.ok:
+        typer.echo(f"[license] Chưa kích hoạt: {status.reason}")
+        typer.echo(f"[license] Mã máy (gửi cho nhà cung cấp để lấy key): {status.machine}")
+        typer.echo(f"[license] Mở http://{host}:{port} và dán license key để kích hoạt.")
+
+    run_server(host=host, port=port, jobs_root=jobs_root, require_license=True)
 
 
 @app.command("approve-script")
