@@ -85,14 +85,15 @@ class MediaStore:
     def add_transcript_segment(self, segment: TranscriptSegment) -> TranscriptSegment:
         cursor = self.connection.execute(
             "INSERT INTO transcript_segments("
-            "media_asset_id, start_seconds, end_seconds, text, speaker"
-            ") VALUES (?, ?, ?, ?, ?)",
+            "media_asset_id, start_seconds, end_seconds, text, speaker, words"
+            ") VALUES (?, ?, ?, ?, ?, ?)",
             (
                 segment.media_asset_id,
                 segment.start_seconds,
                 segment.end_seconds,
                 segment.text,
                 segment.speaker,
+                json.dumps([word.model_dump() for word in segment.words]),
             ),
         )
         self.connection.commit()
@@ -132,8 +133,14 @@ class MediaStore:
                 ((asset_id, shot.start_seconds, shot.end_seconds, shot.label) for shot in shots),
             )
             self.connection.executemany(
-                "INSERT INTO transcript_segments(media_asset_id, start_seconds, end_seconds, text, speaker) VALUES (?, ?, ?, ?, ?)",
-                ((asset_id, segment.start_seconds, segment.end_seconds, segment.text, segment.speaker) for segment in segments),
+                "INSERT INTO transcript_segments(media_asset_id, start_seconds, end_seconds, text, speaker, words) VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    (
+                        asset_id, segment.start_seconds, segment.end_seconds, segment.text,
+                        segment.speaker, json.dumps([word.model_dump() for word in segment.words]),
+                    )
+                    for segment in segments
+                ),
             )
         return asset.model_copy(update={"id": asset_id})
 
@@ -606,10 +613,19 @@ class MediaStore:
             "relations": relations,
         }
 
+    @staticmethod
+    def _segment_from_row(row: sqlite3.Row) -> TranscriptSegment:
+        """Build a TranscriptSegment from a row, decoding the JSON words column."""
+        data = dict(row)
+        raw = data.get("words")
+        if isinstance(raw, str):
+            data["words"] = json.loads(raw) if raw else []
+        return TranscriptSegment.model_validate(data)
+
     def transcript_for_shot(self, shot_id: int) -> list[TranscriptSegment]:
         rows = self.connection.execute(
             "SELECT t.id, t.media_asset_id, t.start_seconds, t.end_seconds, "
-            "t.text, t.speaker "
+            "t.text, t.speaker, t.words "
             "FROM shots AS s JOIN transcript_segments AS t "
             "ON t.media_asset_id = s.media_asset_id "
             "AND t.start_seconds < s.end_seconds "
@@ -617,21 +633,21 @@ class MediaStore:
             "WHERE s.id = ? ORDER BY t.start_seconds, t.id",
             (shot_id,),
         )
-        return [TranscriptSegment.model_validate(dict(row)) for row in rows]
+        return [self._segment_from_row(row) for row in rows]
 
     def get_transcript_segment(self, segment_id: int) -> TranscriptSegment | None:
         row = self.connection.execute(
-            "SELECT id, media_asset_id, start_seconds, end_seconds, text, speaker "
+            "SELECT id, media_asset_id, start_seconds, end_seconds, text, speaker, words "
             "FROM transcript_segments WHERE id = ?",
             (segment_id,),
         ).fetchone()
-        return TranscriptSegment.model_validate(dict(row)) if row else None
+        return self._segment_from_row(row) if row else None
 
     def list_transcript(
         self, media_asset_id: int | None = None
     ) -> list[TranscriptSegment]:
         sql = (
-            "SELECT id, media_asset_id, start_seconds, end_seconds, text, speaker "
+            "SELECT id, media_asset_id, start_seconds, end_seconds, text, speaker, words "
             "FROM transcript_segments"
         )
         params: tuple[object, ...] = ()
@@ -640,14 +656,14 @@ class MediaStore:
             params = (media_asset_id,)
         sql += " ORDER BY start_seconds, id"
         rows = self.connection.execute(sql, params)
-        return [TranscriptSegment.model_validate(dict(row)) for row in rows]
+        return [self._segment_from_row(row) for row in rows]
 
     def search_transcript(
         self, query: str, media_asset_id: int | None = None
     ) -> list[TranscriptSegment]:
         sql = (
             "SELECT t.id, t.media_asset_id, t.start_seconds, t.end_seconds, "
-            "t.text, t.speaker FROM transcript_segments_fts AS f "
+            "t.text, t.speaker, t.words FROM transcript_segments_fts AS f "
             "JOIN transcript_segments AS t ON t.id = f.rowid "
             "WHERE transcript_segments_fts MATCH ?"
         )
@@ -658,4 +674,4 @@ class MediaStore:
             params.append(media_asset_id)
         sql += " ORDER BY rank, t.start_seconds, t.id"
         rows = self.connection.execute(sql, params)
-        return [TranscriptSegment.model_validate(dict(row)) for row in rows]
+        return [self._segment_from_row(row) for row in rows]

@@ -47,7 +47,7 @@ def test_migrations_are_idempotent_and_foreign_keys_are_enforced() -> None:
         versions = store.connection.execute(
             "SELECT version FROM schema_migrations ORDER BY version"
         ).fetchall()
-        assert [row[0] for row in versions] == [1, 2, 3, 4, 5, 6]
+        assert [row[0] for row in versions] == [1, 2, 3, 4, 5, 6, 7]
         assert store.connection.execute("PRAGMA foreign_keys").fetchone()[0] == 1
 
         with pytest.raises(sqlite3.IntegrityError):
@@ -96,7 +96,7 @@ def test_migration_006_applies_to_existing_and_fresh_databases(tmp_path: Path) -
         versions = store.connection.execute(
             "SELECT version FROM schema_migrations ORDER BY version"
         ).fetchall()
-        assert [row[0] for row in versions] == [1, 2, 3, 4, 5, 6]
+        assert [row[0] for row in versions] == [1, 2, 3, 4, 5, 6, 7]
         assert {"content_hash", "embed_version"} <= _embedding_columns(
             store, "shot_embeddings"
         )
@@ -121,7 +121,7 @@ def test_migration_006_applies_to_existing_and_fresh_databases(tmp_path: Path) -
         versions = store.connection.execute(
             "SELECT version FROM schema_migrations ORDER BY version"
         ).fetchall()
-        assert [row[0] for row in versions] == [1, 2, 3, 4, 5, 6]
+        assert [row[0] for row in versions] == [1, 2, 3, 4, 5, 6, 7]
         assert {"content_hash", "embed_version"} <= _embedding_columns(
             store, "shot_embeddings"
         )

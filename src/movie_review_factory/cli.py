@@ -3,7 +3,7 @@ from typing import Optional
 
 import typer
 
-from .models import JobConfig
+from .models import JobConfig, WatermarkDetect, WatermarkRemoval
 from .pipeline import (
     approve_metadata,
     approve_script,
@@ -30,7 +30,27 @@ def init_job(
         "scaffold",
         help="Content generator for research/outline/script: scaffold, claude, or agy.",
     ),
+    watermark_detect: Optional[str] = typer.Option(
+        None,
+        "--watermark-detect",
+        help="Auto-detect & remove a full-frame watermark: color, temporal, or external.",
+    ),
+    detector_cmd: Optional[str] = typer.Option(
+        None,
+        "--detector-cmd",
+        help="External detector command (with {video}/{out}) for --watermark-detect external; "
+             "falls back to MRF_MASK_DETECTOR_CMD when omitted.",
+    ),
 ):
+    watermark_removal = WatermarkRemoval()
+    if watermark_detect is not None:
+        method = watermark_detect.strip().lower()
+        if method not in ("color", "temporal", "external"):
+            raise typer.BadParameter("watermark-detect must be color, temporal, or external")
+        watermark_removal = WatermarkRemoval(
+            enabled=True,
+            detect=WatermarkDetect(method=method, external_cmd=(detector_cmd or "").strip()),
+        )
     config = JobConfig(
         job_id=path.name,
         language=language,
@@ -39,8 +59,29 @@ def init_job(
         source_video=source_video,
         movie_title=movie_title,
         content_agent=content_agent,
+        watermark_removal=watermark_removal,
     )
     typer.echo(f"created {create_job(path, config)}")
+
+
+@app.command("probe-detector")
+def probe_detector_cmd(
+    video: Path,
+    detector_cmd: Optional[str] = typer.Option(
+        None,
+        "--detector-cmd",
+        help="External detector command (with {video}/{out}); falls back to MRF_MASK_DETECTOR_CMD.",
+    ),
+    timeout: float = typer.Option(120, "--timeout", help="Seconds to wait for the detector."),
+):
+    """Run the external watermark detector on a single frame to validate it."""
+    from .mask_detection import DetectSettings, probe_external_detector
+
+    settings = DetectSettings(method="external", external_cmd=(detector_cmd or "").strip())
+    probe = probe_external_detector(video, settings, timeout=timeout)
+    typer.echo(probe.message)
+    if not probe.ok:
+        raise typer.Exit(1)
 
 
 @app.command("validate-job")

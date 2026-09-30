@@ -10,14 +10,14 @@ import time
 from pathlib import Path
 from typing import Callable, Iterator
 
-from . import agy_vision, branding, cancellation, scene_scoring, semantic_search
+from . import agy_vision, branding, cancellation, copyright_bypass, mask_detection, scene_scoring, semantic_search, visual_rhythm, watermark_removal
 from .agy_agent import run_agy_json
 from .content_agent import run_claude_json
 from .creative_brief import prompt_creative_brief, script_evidence_issues, stale_script_tags
 from .media_store import MediaStore
 from .models import Artifact, JobConfig, JobManifest, MediaAsset, Shot, StageResult, TranscriptSegment, VisualObservation
 
-STAGES = ("ingest","research","transcript","scenes","outline","script","scene_plan","tts","alignment","render","qa","metadata","thumbnail","publish")
+STAGES = ("ingest","watermark","research","transcript","scenes","outline","script","scene_plan","tts","alignment","render","qa","metadata","thumbnail","publish")
 
 MANIFEST_NAME = "manifest.json"
 MANIFEST_RETRY_ATTEMPTS = 10
@@ -30,10 +30,12 @@ _KNOWN_ARTIFACTS = (
     "youtube_metadata.json", "thumbnails.json", "thumbnail.jpg",
     "thumbnail-1.jpg", "thumbnail-2.jpg", "thumbnail-3.jpg",
     "media_index.sqlite3", "publish_record.json",
+    "source_clean.mp4", "watermark.json",
 )
 
 _STAGE_ARTIFACTS = {
     "ingest": ("ingest.json",),
+    "watermark": ("source_clean.mp4", "watermark.json"),
     "research": ("research.json",),
     "transcript": ("transcript.json", "captions.srt"),
     "scenes": ("scenes.json", "media_index.sqlite3"),
@@ -79,8 +81,12 @@ def load_manifest(root: Path) -> JobManifest:
         try:
             manifest = JobManifest.model_validate_json(path.read_text(encoding="utf-8"))
             actual = [stage.stage for stage in manifest.stages]
-            legacy_without_thumbnail = [name for name in STAGES if name != "thumbnail"]
-            if actual == legacy_without_thumbnail:
+            # Reconcile older manifests when stages are added/reordered (e.g. the
+            # optional "watermark" stage): keep every known stage's status and
+            # insert any missing stage as pending, in canonical STAGES order.
+            # Only reconcile when all present stages are known, so a genuinely
+            # corrupt manifest is still surfaced by validate_job().
+            if actual != list(STAGES) and all(name in STAGES for name in actual):
                 existing = {stage.stage: stage for stage in manifest.stages}
                 manifest.stages = [
                     existing.get(name, StageResult(stage=name, status="pending"))
@@ -255,6 +261,116 @@ def _ingest(root: Path, manifest: JobManifest) -> tuple[list[Artifact], str]:
     return [_write_json(root, "ingest.json", data)], "probed source video with ffprobe"
 
 
+def _source_video(root: Path, cfg: JobConfig) -> Path:
+    """Resolve the source video, preferring a watermark-cleaned copy if present.
+
+    The optional ``watermark`` stage writes ``source_clean.mp4``; when it exists
+    every downstream stage (scenes, render) reads it instead of the original so
+    the full-frame watermark never reaches the finished review.
+    """
+    clean = root / "source_clean.mp4"
+    if clean.exists():
+        return clean
+    return Path(cfg.source_video)
+
+
+def _band_or_box_mask(root: Path, cfg: JobConfig) -> Path | None:
+    """Generate a rectangular mask from boxes or top/bottom bands.
+
+    Uses the frame size recorded by the ingest stage; returns None when neither
+    a box nor a band is configured (or the frame size is unknown).
+    """
+    wm = cfg.watermark_removal
+    ingest = _read_json(root, "ingest.json")
+    width, height = ingest.get("width"), ingest.get("height")
+    if not width or not height:
+        return None
+    out = root / "watermark_mask.png"
+    if wm.boxes:
+        return watermark_removal.rect_mask_from_boxes(int(width), int(height), wm.boxes, out)
+    if wm.top_band or wm.bottom_band:
+        return watermark_removal.rect_mask_from_bands(
+            int(width), int(height), out,
+            top_fraction=wm.top_band, bottom_fraction=wm.bottom_band,
+        )
+    return None
+
+
+def _resolve_watermark_mask(root: Path, cfg: JobConfig, src: Path) -> Path | None:
+    """Resolve a mask for the watermark region.
+
+    Order: an explicit ``mask`` (single image or per-frame folder), then an
+    auto-detected per-frame mask folder (``detect``), then a generated
+    rectangular mask from boxes/bands. Raises SkipStage only when a detector is
+    unavailable (so the job still runs); other detector failures propagate.
+    """
+    wm = cfg.watermark_removal
+    if wm.mask:
+        explicit = Path(wm.mask)
+        return explicit if explicit.exists() else None
+    if wm.detect:
+        color = tuple(wm.detect.color[:3]) if len(wm.detect.color) >= 3 else (255, 255, 255)
+        settings = mask_detection.DetectSettings(
+            method=wm.detect.method,
+            target_rgb=color,
+            tolerance=wm.detect.tolerance,
+            dilation=wm.detect.dilation,
+            threshold=wm.detect.threshold,
+            fps=wm.detect.fps or None,
+            external_cmd=wm.detect.external_cmd,
+        )
+        try:
+            return mask_detection.generate_frame_masks(src, root / "watermark_masks", settings)
+        except mask_detection.MaskDetectorUnavailable as exc:
+            raise SkipStage(str(exc))
+    return _band_or_box_mask(root, cfg)
+
+
+# --- watermark: optional full-frame watermark removal via ProPainter --------
+
+@register_stage("watermark")
+def _watermark(root: Path, manifest: JobManifest) -> tuple[list[Artifact], str]:
+    """Reconstruct a watermark-free source video with ProPainter (optional).
+
+    Self-skips unless ``watermark_removal.enabled`` is set, a mask/band/box is
+    configured, and ProPainter is installed (``MRF_PROPAINTER_DIR``), so a job
+    without the model still runs cleanly.
+    """
+    cfg = manifest.config
+    wm = cfg.watermark_removal
+    if not wm.enabled:
+        raise SkipStage("watermark removal disabled - set watermark_removal.enabled to clean full-frame watermarks")
+    if not cfg.source_video:
+        raise SkipStage("no source_video set - provide one to clean")
+    src = Path(cfg.source_video)
+    if not src.exists():
+        raise SkipStage(f"source_video not found: {src}")
+    mask = _resolve_watermark_mask(root, cfg, src)
+    if mask is None:
+        raise SkipStage("no watermark mask configured - set watermark_removal.mask, detect, boxes, or a band")
+    try:
+        pp_config = watermark_removal.resolve_config()
+    except watermark_removal.ProPainterUnavailable as exc:
+        raise SkipStage(str(exc))
+    output = root / "source_clean.mp4"
+    watermark_removal.remove_watermark(src, mask, output, pp_config)
+    per_frame = watermark_removal.frame_mask_paths(mask) if mask.is_dir() else []
+    data = {
+        "job_id": cfg.job_id,
+        "source_video": str(src),
+        "clean_video": output.name,
+        "mask": str(mask),
+        "mask_kind": "per-frame" if mask.is_dir() else "static",
+        "mask_frames": len(per_frame),
+        "propainter_home": str(pp_config.home),
+    }
+    artifacts = [
+        Artifact(name="source_clean.mp4", path=output, status="ready"),
+        _write_json(root, "watermark.json", data),
+    ]
+    return artifacts, "removed full-frame watermark with ProPainter"
+
+
 # --- transcript: timed speech-to-text with faster-whisper -------------------
 
 def _srt_timestamp(seconds: float) -> str:
@@ -276,6 +392,158 @@ def _whisper_model_options() -> dict[str, object]:
     return options
 
 
+# When faster-whisper returns per-word timings, a coarse VAD segment is cut into
+# sentence-sized transcript rows so captions and the explorer list stay anchored to
+# real speech instead of being interpolated by character count. A row ends at a
+# sentence mark once it is at least MIN long, at a silence GAP between two spoken
+# words, or once it reaches MAX seconds.
+_TRANSCRIPT_SPLIT_GAP_SECONDS = 0.6
+_TRANSCRIPT_SPLIT_MIN_SECONDS = 2.5
+_TRANSCRIPT_SPLIT_MAX_SECONDS = 8.0
+
+
+def _cuda_available() -> bool:
+    """Best-effort probe for a usable CUDA device via ctranslate2 (whisper's backend)."""
+    try:
+        import ctranslate2
+
+        return int(ctranslate2.get_cuda_device_count()) > 0
+    except Exception:
+        return False
+
+
+def _whisper_runtime() -> tuple[str, str, str]:
+    """Resolve (model, device, compute_type) for faster-whisper.
+
+    Honours MRF_WHISPER_MODEL / MRF_WHISPER_DEVICE / MRF_WHISPER_COMPUTE_TYPE and
+    otherwise auto-detects: a CUDA GPU -> float16 (8-15x faster than CPU int8),
+    else CPU int8. Point MRF_WHISPER_MODEL at a distilled checkpoint such as
+    "distil-large-v3" for a further 4-5x speed-up at near-identical accuracy.
+    """
+    model_name = os.environ.get("MRF_WHISPER_MODEL", "").strip() or "small"
+    device = os.environ.get("MRF_WHISPER_DEVICE", "").strip().lower()
+    compute_type = os.environ.get("MRF_WHISPER_COMPUTE_TYPE", "").strip().lower()
+    if device not in {"cpu", "cuda", "auto", ""}:
+        device = ""
+    if not device or device == "auto":
+        device = "cuda" if _cuda_available() else "cpu"
+    if not compute_type:
+        compute_type = "float16" if device == "cuda" else "int8"
+    return model_name, device, compute_type
+
+
+def _extract_wav_16k_mono(src: Path, dest: Path) -> bool:
+    """Demux the audio to 16kHz mono PCM so whisper reads a tiny WAV instead of
+    demuxing the multi-GB video container on every run. Returns True on success."""
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        return False
+    dest.unlink(missing_ok=True)
+    command = [
+        ffmpeg, "-y", "-i", str(src), "-vn",
+        "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", str(dest),
+    ]
+    try:
+        subprocess.run(command, capture_output=True, text=True, check=True)
+    except (subprocess.CalledProcessError, OSError):
+        dest.unlink(missing_ok=True)
+        return False
+    return dest.exists() and dest.stat().st_size > 0
+
+
+def _prepare_whisper_audio(root: Path, src: Path) -> Path:
+    """Return a fast 16kHz mono WAV for whisper, or the original source when
+    extraction is unavailable (kept as a seam so tests can stub it)."""
+    wav_path = root / ".mrf_whisper_audio.wav"
+    if _extract_wav_16k_mono(src, wav_path):
+        return wav_path
+    return src
+
+
+def _srt_time_to_seconds(value: str) -> float:
+    value = value.strip().replace(",", ".")
+    hours, minutes, seconds = value.split(":")
+    return int(hours) * 3600 + int(minutes) * 60 + float(seconds)
+
+
+def _parse_srt_segments(text: str) -> list[dict]:
+    """Parse SRT / converted-subtitle text into timed transcript rows."""
+    segments: list[dict] = []
+    for block in re.split(r"\r?\n[ \t]*\r?\n", text.strip()):
+        lines = [line for line in block.splitlines() if line.strip()]
+        timing = next((i for i, line in enumerate(lines) if "-->" in line), None)
+        if timing is None:
+            continue
+        match = re.search(
+            r"(\d{1,2}:\d{2}:\d{2}[.,]\d{1,3})\s*-->\s*(\d{1,2}:\d{2}:\d{2}[.,]\d{1,3})",
+            lines[timing],
+        )
+        if not match:
+            continue
+        body = " ".join(lines[timing + 1:]).strip()
+        body = re.sub(r"<[^>]+>", "", body)
+        body = re.sub(r"\{[^}]*\}", "", body).strip()
+        if not body:
+            continue
+        start = _srt_time_to_seconds(match.group(1))
+        end = _srt_time_to_seconds(match.group(2))
+        segments.append({
+            "start_seconds": start,
+            "end_seconds": end if end > start else start,
+            "text": body,
+        })
+    return segments
+
+
+def _embedded_subtitle_segments(
+    src: Path, want_langs: list[str], root: Path
+) -> tuple[list[dict], str] | None:
+    """Reuse a subtitle track shipped inside the container instead of running
+    Whisper. Returns (segments, language) or None when nothing usable is found."""
+    ffprobe = shutil.which("ffprobe")
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffprobe or not ffmpeg:
+        return None
+    try:
+        probe = subprocess.run(
+            [ffprobe, "-v", "error", "-select_streams", "s",
+             "-show_entries", "stream=index:stream_tags=language",
+             "-of", "json", str(src)],
+            capture_output=True, text=True, check=True,
+        )
+        streams = json.loads(probe.stdout or "{}").get("streams") or []
+    except (subprocess.CalledProcessError, OSError, json.JSONDecodeError):
+        return None
+    wanted = [lang.strip().lower() for lang in want_langs if lang.strip()]
+    chosen_rel: int | None = None
+    chosen_lang = "unknown"
+    for rel_index, stream in enumerate(streams):
+        lang = str((stream.get("tags") or {}).get("language", "")).lower()
+        if not wanted or lang in wanted:
+            chosen_rel, chosen_lang = rel_index, (lang or "unknown")
+            break
+    if chosen_rel is None:
+        return None
+    dest = root / ".mrf_embedded_sub.srt"
+    dest.unlink(missing_ok=True)
+    raw = ""
+    try:
+        subprocess.run(
+            [ffmpeg, "-y", "-i", str(src), "-map", f"0:s:{chosen_rel}", str(dest)],
+            capture_output=True, text=True, check=True,
+        )
+        if dest.exists():
+            raw = dest.read_text(encoding="utf-8", errors="replace")
+    except (subprocess.CalledProcessError, OSError):
+        raw = ""
+    finally:
+        dest.unlink(missing_ok=True)
+    segments = _parse_srt_segments(raw)
+    if not segments:
+        return None
+    return segments, chosen_lang
+
+
 @register_stage("transcript")
 def _transcript(root: Path, manifest: JobManifest) -> tuple[list[Artifact], str]:
     """Transcribe a local source video into timed JSON and SRT artifacts."""
@@ -288,6 +556,34 @@ def _transcript(root: Path, manifest: JobManifest) -> tuple[list[Artifact], str]
     # Ingest already recorded the fact: a container with zero audio streams makes faster-whisper/PyAV die with a bare "tuple index out of range".
     if _read_json(root, "ingest.json").get("has_audio") is False:
         raise SkipStage("source video has no audio track - nothing to transcribe")
+    # Optional fast path: if the container already ships a usable subtitle track,
+    # reuse it verbatim and skip Whisper entirely (set MRF_TRANSCRIPT_EMBEDDED_SUBS=1).
+    if os.environ.get("MRF_TRANSCRIPT_EMBEDDED_SUBS", "").strip().lower() in {"1", "true", "yes", "on"}:
+        requested = os.environ.get("MRF_TRANSCRIPT_SUB_LANGS", "").strip()
+        want_langs = [part for part in re.split(r"[,\s]+", requested) if part]
+        if not want_langs and cfg.language:
+            want_langs = [cfg.language]
+        embedded = _embedded_subtitle_segments(src, want_langs, root)
+        if embedded is not None:
+            segments, sub_language = embedded
+            transcript = {
+                "job_id": cfg.job_id,
+                "source_video": str(src),
+                "language": sub_language,
+                "output_language": cfg.language,
+                "segments": segments,
+                "source": "embedded-subtitles",
+            }
+            srt = "\n".join(
+                f"{index}\n{_srt_timestamp(segment['start_seconds'])} --> "
+                f"{_srt_timestamp(segment['end_seconds'])}\n{segment['text']}\n"
+                for index, segment in enumerate(segments, start=1)
+            )
+            artifacts = [
+                _write_json(root, "transcript.json", transcript),
+                _write_text(root, "captions.srt", srt),
+            ]
+            return artifacts, f"reused {len(segments)} embedded subtitle segments (skipped Whisper)"
     try:
         from faster_whisper import WhisperModel
     except ImportError as exc:
@@ -298,31 +594,112 @@ def _transcript(root: Path, manifest: JobManifest) -> tuple[list[Artifact], str]
     configured_threads = os.environ.get("MRF_WHISPER_CPU_THREADS", "").strip()
     if configured_threads:
         cpu_threads = max(1, min(32, int(configured_threads)))
-    model = WhisperModel(
-        "small",
-        device="cpu",
-        compute_type="int8",
-        cpu_threads=cpu_threads,
-        **_whisper_model_options(),
-    )
+    model_name, device, compute_type = _whisper_runtime()
+    try:
+        model = WhisperModel(
+            model_name,
+            device=device,
+            compute_type=compute_type,
+            cpu_threads=cpu_threads,
+            **_whisper_model_options(),
+        )
+    except (RuntimeError, ValueError, OSError):
+        # A GPU runtime was requested/auto-selected but is not usable on this box
+        # (missing CUDA libraries, insufficient VRAM, ...). Fall back to CPU int8 so
+        # the job still completes rather than aborting the whole pipeline.
+        if device == "cpu":
+            raise
+        device, compute_type = "cpu", "int8"
+        model = WhisperModel(
+            model_name,
+            device=device,
+            compute_type=compute_type,
+            cpu_threads=cpu_threads,
+            **_whisper_model_options(),
+        )
+    # Feed whisper a small pre-extracted 16kHz mono WAV instead of demuxing the
+    # full video container on every decode pass.
+    audio_input = _prepare_whisper_audio(root, src)
     batch_size = max(1, min(16, int(os.environ.get("MRF_WHISPER_BATCH_SIZE", "4"))))
+    # word_timestamps=True makes faster-whisper emit per-word times derived from
+    # the model's cross-attention. Whisper's coarse segment.start is
+    # systematically early (Silero VAD's speech_pad_ms padding plus the model's
+    # ~400ms lead-in), which surfaces as captions that sit a constant beat ahead
+    # of the audio; anchoring each segment to its own first/last word removes
+    # that fixed offset without a hand-tuned magic constant.
     if batch_size > 1:
         from faster_whisper import BatchedInferencePipeline
 
         transcriber = BatchedInferencePipeline(model=model)
         raw_segments, detected = transcriber.transcribe(
-            str(src), language=None, vad_filter=True, batch_size=batch_size,
+            str(audio_input), language=None, vad_filter=True, batch_size=batch_size,
+            word_timestamps=True,
         )
     else:
-        raw_segments, detected = model.transcribe(str(src), language=None, vad_filter=True)
-    segments = [
-        {
-            "start_seconds": float(segment.start),
-            "end_seconds": float(segment.end),
-            "text": segment.text.strip(),
-        }
-        for segment in raw_segments
-    ]
+        raw_segments, detected = model.transcribe(
+            str(audio_input), language=None, vad_filter=True, word_timestamps=True,
+        )
+
+    def _split_segment(segment) -> list[dict]:
+        """Cut one coarse VAD segment into sentence-sized, word-anchored rows.
+
+        faster-whisper groups speech into segments that can span many seconds and
+        several sentences. Keeping such a block whole forces the UI to interpolate
+        per-sentence timing by character count, which assumes a constant speaking
+        pace and drifts ahead of the audio across any pause. With per-word timings we
+        break at sentence-ending punctuation, at a silent gap between two spoken
+        words, or once a row grows too long — so every row starts and ends on real
+        speech. Falls back to the whole segment when word timings are unavailable.
+        """
+        def _whole() -> list[dict]:
+            return [{
+                "start_seconds": float(segment.start),
+                "end_seconds": float(segment.end),
+                "text": segment.text.strip(),
+                "words": [],
+            }]
+        words = [
+            word for word in (getattr(segment, "words", None) or [])
+            if getattr(word, "start", None) is not None and getattr(word, "end", None) is not None
+        ]
+        if not words:
+            return _whole()
+        rows: list[dict] = []
+        buffer: list = []
+
+        def _flush() -> None:
+            if not buffer:
+                return
+            text = "".join(str(getattr(word, "word", "")) for word in buffer).strip()
+            start, end = float(buffer[0].start), float(buffer[-1].end)
+            if text and end > start:
+                word_times = [
+                    {"word": str(getattr(word, "word", "")).strip(),
+                     "start": float(word.start), "end": float(word.end)}
+                    for word in buffer
+                ]
+                rows.append({"start_seconds": start, "end_seconds": end, "text": text, "words": word_times})
+
+        for index, word in enumerate(words):
+            buffer.append(word)
+            token = str(getattr(word, "word", "")).strip()
+            row_seconds = float(word.end) - float(buffer[0].start)
+            ends_sentence = token.endswith((".", "?", "!", "…")) and row_seconds >= _TRANSCRIPT_SPLIT_MIN_SECONDS
+            gap_ahead = (
+                index + 1 < len(words)
+                and float(words[index + 1].start) - float(word.end) >= _TRANSCRIPT_SPLIT_GAP_SECONDS
+            )
+            if ends_sentence or gap_ahead or row_seconds >= _TRANSCRIPT_SPLIT_MAX_SECONDS:
+                _flush()
+                buffer = []
+        _flush()
+        return rows or _whole()
+
+    segments = []
+    for segment in raw_segments:
+        segments.extend(_split_segment(segment))
+    if audio_input != src:
+        Path(audio_input).unlink(missing_ok=True)
     transcript = {
         "job_id": cfg.job_id,
         "source_video": str(src),
@@ -445,7 +822,7 @@ def _scenes(root: Path, manifest: JobManifest) -> tuple[list[Artifact], str]:
     cfg = manifest.config
     if not cfg.source_video:
         raise SkipStage("no source_video set - provide one to index scenes")
-    src = Path(cfg.source_video)
+    src = _source_video(root, cfg)
     if not src.exists():
         raise SkipStage(f"source_video not found: {src}")
     duration = _probe_duration_seconds(src)
@@ -484,6 +861,7 @@ def _scenes(root: Path, manifest: JobManifest) -> tuple[list[Artifact], str]:
                     start_seconds=float(segment["start_seconds"]),
                     end_seconds=float(segment["end_seconds"]),
                     text=str(segment.get("text", "")).strip(),
+                    words=segment.get("words") or [],
                 )
                 for segment in transcript.get("segments", [])
                 if str(segment.get("text", "")).strip()
@@ -1865,6 +2243,43 @@ VOICE_BY_LANGUAGE = {
 DEFAULT_TTS_VOICE = "en-US-AriaNeural"
 
 
+# Voice emotion / pacing presets mapped to edge-tts prosody (rate/pitch/volume).
+# A movie-review channel voice usually wants a little more energy; "dramatic" and
+# "suspense" slow down and drop the pitch for gravitas. Explicit MRF_TTS_RATE /
+# MRF_TTS_PITCH / MRF_TTS_VOLUME always override the preset.
+_TTS_EMOTION_PRESETS: dict[str, dict[str, str]] = {
+    "neutral": {},
+    "energetic": {"rate": "+12%", "pitch": "+8Hz"},
+    "hype": {"rate": "+18%", "pitch": "+12Hz", "volume": "+2%"},
+    "dramatic": {"rate": "-6%", "pitch": "-4Hz"},
+    "suspense": {"rate": "-12%", "pitch": "-6Hz"},
+    "calm": {"rate": "-8%"},
+}
+
+_TTS_PERCENT_RE = re.compile(r"^[+-]\d{1,3}%$")
+_TTS_HZ_RE = re.compile(r"^[+-]\d{1,3}Hz$")
+
+
+def _tts_prosody() -> dict[str, str]:
+    """Resolve edge-tts prosody (rate/pitch/volume) from an emotion preset plus
+    explicit env overrides. Invalid or no-op ("+0%"/"+0Hz") values are dropped so
+    the default is plain, unmodified narration and existing renders are unchanged.
+    """
+    preset = os.environ.get("MRF_TTS_EMOTION", "").strip().lower()
+    values = dict(_TTS_EMOTION_PRESETS.get(preset, {}))
+    for key, env_name in (("rate", "MRF_TTS_RATE"), ("pitch", "MRF_TTS_PITCH"), ("volume", "MRF_TTS_VOLUME")):
+        raw = os.environ.get(env_name, "").strip()
+        if raw:
+            values[key] = raw
+    prosody: dict[str, str] = {}
+    for key, value in values.items():
+        pattern = _TTS_HZ_RE if key == "pitch" else _TTS_PERCENT_RE
+        if not pattern.match(value) or value in {"+0%", "-0%", "+0Hz", "-0Hz"}:
+            continue
+        prosody[key] = value
+    return prosody
+
+
 @register_stage("tts")
 def _tts(root: Path, manifest: JobManifest) -> tuple[list[Artifact], str]:
     """Synthesize approved, non-empty narration into a single MP3 artifact."""
@@ -1907,9 +2322,17 @@ def _tts(root: Path, manifest: JobManifest) -> tuple[list[Artifact], str]:
     no_audio_error = getattr(getattr(edge_tts, "exceptions", None), "NoAudioReceived", None)
     if no_audio_error is None:
         no_audio_error = type("_NoAudioReceived", (Exception,), {})
+    prosody = _tts_prosody()
+    communicate_factory = edge_tts.Communicate
+    if prosody:
+        # Bake the prosody into the factory so chunked_tts / narration_alignment
+        # keep their existing (text, voice, boundary=...) call signature.
+        def communicate_factory(text, voice, _prosody=prosody, _factory=edge_tts.Communicate, **kwargs):
+            return _factory(text, voice, **_prosody, **kwargs)
+
     boundaries = synthesize_chunked(
         narration, voice, audio_path,
-        communicate_factory=edge_tts.Communicate,
+        communicate_factory=communicate_factory,
         synthesize=narration_alignment.synthesize_with_boundaries,
         no_audio_error=no_audio_error,
         ffmpeg_bin=ffmpeg or "ffmpeg",
@@ -1922,6 +2345,7 @@ def _tts(root: Path, manifest: JobManifest) -> tuple[list[Artifact], str]:
         "language": cfg.language,
         "engine": "edge-tts",
         "voice": voice,
+        "prosody": prosody,
         "audio_file": audio_path.name,
         "section_count": len(sections),
         "sections": sections,
@@ -2311,13 +2735,137 @@ def caption_ass(
     return header + "\n".join(lines) + ("\n" if lines else "")
 
 
+# --- FFmpeg encoder hardening ------------------------------------------------
+# libx264 allocates per-thread frame buffers, so a high automatic thread count on
+# a many-core box can exhaust the process address space and die with
+# "x264 [error]: malloc of size N failed" / "Cannot allocate memory" even while
+# plenty of system RAM is free. Cap encoder threads to a sane value, and if a
+# render still hits an allocation error retry it exactly once, single-threaded.
+
+_FFMPEG_MEMORY_ERROR_MARKERS = (
+    "cannot allocate memory",
+    "out of memory",
+    "malloc of size",
+    "malloc failed",
+)
+
+
+def ffmpeg_thread_cap() -> int:
+    """A conservative libx264 thread count.
+
+    Honours MRF_FFMPEG_THREADS (clamped to 1..16) when set; otherwise uses at
+    most half the logical cores and never more than 8 - enough for throughput
+    without the per-thread buffer blow-up that triggers the x264 malloc flake.
+    """
+    configured = os.environ.get("MRF_FFMPEG_THREADS", "").strip()
+    if configured:
+        try:
+            return max(1, min(16, int(configured)))
+        except ValueError:
+            pass
+    cores = os.cpu_count() or 4
+    return max(1, min(8, cores // 2 or 1))
+
+
+def is_ffmpeg_memory_error(text: str | None) -> bool:
+    """True when ffmpeg/x264 stderr shows an allocation failure worth retrying."""
+    if not text:
+        return False
+    lowered = text.lower()
+    return any(marker in lowered for marker in _FFMPEG_MEMORY_ERROR_MARKERS)
+
+
+def ffmpeg_command_single_thread(command: list[str]) -> list[str]:
+    """Return a copy of an ffmpeg command with libx264 threading forced to 1.
+
+    Rewrites an existing '-threads N' (added by the render builders) in place, or
+    inserts '-threads 1' just before the output path when none is present. The
+    input list is never mutated.
+    """
+    reduced = list(command)
+    if "-threads" in reduced:
+        reduced[reduced.index("-threads") + 1] = "1"
+    else:
+        reduced[-1:-1] = ["-threads", "1"]
+    return reduced
+
+
+_HARDWARE_H264_ENCODERS = ("h264_nvenc", "h264_qsv", "h264_amf")
+
+
+def _libx264_encoder_args() -> list[str]:
+    """CPU software encoder args - the safe default; keeps the OOM thread cap."""
+    return [
+        "-c:v", "libx264", "-threads", str(ffmpeg_thread_cap()),
+        "-preset", "fast", "-crf", "23",
+    ]
+
+
+def _hardware_encoder_args(name: str) -> list[str]:
+    """Quality/speed-balanced args for a specific hardware H.264 encoder."""
+    if name == "h264_nvenc":
+        return ["-c:v", "h264_nvenc", "-preset", "p4", "-tune", "hq",
+                "-rc", "vbr", "-cq", "23", "-b:v", "0"]
+    if name == "h264_qsv":
+        return ["-c:v", "h264_qsv", "-preset", "veryfast", "-global_quality", "23"]
+    if name == "h264_amf":
+        return ["-c:v", "h264_amf", "-quality", "balanced",
+                "-rc", "cqp", "-qp_i", "23", "-qp_p", "23"]
+    return _libx264_encoder_args()
+
+
+def _available_ffmpeg_encoders() -> set[str]:
+    """H.264 encoder names this ffmpeg build exposes (via `ffmpeg -encoders`)."""
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        return set()
+    try:
+        proc = subprocess.run(
+            [ffmpeg, "-hide_banner", "-encoders"],
+            capture_output=True, text=True, check=True,
+        )
+    except (subprocess.CalledProcessError, OSError):
+        return set()
+    listing = getattr(proc, "stdout", "") or ""
+    return {name for name in (*_HARDWARE_H264_ENCODERS, "libx264") if name in listing}
+
+
+def _video_encoder_args() -> tuple[list[str], bool]:
+    """Resolve ffmpeg video-encoder args and whether the choice is hardware.
+
+    Controlled by MRF_VIDEO_ENCODER:
+      * unset / "libx264" / "cpu" -> CPU libx264 (default; behaviour unchanged).
+      * "auto"                    -> probe `ffmpeg -encoders` and pick a hardware
+                                     H.264 encoder (NVENC > QSV > AMF), else libx264.
+      * "nvenc"/"qsv"/"amf" (or the full h264_* name) -> force that encoder.
+
+    Hardware encoders are ~5-8x faster and offload the CPU; the render stage
+    transparently falls back to libx264 if the hardware path fails at run time, so
+    a forced/auto choice never has to be perfect.
+    """
+    selection = os.environ.get("MRF_VIDEO_ENCODER", "").strip().lower()
+    forced = {
+        "nvenc": "h264_nvenc", "h264_nvenc": "h264_nvenc",
+        "qsv": "h264_qsv", "h264_qsv": "h264_qsv",
+        "amf": "h264_amf", "h264_amf": "h264_amf",
+    }
+    if selection in forced:
+        return _hardware_encoder_args(forced[selection]), True
+    if selection == "auto":
+        available = _available_ffmpeg_encoders()
+        for name in _HARDWARE_H264_ENCODERS:
+            if name in available:
+                return _hardware_encoder_args(name), True
+    return _libx264_encoder_args(), False
+
+
 @register_stage("render")
 def _render(root: Path, manifest: JobManifest) -> tuple[list[Artifact], str]:
     """Render selected ranges of the configured source video with narration and SRT."""
     cfg = manifest.config
     if not cfg.source_video:
         raise SkipStage("no source_video set - provide one to render")
-    source_path = Path(cfg.source_video)
+    source_path = _source_video(root, cfg)
     if not source_path.exists():
         raise SkipStage(f"source_video not found: {source_path}")
 
@@ -2394,37 +2942,17 @@ def _render(root: Path, manifest: JobManifest) -> tuple[list[Artifact], str]:
         )
         overlay_paths.append(overlay)
     filter_parts: list[str] = []
-    concat_inputs: list[str] = []
-    for item in ranges:
-        index = item["index"]
-        start = item["start_seconds"]
-        end = item["end_seconds"]
-        source_seconds = item["source_seconds"]
-        target_seconds = item["duration_seconds"]
-        segment = f"[0:v]trim=start={start:.6f}:end={end:.6f},setpts=PTS-STARTPTS"
-        # When a clip must play longer than its trimmed source range, normalise
-        # the frame rate then loop the trimmed frames until they cover the target
-        # duration and trim to the exact length. This keeps the composed video at
-        # least as long as the narration so -shortest clamps the output to the
-        # narration track instead of truncating the video (audio/video drift).
-        if target_seconds > source_seconds:
-            size = max(1, round(source_seconds * RENDER_FRAME_RATE))
-            loops = math.ceil(target_seconds / source_seconds) - 1
-            segment += (
-                f",fps={RENDER_FRAME_RATE},"
-                f"loop=loop={loops}:size={size}:start=0,"
-                f"setpts=N/{RENDER_FRAME_RATE}/TB,"
-                f"trim=end={target_seconds:.6f},setpts=PTS-STARTPTS"
-            )
-        elif target_seconds < source_seconds:
-            segment += f",trim=end={target_seconds:.6f},setpts=PTS-STARTPTS"
-        filter_parts.append(
-            f"{segment},"
-            f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
-            f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar=1,"
-            f"fps={RENDER_FRAME_RATE},format=yuv420p[v{index}]"
-        )
-        concat_inputs.append(f"[v{index}]")
+    # Each clip is decoded from its OWN seeked source input (built after the
+    # other inputs, below) instead of N trims of a single shared [0:v]. A single
+    # shared input is implicitly split to every clip branch, and ffmpeg buffers
+    # frames for branches the concat has not reached yet; because clips are
+    # concatenated in timeline order (not source-time order) that buffer grew to
+    # roughly the whole timeline in RAM and OOM'd on long jobs (exit -12).
+    # Per-clip seeked inputs decode only their own range on demand, so concat
+    # consumes them sequentially with flat memory. The clip filter chains that
+    # define [v{index}] are appended further down, once the clip input indices
+    # are known (chain order within -filter_complex is irrelevant to ffmpeg).
+    concat_inputs = [f"[v{item['index']}]" for item in ranges]
     filter_parts.append(f"{''.join(concat_inputs)}concat=n={len(ranges)}:v=1:a=0[video]")
     planned_duration = sum(item["duration_seconds"] for item in ranges)
     # Each segment can lose a frame to rate conversion before concat. Reserve
@@ -2554,6 +3082,87 @@ def _render(root: Path, manifest: JobManifest) -> tuple[list[Artifact], str]:
         video_map, audio_map = "[showv]", "[showa]"
 
     total_duration = narration_duration + intro_seconds + outro_seconds
+
+    # QA signal detection (black/freeze/silence/loudness) is deliberately NOT
+    # folded onto a second (-f null) output here. Splitting (split=2) the encode
+    # and detect branches let the fast loop-filter frames queue without bound
+    # against the slow ebur128/detect branch, exhausting memory on long
+    # timelines (ffmpeg exit -12, "Cannot allocate memory"). This render now
+    # encodes a single output so memory stays flat; the qa stage runs the detect
+    # filters as its own decode pass over the finished final.mp4
+    # (media_qa.inspect_rendered_media). Any stale render-signals.log is removed
+    # so qa always takes that separate pass.
+    (root / "render-signals.log").unlink(missing_ok=True)
+
+    # One seeked source input per clip, appended AFTER every other input
+    # (source, narration, overlays, mix, cards) so their indices are unchanged.
+    # `-ss start -t duration -i source` reads exactly the clip's source range;
+    # setpts normalises its PTS to zero. Stretched clips still loop to reach the
+    # target length. This is the OOM fix: no shared-input split, no whole-
+    # timeline buffering. Input 0 (the plain source) is left in place so the
+    # narration/overlay/mix/card input indices below do not move; it simply
+    # goes unreferenced, which ffmpeg accepts.
+    clip_input_base = (
+        2 + len(overlay_paths)
+        + list(mix.input_args).count("-i")
+        + list(card_inputs).count("-i")
+    )
+    ken_burns = os.environ.get("MRF_KEN_BURNS", "").strip().lower() in {"1", "true", "yes", "on"}
+    bypass_setting = getattr(cfg, "copyright_bypass", "") or os.environ.get("MRF_COPYRIGHT_BYPASS", "")
+    bypass_profile = copyright_bypass.resolve_profile(bypass_setting)
+    bypass_filters = copyright_bypass.build_clip_bypass_filters(width, height, bypass_profile)
+    bypass_clause = f",{','.join(bypass_filters)}" if bypass_filters else ""
+    clip_inputs: list[str] = []
+    for item in ranges:
+        index = item["index"]
+        start = item["start_seconds"]
+        source_seconds = item["source_seconds"]
+        target_seconds = item["duration_seconds"]
+        clip_inputs += [
+            "-ss", f"{start:.6f}", "-t", f"{source_seconds:.6f}", "-i", str(source_path),
+        ]
+        segment = f"[{clip_input_base + index}:v]setpts=PTS-STARTPTS"
+        if target_seconds > source_seconds:
+            size = max(1, round(source_seconds * RENDER_FRAME_RATE))
+            loops = math.ceil(target_seconds / source_seconds) - 1
+            segment += (
+                f",fps={RENDER_FRAME_RATE},"
+                f"loop=loop={loops}:size={size}:start=0,"
+                f"setpts=N/{RENDER_FRAME_RATE}/TB,"
+                f"trim=end={target_seconds:.6f},setpts=PTS-STARTPTS"
+            )
+        elif target_seconds < source_seconds:
+            segment += f",trim=end={target_seconds:.6f},setpts=PTS-STARTPTS"
+        if ken_burns:
+            geometry = visual_rhythm.ken_burns_filter(
+                width, height, RENDER_FRAME_RATE,
+                max(1, round(target_seconds * RENDER_FRAME_RATE)), index=index,
+            )
+        else:
+            geometry = (
+                f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
+                f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2"
+            )
+        filter_parts.append(
+            f"{segment},{geometry}{bypass_clause},setsar=1,"
+            f"fps={RENDER_FRAME_RATE},format=yuv420p[v{index}]"
+        )
+
+    # Optional whoosh/impact on every scene cut (set MRF_TRANSITION_SFX to an
+    # audio file). SFX inputs are appended AFTER the clip inputs so no existing
+    # input index shifts; when disabled sfx_inputs stays empty and the command is
+    # byte-identical to the default render.
+    sfx_inputs: list[str] = []
+    transition_sfx = os.environ.get("MRF_TRANSITION_SFX", "").strip()
+    if transition_sfx and Path(transition_sfx).is_file():
+        cut_times = visual_rhythm.transition_cut_times(ranges, intro_seconds=intro_seconds)
+        fragment, audio_map = visual_rhythm.transition_sfx_filtergraph(
+            audio_map, clip_input_base + len(ranges), cut_times,
+        )
+        if fragment:
+            filter_parts.append(fragment)
+            sfx_inputs = ["-i", transition_sfx]
+
     filter_complex = ";".join(filter_parts)
 
     temporary_path = root / "final.rendering.mp4"
@@ -2566,52 +3175,82 @@ def _render(root: Path, manifest: JobManifest) -> tuple[list[Artifact], str]:
     # overruns the narration by the filter's buffered tail (~0.7s on the smoke
     # job), which exceeds RENDER_DURATION_DRIFT_SECONDS. -t pins both streams to
     # the narration length; -shortest stays as a secondary guard.
-    command = [
-        ffmpeg, "-y", "-i", str(source_path), "-i", str(narration_path),
-        *(arg for path in overlay_paths for arg in ("-i", str(path))),
-        *mix.input_args,
-        *card_inputs,
-        "-filter_complex", filter_complex,
-        "-map", video_map, "-map", audio_map,
-        "-c:v", "libx264", "-preset", "fast", "-crf", "23",
-        "-pix_fmt", "yuv420p", "-r", str(RENDER_FRAME_RATE),
-        "-t", f"{total_duration:.6f}",
-        "-c:a", "aac", "-b:a", "192k", "-shortest", "-movflags", "+faststart",
-        str(temporary_path),
-    ]
-    try:
+    def _command_with(video_encoder_args: list[str]) -> list[str]:
+        return [
+            ffmpeg, "-y", "-i", str(source_path), "-i", str(narration_path),
+            *(arg for path in overlay_paths for arg in ("-i", str(path))),
+            *mix.input_args,
+            *card_inputs,
+            *clip_inputs,
+            *sfx_inputs,
+            "-filter_complex", filter_complex,
+            "-map", video_map, "-map", audio_map,
+            *video_encoder_args,
+            "-pix_fmt", "yuv420p", "-r", str(RENDER_FRAME_RATE),
+            "-t", f"{total_duration:.6f}",
+            "-c:a", "aac", "-b:a", "192k", "-shortest", "-movflags", "+faststart",
+            str(temporary_path),
+        ]
+
+    encoder_args, encoder_is_hardware = _video_encoder_args()
+    command = _command_with(encoder_args)
+    def _run_encoder(active_command: list[str]) -> None:
         context = cancellation.current_context()
         if context is None:
-            subprocess.run(command, capture_output=True, text=True, check=True)
-        else:
+            subprocess.run(active_command, capture_output=True, text=True, check=True)
+            return
+        cancellation.checkpoint()
+        process = subprocess.Popen(
+            active_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        try:
+            if context.register_process:
+                context.register_process(process)
+            while True:
+                try:
+                    stdout, stderr = process.communicate(timeout=0.25)
+                    break
+                except subprocess.TimeoutExpired:
+                    cancellation.checkpoint()
             cancellation.checkpoint()
-            process = subprocess.Popen(
-                command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-            )
-            try:
-                if context.register_process:
-                    context.register_process(process)
-                while True:
-                    try:
-                        stdout, stderr = process.communicate(timeout=0.25)
-                        break
-                    except subprocess.TimeoutExpired:
-                        cancellation.checkpoint()
-                cancellation.checkpoint()
-                if process.returncode:
-                    raise subprocess.CalledProcessError(
-                        process.returncode, command, output=stdout, stderr=stderr,
-                    )
-            finally:
-                if process.poll() is None:
-                    process.terminate()
-                    try:
-                        process.communicate(timeout=5)
-                    except subprocess.TimeoutExpired:
-                        process.kill()
-                        process.communicate()
-                if context.unregister_process:
-                    context.unregister_process(process)
+            if process.returncode:
+                raise subprocess.CalledProcessError(
+                    process.returncode, active_command, output=stdout, stderr=stderr,
+                )
+        finally:
+            if process.poll() is None:
+                process.terminate()
+                try:
+                    process.communicate(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.communicate()
+            if context.unregister_process:
+                context.unregister_process(process)
+
+    def _encode(active_command: list[str]) -> None:
+        try:
+            _run_encoder(active_command)
+        except subprocess.CalledProcessError as exc:
+            if not is_ffmpeg_memory_error(f"{exc.stderr or ''}\n{exc.output or ''}"):
+                raise
+            # One bounded, single-threaded retry: libx264's per-thread frame
+            # buffers are what exhaust the address space, so threads=1 clears the
+            # transient "x264 malloc failed / Cannot allocate memory" flake.
+            temporary_path.unlink(missing_ok=True)
+            _run_encoder(ffmpeg_command_single_thread(active_command))
+
+    try:
+        try:
+            _encode(command)
+        except subprocess.CalledProcessError:
+            # A hardware encoder (NVENC/QSV/AMF) is unusable on this box - rebuild
+            # with software libx264 and retry once (retains the OOM hardening).
+            if not encoder_is_hardware:
+                raise
+            temporary_path.unlink(missing_ok=True)
+            command = _command_with(_libx264_encoder_args())
+            _encode(command)
         if not temporary_path.exists():
             raise RuntimeError("ffmpeg completed without producing final output")
         output_duration = _probe_duration_seconds(temporary_path)
@@ -2813,9 +3452,21 @@ def _qa(root: Path, manifest: JobManifest) -> tuple[list[Artifact], str]:
                 failures.append(editorial["message"] or editorial["check"])
 
     from . import media_qa
-    for signal in media_qa.inspect_rendered_media(
-        final_path, ffmpeg_bin=shutil.which("ffmpeg"), duration_seconds=output_duration,
-    ):
+    # Prefer the detect log the render pass already produced - it avoids
+    # decoding final.mp4 a second time. Fall back to a fresh decode pass when
+    # the log is absent or unusable (render predates this artifact, was
+    # truncated, or the detect pass produced no loudness summary).
+    signal_log = root / "render-signals.log"
+    signals: list[dict] | None = None
+    if signal_log.is_file():
+        signals = media_qa.signals_from_render_log(
+            signal_log.read_text(encoding="utf-8", errors="replace"), output_duration,
+        )
+    if signals is None:
+        signals = media_qa.inspect_rendered_media(
+            final_path, ffmpeg_bin=shutil.which("ffmpeg"), duration_seconds=output_duration,
+        )
+    for signal in signals:
         checks.append(signal)
         if not signal["passed"]:
             failures.append(signal["message"] or signal["check"])

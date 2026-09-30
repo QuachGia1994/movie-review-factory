@@ -94,3 +94,22 @@ def test_real_ffmpeg_decodes_black_tone_and_loudness(tmp_path):
     assert checks["black_intervals"]["review_required"]
     assert checks["black_intervals"]["value"]["intervals"][0]["start_seconds"] == 0
     assert checks["decoded_audio_loudness"]["passed"]
+
+
+def test_signals_from_render_log_reuses_detect_log_and_marks_scan_source():
+    checks = {c["check"]: c
+              for c in media_qa.signals_from_render_log(LOG, duration_seconds=20)}
+    # The render pass already decoded the frames, so the scan says so.
+    assert checks["decoded_media_scan"]["passed"]
+    assert checks["decoded_media_scan"]["value"]["source"] == "render_pass"
+    # Same parser as the decode-pass path, so the signal checks match.
+    assert checks["black_intervals"]["value"]["intervals"][0]["start_seconds"] == 2.0
+    assert checks["decoded_audio_loudness"]["passed"]
+
+
+def test_signals_from_render_log_returns_none_without_loudness_summary():
+    # No ebur128 summary -> the detect pass did not run or the log is unusable,
+    # so the caller must fall back to a fresh decode pass, not fail QA.
+    assert media_qa.signals_from_render_log(
+        "black_start:1 black_end:2 black_duration:1") is None
+    assert media_qa.signals_from_render_log("") is None

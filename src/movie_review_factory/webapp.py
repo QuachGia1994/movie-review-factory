@@ -28,6 +28,7 @@ import os
 import queue
 import re
 import shutil
+import sys
 import tempfile
 import threading
 from datetime import datetime, timezone
@@ -35,7 +36,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 
-from . import analytics, audio_mix, branding, cancellation, creative_brief, editor_ops, localization, midroll, pipeline, semantic_search, versions
+from . import analytics, audio_mix, branding, cancellation, copyright_bypass, creative_brief, editor_ops, hook_crafter, link_download, localization, mask_detection, midroll, pipeline, semantic_search, versions
 from .content_agent import _terminate_process_tree
 from .media_store import MediaStore
 from .creator_library import CreatorLibrary
@@ -161,6 +162,9 @@ class JobsService:
         self._runs: dict[str, dict] = {}
         self._short_exports: dict[str, dict] = {}
         self._section_previews: dict[str, dict] = {}
+        # Tracks the "re-index dialogue" action (reset + re-run transcript+scenes)
+        # per job so the dashboard can disable the button and poll progress.
+        self._reindex: dict[str, dict] = {}
         self._uploads: set[str] = set()
         self._deleting: set[str] = set()
         self._lock = threading.Lock()
@@ -287,6 +291,7 @@ class JobsService:
         info["short_export"] = short_state
         with self._lock:
             info["section_preview"] = dict(self._section_previews.get(job_id, {"running": False}))
+            info["reindex"] = dict(self._reindex.get(job_id, {"running": False}))
         info["stopping"] = bool(run_state.get("stopping"))
         info["cancelled"] = any(stage["status"] == "cancelled" for stage in info["stages"])
         info["can_stop"] = info["running"] and not info["stopping"]
@@ -903,6 +908,7 @@ class JobsService:
         if not database_path.exists():
             raise FileNotFoundError("chưa có chỉ mục media")
         with MediaStore(database_path) as store:
+            store.migrate()
             segments = store.list_transcript(1)
         if not segments:
             raise FileNotFoundError("chưa có lời thoại trong chỉ mục media")
@@ -938,8 +944,20 @@ class JobsService:
         if start < 0 or not 0 < duration <= media_intelligence.MAX_CLIP_SECONDS:
             raise ValueError("invalid highlight time bounds")
         temporary = output.with_suffix(".exporting.mp4"); temporary.unlink(missing_ok=True)
+        command = [ffmpeg, "-y", "-ss", f"{start:.6f}", "-i", str(self.source_media_path(job_id)), "-t", f"{duration:.6f}", "-vf", "scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2", "-c:v", "libx264", "-threads", str(pipeline.ffmpeg_thread_cap()), "-preset", "fast", "-c:a", "aac", "-movflags", "+faststart", str(temporary)]
         try:
-            pipeline.subprocess.run([ffmpeg, "-y", "-ss", f"{start:.6f}", "-i", str(self.source_media_path(job_id)), "-t", f"{duration:.6f}", "-vf", "scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2", "-c:v", "libx264", "-preset", "fast", "-c:a", "aac", "-movflags", "+faststart", str(temporary)], capture_output=True, text=True, check=True, shell=False)
+            try:
+                pipeline.subprocess.run(command, capture_output=True, text=True, check=True, shell=False)
+            except pipeline.subprocess.CalledProcessError as exc:
+                if not pipeline.is_ffmpeg_memory_error(f"{exc.stderr or ''}\n{exc.output or ''}"):
+                    raise
+                # One bounded, single-threaded retry clears the transient x264
+                # "malloc failed / Cannot allocate memory" allocation flake.
+                temporary.unlink(missing_ok=True)
+                pipeline.subprocess.run(
+                    pipeline.ffmpeg_command_single_thread(command),
+                    capture_output=True, text=True, check=True, shell=False,
+                )
             if not temporary.is_file() or temporary.stat().st_size <= 0:
                 raise RuntimeError("ffmpeg did not produce a highlight clip")
             temporary.replace(output)
@@ -1140,6 +1158,16 @@ class JobsService:
         content_agent = str(payload.get("content_agent") or "scaffold")
         if content_agent not in CONTENT_AGENT_MODES:
             raise ValueError(f"content_agent phải là {' hoặc '.join(CONTENT_AGENT_MODES)}")
+        watermark_detect = str(payload.get("watermark_detect") or "").strip().lower()
+        watermark_removal: dict = {}
+        if watermark_detect:
+            if watermark_detect not in ("color", "temporal", "external"):
+                raise ValueError("watermark_detect phải là color, temporal, hoặc external")
+            detect: dict = {"method": watermark_detect}
+            detector_cmd = str(payload.get("detector_cmd") or "").strip()
+            if detector_cmd:
+                detect["external_cmd"] = detector_cmd
+            watermark_removal = {"enabled": True, "detect": detect}
         config = JobConfig(
             job_id=job_id,
             language=str(payload.get("language") or "vi"),
@@ -1151,9 +1179,102 @@ class JobsService:
             content_agent=content_agent,
             brand_top_band=float(payload.get("brand_top_band") or 0),
             brand_bottom_band=float(payload.get("brand_bottom_band") or 0),
+            watermark_removal=watermark_removal,
+            copyright_bypass=str(payload.get("copyright_bypass") or "off"),
         )
         pipeline.create_job(root, config)
         return self.status(job_id)
+
+    def probe_detector(self, job_id: str) -> dict:
+        """Run the external watermark detector on one frame to validate config."""
+        root = self._require_job(job_id)
+        cfg = pipeline.load_manifest(root).config
+        if not cfg.source_video:
+            raise ValueError("job chưa có video nguồn để thử detector")
+        detect = cfg.watermark_removal.detect
+        external_cmd = (detect.external_cmd if detect else "") or ""
+        settings = mask_detection.DetectSettings(method="external", external_cmd=external_cmd)
+        probe = mask_detection.probe_external_detector(Path(cfg.source_video), settings)
+        return {"ok": probe.ok, "masks": probe.masks, "message": probe.message}
+
+    def probe_link(self, url: str, runner=None) -> dict:
+        """Fetch metadata for a video URL via yt-dlp."""
+        url = str(url or "").strip()
+        if not url:
+            raise ValueError("nhập liên kết video hợp lệ")
+        return link_download.fetch_metadata(url, runner=runner)
+
+    def download_link_video(
+        self,
+        job_id: str,
+        url: str,
+        confirm_rights: bool = False,
+        sub_langs: str = "vi,en",
+        runner=None,
+    ) -> dict:
+        root = self._require_job(job_id)
+        url = str(url or "").strip()
+        if not url:
+            raise ValueError("nhập liên kết video hợp lệ")
+        if not confirm_rights and not link_download.rights_confirmed():
+            raise link_download.RightsConfirmationRequired(
+                "Xác nhận bạn có quyền sử dụng video này để tải về."
+            )
+        with self._lock:
+            if (self._runs.get(job_id, {}).get("running") or self._short_exports.get(job_id, {}).get("running")
+                    or self._section_previews.get(job_id, {}).get("running")
+                    or job_id in self._uploads or job_id in self._deleting or job_id in self._indexing):
+                raise RuntimeError("job đang chạy hoặc đang tải video hay đang xuất short")
+            if pipeline.load_manifest(root).config.source_video or (root / "source.mp4").exists():
+                raise FileExistsError("job đã có video nguồn")
+            self._uploads.add(job_id)
+        try:
+            result = link_download.download_video(
+                url,
+                root,
+                confirm_rights=confirm_rights,
+                sub_langs=sub_langs,
+                runner=runner,
+            )
+            source_path = Path(result["source_video"])
+            manifest = pipeline.load_manifest(root)
+            manifest.config.source_video = source_path.resolve()
+            pipeline.save_manifest(root, manifest)
+        finally:
+            with self._lock:
+                self._uploads.discard(job_id)
+        if self._index_auto:
+            self._enqueue_index_quietly(job_id)
+        return self.status(job_id)
+
+    def hook_path(self, job_id: str) -> Path:
+        root = self._require_job(job_id)
+        path = root / "hook.mp4"
+        if not path.is_file():
+            raise FileNotFoundError("chưa có hook teaser cho project này")
+        return path
+
+    def get_hook_info(self, job_id: str) -> dict:
+        root = self._require_job(job_id)
+        hook_file = root / "hook.mp4"
+        meta_file = root / "hook.json"
+        if not hook_file.is_file() or not meta_file.is_file():
+            return {"present": False, "href": None, "meta": None}
+        try:
+            meta = json.loads(meta_file.read_text(encoding="utf-8"))
+        except Exception:
+            meta = None
+        return {"present": True, "href": f"/api/jobs/{job_id}/hook.mp4", "meta": meta}
+
+    def generate_hook(self, job_id: str) -> dict:
+        root = self._require_job(job_id)
+        if not (root / "scenes.json").is_file():
+            raise ValueError("Cần lập chỉ mục cảnh (scenes.json) trước khi tạo hook teaser.")
+        manifest = pipeline.load_manifest(root)
+        if not manifest.config.source_video or not Path(manifest.config.source_video).is_file():
+            raise ValueError("Project chưa có video nguồn để tạo hook teaser.")
+        hook_crafter.build_hook_teaser(root)
+        return self.get_hook_info(job_id)
 
     def import_video(self, job_id: str, filename: str, size: int, reader) -> dict:
         root = self._require_job(job_id)
@@ -1292,6 +1413,69 @@ class JobsService:
 
         threading.Thread(target=worker, name=f"mrf-run-{job_id}", daemon=True).start()
         return {"started": True, "until": until}
+
+    def reindex_transcript(self, job_id: str) -> dict:
+        """Reset and re-run only the transcript + scenes stages for a job.
+
+        Regenerates ``transcript.json``/``captions.srt`` (so faster-whisper runs
+        again with word-level timestamps) and rebuilds ``media_index.sqlite3``
+        from that fresh transcript, then stops before ``outline`` so the already
+        produced script/render are left untouched. Runs in a background thread;
+        progress is exposed via ``status.reindex``.
+        """
+        root = self._require_job(job_id)
+        cfg = pipeline.load_manifest(root).config
+        if not cfg.source_video:
+            raise ValueError("Project chưa có video nguồn để lập chỉ mục lại lời thoại.")
+        # A queued/running background index must yield first so the two never
+        # write media_index.sqlite3 at the same time.
+        self._preempt_index(job_id)
+        state = {"running": True, "error": None,
+                 "message": "Đang bóc lại lời thoại và dựng chỉ mục…"}
+        with self._lock:
+            if (self._runs.get(job_id, {}).get("running")
+                    or self._section_previews.get(job_id, {}).get("running")
+                    or self._short_exports.get(job_id, {}).get("running")
+                    or self._reindex.get(job_id, {}).get("running")
+                    or job_id in self._uploads or job_id in self._deleting or job_id in self._indexing):
+                raise RuntimeError("Project đang xử lý; chờ xong trước khi lập chỉ mục lại lời thoại.")
+            # Flip only these two stages back to pending; the pipeline skips any
+            # stage still marked ready, so re-running is otherwise a no-op.
+            manifest = pipeline.load_manifest(root)
+            for stage in manifest.stages:
+                if stage.stage in ("transcript", "scenes"):
+                    stage.status = "pending"
+                    stage.message = ""
+            pipeline.save_manifest(root, manifest)
+            self._reindex[job_id] = state
+
+        def worker() -> None:
+            error = None
+            try:
+                pipeline.run_job(root, until="scenes")
+                # run_job turns a missing dependency into a "skipped" stage
+                # rather than raising, so a silent no-op would otherwise look
+                # like success. If the transcript did not finish ready, the
+                # captions were NOT recomputed (e.g. faster-whisper is not
+                # installed) - surface that so the operator can act on it.
+                transcript_stage = pipeline.load_manifest(root).stage("transcript")
+                if transcript_stage is not None and transcript_stage.status in ("skipped", "failed"):
+                    error = localization.localize_message(transcript_stage.message) or (
+                        "Không bóc lại được lời thoại (kiểm tra phụ thuộc như faster-whisper)."
+                    )
+            except Exception as exc:
+                error = str(exc)
+            finally:
+                with self._lock:
+                    if self._reindex.get(job_id) is state:
+                        state.update(
+                            running=False,
+                            error=error,
+                            message=None if error else "Đã cập nhật lời thoại và mốc thời gian.",
+                        )
+
+        threading.Thread(target=worker, name=f"mrf-reindex-{job_id}", daemon=True).start()
+        return {"started": True}
 
     def rerender_brand(self, job_id: str, payload: dict) -> dict:
         root = self._require_job(job_id)
@@ -2047,6 +2231,12 @@ class MRFRequestHandler(BaseHTTPRequestHandler):
         if len(parts) == 5 and parts[0] == "jobs" and parts[2] == "shots" and parts[4] == "thumbnail":
             self._serve_file(self.service.shot_thumbnail_path(parts[1], int(parts[3])))
             return
+        if len(parts) == 3 and parts[0] == "jobs" and parts[2] == "hook.mp4":
+            self._serve_file(self.service.hook_path(parts[1]))
+            return
+        if len(parts) == 3 and parts[0] == "jobs" and parts[2] == "hook":
+            self._send_json(200, self.service.get_hook_info(parts[1]))
+            return
         self._send_json(404, {"error": "not found", "error_vi": "không tìm thấy"})
 
     def _route_post(self, parts: list[str]) -> None:
@@ -2067,8 +2257,27 @@ class MRFRequestHandler(BaseHTTPRequestHandler):
         if parts == ["agy-pool", "probe"]:
             self._send_json(200, self.service.probe_agy())
             return
+        if len(parts) == 3 and parts[0] == "jobs" and parts[2] == "probe-detector":
+            self._send_json(200, self.service.probe_detector(parts[1]))
+            return
         if parts == ["jobs"]:
             self._send_json(201, self.service.create_job(self._read_body()))
+            return
+        if parts == ["link-probe"]:
+            body = self._read_body()
+            self._send_json(200, self.service.probe_link(body.get("url", "")))
+            return
+        if len(parts) == 3 and parts[0] == "jobs" and parts[2] == "download-link":
+            body = self._read_body()
+            self._send_json(200, self.service.download_link_video(
+                parts[1],
+                body.get("url", ""),
+                confirm_rights=bool(body.get("confirm_rights")),
+                sub_langs=str(body.get("sub_langs") or "vi,en"),
+            ))
+            return
+        if len(parts) == 3 and parts[0] == "jobs" and parts[2] == "hook":
+            self._send_json(202, self.service.generate_hook(parts[1]))
             return
         if parts == ["creator-library", "series"]:
             self._send_json(201, self.service.save_creator_series(self._read_body()))
@@ -2130,6 +2339,9 @@ class MRFRequestHandler(BaseHTTPRequestHandler):
             return
         if len(parts) == 3 and parts[0] == "jobs" and parts[2] == "index":
             self._send_json(202, self.service.enqueue_index(parts[1]))
+            return
+        if len(parts) == 3 and parts[0] == "jobs" and parts[2] == "reindex-transcript":
+            self._send_json(202, self.service.reindex_transcript(parts[1]))
             return
         if len(parts) == 3 and parts[0] == "jobs" and parts[2] == "stop":
             self._send_json(202, self.service.stop_run(parts[1]))
@@ -2239,10 +2451,18 @@ def create_server(host: str = "127.0.0.1", port: int = 8765,
 def run_server(host: str = "127.0.0.1", port: int = 8765,
                jobs_root: Path | str = "jobs") -> None:
     """Start the local web server and serve until interrupted."""
+    # The dashboard's operator-facing strings are Vietnamese; force UTF-8 on the
+    # console streams so a legacy Windows code page (e.g. cp1258) cannot raise
+    # UnicodeEncodeError on a startup line or an unhandled-exception traceback.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[attr-defined]
+        except (AttributeError, ValueError):
+            pass
     server = create_server(host, port, jobs_root)
     bound_host, bound_port = server.server_address[:2]
     print(f"Movie Review Factory UI: http://{bound_host}:{bound_port}  (jobs: {Path(jobs_root)})")
-    print("Nhấn Ctrl+C để dừng.")
+    print("Press Ctrl+C to stop.")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -2274,6 +2494,9 @@ INDEX_HTML = """<!DOCTYPE html>
   input, select, textarea, button { font: inherit; }
   input, select, textarea { width: 100%; padding: 7px 9px; background: #0f1115; color: #e6e8ee;
       border: 1px solid #333a48; border-radius: 6px; }
+  input[type="checkbox"], input[type="radio"] { width: auto !important; margin: 0; cursor: pointer; flex-shrink: 0; }
+  .checkbox-row { display: flex; align-items: flex-start; gap: 8px; margin: 8px 0; font-size: 12px; color: var(--text, #e6e8ee); cursor: pointer; }
+  .checkbox-row input { margin-top: 2px; }
   textarea { resize: vertical; }
   button { cursor: pointer; padding: 8px 12px; border-radius: 6px; border: 1px solid #333a48;
       background: #232838; color: #e6e8ee; }
@@ -2657,6 +2880,11 @@ INDEX_HTML = """<!DOCTYPE html>
   .settings-row{ display:grid; grid-template-columns:minmax(0,1fr) auto; gap:8px; align-items:end; }
   .settings-row label{ margin:0 0 2px; }
   .settings-row button{ white-space:nowrap; }
+  /* A row of two equal inputs (e.g. the two mask-band fields) needs a balanced
+     two-column grid; the default input+button template squeezes the second
+     field and misaligns the pair. */
+  .settings-row.band-row{ grid-template-columns:1fr 1fr; align-items:start; }
+  .settings-row.band-row input{ width:100%; }
   .library-hub{ display:grid; grid-template-columns:minmax(0,1.15fr) minmax(300px,.85fr); gap:16px; align-items:start; }
   .library-section{ min-width:0; padding:14px; border:1px solid var(--line); border-radius:var(--r-md); background:var(--panel); }
   .library-section > .search-field{ margin-top:12px; }
@@ -2768,17 +2996,33 @@ INDEX_HTML = """<!DOCTYPE html>
         <form id="createForm" class="create-form">
           <label for="sourceFile">Video MP4</label>
           <input id="sourceFile" type="file" accept=".mp4,video/mp4">
+          <details style="margin:8px 0 12px 0">
+            <summary style="cursor:pointer;font-weight:500;color:var(--accent,#4f8ff7)">🔗 Hoặc dán link video (YouTube / Web / Trực tiếp)</summary>
+            <div style="margin-top:6px;display:flex;gap:6px">
+              <input id="linkUrl" type="url" placeholder="https://www.youtube.com/watch?v=..." style="flex:1">
+              <button id="probeLinkBtn" type="button">Kiểm tra link</button>
+            </div>
+            <div id="linkPreview" class="notice" style="display:none;margin-top:6px"></div>
+            <label class="checkbox-row" style="margin:10px 0 6px 0">
+              <input id="confirmDownloadRights" type="checkbox">
+              <span>Tôi xác nhận có quyền tải và sử dụng video này để review/bình luận</span>
+            </label>
+          </details>
           <input id="newJobId" name="job_id" type="hidden">
           <label>Tên phim / truy vấn nghiên cứu</label>
           <input name="movie_title" placeholder="vd: The Matrix (1999)">
           <details class="advanced-fields"><summary>Định hướng review</summary>
             <label for="briefTemplateSelect">Mẫu brief dùng lại</label>
             <select id="briefTemplateSelect"><option value="">Chọn mẫu để điền form…</option></select>
-            <button id="applyBriefTemplate" type="button">Áp dụng mẫu</button>
+            <div class="row" style="margin:8px 0 12px 0">
+              <button id="applyBriefTemplate" type="button">Áp dụng mẫu</button>
+            </div>
             <label for="briefTemplateName">Lưu các trường bên dưới thành mẫu mới</label>
             <input id="briefTemplateName" maxlength="200" placeholder="Tên mẫu brief">
-            <button id="saveBriefTemplate" type="button">Lưu mẫu brief</button>
-            <span id="briefTemplateMsg" class="notice" role="status"></span>
+            <div class="row" style="margin:8px 0 12px 0;align-items:center;gap:8px">
+              <button id="saveBriefTemplate" type="button">Lưu mẫu brief</button>
+              <span id="briefTemplateMsg" class="notice" role="status"></span>
+            </div>
             <label>Luận điểm chính</label><textarea name="review_thesis" rows="2" maxlength="500" placeholder="Điều bạn muốn người xem nhớ sau video"></textarea>
             <label>Giọng kể</label><input name="tone" maxlength="120" placeholder="Hài hước, phân tích, giàu cảm xúc...">
             <label>Khán giả</label><input name="target_audience" maxlength="200" placeholder="Người mới xem hay fan lâu năm">
@@ -2802,14 +3046,26 @@ INDEX_HTML = """<!DOCTYPE html>
             <input name="target_minutes" type="number" value="10" min="1" max="60" step="0.5">
             <label>Tỷ lệ khung hình</label>
             <select name="aspect_ratio"><option>16:9</option><option>9:16</option></select>
+            <label>Bảo vệ bản quyền (Bypass Content ID)</label>
+            <select name="copyright_bypass">
+              <option value="off">Tắt</option>
+              <option value="light">Nhẹ (Zoom 3%, chỉnh màu)</option>
+              <option value="balanced" selected>Cân bằng (Lật ngang, Zoom 5%, chỉnh màu)</option>
+              <option value="aggressive">Mạnh (Lật ngang, Zoom 8%, chỉnh màu, 1.06x)</option>
+            </select>
             <label>Che dải watermark phía trên (0–20% chiều cao)</label>
             <input name="brand_top_band" type="number" value="0" min="0" max="0.2" step="0.01">
             <label>Che dải tiêu đề cũ phía dưới (0–20% chiều cao)</label>
             <input name="brand_bottom_band" type="number" value="0" min="0" max="0.2" step="0.01">
-          </details>
-          <details><summary class="muted">Hoặc nhập đường dẫn cục bộ</summary>
-            <label for="sourcePath">Đường dẫn video trên máy chạy ứng dụng</label>
-            <input id="sourcePath" name="source_video" placeholder="data\\raw\\....mp4">
+            <label>Tự động phát hiện &amp; xoá watermark chìm (ProPainter)</label>
+            <select name="watermark_detect">
+              <option value="">Tắt</option>
+              <option value="color">Ngưỡng màu (color)</option>
+              <option value="temporal">Theo thời gian (temporal)</option>
+              <option value="external">Detector ngoài (external)</option>
+            </select>
+            <label>Lệnh detector ngoài (external) — để trống sẽ dùng MRF_MASK_DETECTOR_CMD</label>
+            <input name="detector_cmd" placeholder="python detect.py --in VIDEO --out OUT">
           </details>
           <div class="row" style="margin-top:10px">
             <button class="primary" type="submit">Tạo project</button>
@@ -2849,7 +3105,7 @@ INDEX_HTML = """<!DOCTYPE html>
           <section class="settings-section">
             <h3>Che chữ nguồn của project hiện tại</h3>
             <p>Chỉ dùng khi bạn có quyền xử lý nguồn. Kiểm tra lại bản dựng sau khi áp dụng.</p>
-            <div class="settings-row">
+            <div class="settings-row band-row">
               <div><label for="brandTopBand">Dải phía trên (0–0,2)</label><input id="brandTopBand" type="number" min="0" max="0.2" step="0.01" value="0"></div>
               <div><label for="brandBottomBand">Dải phía dưới (0–0,2)</label><input id="brandBottomBand" type="number" min="0" max="0.2" step="0.01" value="0"></div>
             </div>
@@ -2967,7 +3223,7 @@ INDEX_HTML = """<!DOCTYPE html>
         <video id="video" controls preload="metadata"></video>
       </div>
       <div class="card" id="exportCard" hidden>
-        <h2>Xuất video</h2>
+        <h2>Xuất bản &amp; bàn giao</h2>
         <div class="muted">Bản MP4 đã vượt qua bước kiểm tra chất lượng.</div>
         <a id="downloadFinal" class="button-link" download="final.mp4">Tải final.mp4</a>
         <button id="handoffBtn" type="button">Đóng gói bàn giao</button>
@@ -3001,6 +3257,18 @@ INDEX_HTML = """<!DOCTYPE html>
           <span id="analyticsMsg" role="status" class="muted"></span>
           <div id="analyticsResults" role="status" class="muted"></div>
         </details>
+        <h3 style="margin-top:16px; border-top:1px solid var(--border, rgba(128,128,128,.25)); padding-top:12px">Cổng xuất bản</h3>
+        <div class="gate">
+          <div>Thao tác này <strong>không tải lên</strong> bất kỳ đâu. Nó chỉ ghi tệp bàn giao
+            <code>publish_record.json</code> khi kịch bản và siêu dữ liệu đã được duyệt.</div>
+          <label class="row" style="margin-top:8px; gap:6px; align-items:center">
+            <input id="confirmPub" type="checkbox" style="width:auto"> Tôi xác nhận tạo bản ghi xuất bản
+          </label>
+          <div class="row" style="margin-top:8px">
+            <button id="publishBtn" disabled>Tạo bản ghi xuất bản</button>
+          </div>
+          <div id="pubMsg" class="notice"></div>
+        </div>
       </div>
       <details id="rightsPanel" class="card">
         <summary>Nguồn và quyền sử dụng tài sản</summary>
@@ -3011,7 +3279,9 @@ INDEX_HTML = """<!DOCTYPE html>
         <label for="rightsStatus">Tình trạng quyền</label>
         <select id="rightsStatus"><option value="unreviewed">Chưa duyệt</option><option value="permitted">Có quyền theo ghi chú</option><option value="restricted">Hạn chế sử dụng</option></select>
         <label for="rightsEvidence">Ghi chú căn cứ / giấy phép</label><textarea id="rightsEvidence" rows="2" maxlength="1000"></textarea>
-        <button id="saveRightsBtn" type="button">Lưu ghi chú quyền</button>
+        <div class="row" style="margin:8px 0 10px 0">
+          <button id="saveRightsBtn" type="button">Lưu ghi chú quyền</button>
+        </div>
         <div id="rightsMsg" class="notice" role="status"></div>
         <div id="rightsList" class="project-list notice"></div>
       </details>
@@ -3020,14 +3290,18 @@ INDEX_HTML = """<!DOCTYPE html>
         <div class="muted">Lưu mốc trước khi sửa. Bản MP4 đạt QA trước đó vẫn có thể tải về.</div>
         <label for="versionName">Tên phiên bản</label>
         <input id="versionName" type="text" maxlength="100" placeholder="Ví dụ: Trước khi sửa đoạn kết">
-        <button id="saveVersionBtn" type="button">Lưu phiên bản</button>
+        <div class="row" style="margin:8px 0 12px 0">
+          <button id="saveVersionBtn" type="button">Lưu phiên bản</button>
+        </div>
         <label for="versionSelect">Phiên bản đã lưu</label>
         <select id="versionSelect" aria-label="Phiên bản đã lưu"></select>
         <label for="versionKind">Khôi phục phần</label>
         <select id="versionKind"><option value="script">Kịch bản</option><option value="scene_plan">Cảnh</option><option value="captions">Phụ đề</option><option value="metadata">Thông tin đăng</option><option value="final">Video đã QA</option></select>
-        <button id="restoreVersionBtn" type="button">Khôi phục</button>
-        <a id="versionDownload" hidden download="final.mp4">Tải bản MP4 cũ</a>
-        <span id="versionMsg" class="muted" role="status"></span>
+        <div class="row" style="margin:8px 0 12px 0;align-items:center;gap:8px">
+          <button id="restoreVersionBtn" type="button">Khôi phục</button>
+          <a id="versionDownload" hidden download="final.mp4">Tải bản MP4 cũ</a>
+          <span id="versionMsg" class="muted" role="status"></span>
+        </div>
       </details>
       <div id="qaFindings" class="card muted" role="status" hidden></div>
       </section>
@@ -3039,6 +3313,8 @@ INDEX_HTML = """<!DOCTYPE html>
             <p>Xem lại cảnh quay, theo dõi lời thoại và trích đoạn trong cùng một không gian làm việc.</p>
           </div>
           <div class="export-tools" aria-label="Công cụ xuất">
+            <button id="reindexTranscriptBtn" type="button" title="Bóc lại lời thoại rồi dựng lại mốc thời gian phụ đề cho video nguồn (không đụng kịch bản/bản dựng)">↻ Index lại lời thoại</button>
+            <span id="reindexMsg" class="muted" role="status" aria-live="polite"></span>
             <button id="mediaExportBtn" type="button" style="display:none" aria-label="Tải bản ghi lời thoại dạng VTT">↓ VTT</button>
           </div>
         </div>
@@ -3111,13 +3387,25 @@ INDEX_HTML = """<!DOCTYPE html>
         <div id="editorState" class="action-note" role="status" hidden></div>
         <details id="sectionPreviewPanel">
           <summary>Xem nhanh một phần · 540p</summary>
-          <p class="muted">Chọn phần để dựng thử từ các cảnh đã chọn, giọng đọc và phụ đề có mốc thời gian. Không dựng lại toàn bộ video.</p>
-          <div class="row"><label for="sectionPreviewSelect">Phần cần xem <select id="sectionPreviewSelect"></select></label>
-            <button id="sectionPreviewBtn" type="button">Dựng nhanh phần này</button>
+          <label for="sectionPreviewSelect" style="margin:8px 0 4px">Phần cần xem</label>
+          <div class="row" style="align-items:center;gap:8px">
+            <select id="sectionPreviewSelect" style="flex:1;min-width:0;max-width:520px"></select>
+            <button id="sectionPreviewBtn" type="button" style="white-space:nowrap">Dựng nhanh phần này</button>
             <a id="sectionPreviewDownload" hidden download="section-preview.mp4">Tải MP4</a>
-            <a id="sectionPreviewSrt" hidden download="section-preview.srt">Tải SRT</a></div>
+            <a id="sectionPreviewSrt" hidden download="section-preview.srt">Tải SRT</a>
+          </div>
           <video id="sectionPreviewVideo" controls preload="metadata" style="width:100%;max-height:440px" hidden aria-label="Xem trước phần đã chọn"></video>
           <div id="sectionPreviewMsg" class="notice" role="status"></div>
+        </details>
+        <details id="hookTeaserPanel" style="margin-top:10px">
+          <summary>Hook Teaser (3–5s) · Giữ chân người xem</summary>
+          <p class="muted">Tự động chọn cảnh kịch tính nhất từ chỉ mục cảnh (scenes.json), cắt teaser ngắn 3–5 giây kèm hiệu ứng punch-in zoom để làm hook mở đầu video review.</p>
+          <div class="row">
+            <button id="buildHookBtn" type="button">Tạo Hook Teaser</button>
+            <a id="hookDownload" hidden download="hook.mp4">Tải hook.mp4</a>
+          </div>
+          <video id="hookVideo" controls preload="metadata" style="width:100%;max-height:360px;margin-top:8px" hidden aria-label="Xem trước Hook Teaser"></video>
+          <div id="hookMsg" class="notice" role="status"></div>
         </details>
         <div id="continuityTracks" class="continuity-grid"></div>
         <div id="timelineList" class="timeline-list"></div>
@@ -3197,20 +3485,6 @@ INDEX_HTML = """<!DOCTYPE html>
         <div id="metaMsg" class="notice"></div>
       </div>
 
-      <div class="card" id="publishGateCard">
-        <h2>Cổng xuất bản</h2>
-        <div class="gate">
-          <div>Thao tác này <strong>không tải lên</strong> bất kỳ đâu. Nó chỉ ghi tệp bàn giao
-            <code>publish_record.json</code> khi kịch bản và siêu dữ liệu đã được duyệt.</div>
-          <label class="row" style="margin-top:8px; gap:6px; align-items:center">
-            <input id="confirmPub" type="checkbox" style="width:auto"> Tôi xác nhận tạo bản ghi xuất bản
-          </label>
-          <div class="row" style="margin-top:8px">
-            <button id="publishBtn" disabled>Tạo bản ghi xuất bản</button>
-          </div>
-          <div id="pubMsg" class="notice"></div>
-        </div>
-      </div>
       </section>
     </div>
   </main>
@@ -3236,7 +3510,7 @@ let editorLoaded = null;
 // opening "Duyệt & xuất" jumps straight to the block that needs attention.
 let reviewFocus = 'script';
 // The card that matches each focus. Opening the review view scrolls to this
-// block; the three FORM cards (script/metadata/publish) collapse so only the
+// block; the FORM cards (script/metadata) collapse so only the
 // one called out by the next action is expanded. videoCard / exportCard /
 // thumbnailCard keep whatever visibility their own state gave them (a ready
 // preview or export must never disappear just because it is not the focus).
@@ -3246,8 +3520,8 @@ const REVIEW_FOCUS_TARGET = {
   thumbnail: 'thumbnailCard',
   export: 'exportCard',
 };
-// Only these three collapse by focus; the rest are governed by loadStatus.
-const REVIEW_FORM_CARDS = ['scriptReviewCard', 'metadataReviewCard', 'publishGateCard'];
+// Only these form cards collapse by focus; the rest are governed by loadStatus.
+const REVIEW_FORM_CARDS = ['scriptReviewCard', 'metadataReviewCard'];
 function applyReviewFocus(scroll = false) {
   const focus = REVIEW_FOCUS_TARGET[reviewFocus] ? reviewFocus : 'script';
   // Both review sub-sections stay visible so every state-driven card (final
@@ -3272,6 +3546,11 @@ function setWorkspaceView(view) {
     tab.tabIndex = active ? 0 : -1;
   }
   for (const name of ['explore', 'edit', 'review', 'files']) $('view-' + name).hidden = name !== view;
+  // The section preview <video> lives inside a collapsible panel on the "Biên
+  // tập" tab. Leaving that tab hides the panel (and its native controls), so a
+  // still-playing preview would keep emitting audio with no reachable pause
+  // button. Stop playback whenever we navigate away from the edit view.
+  if (view !== 'edit') { const preview = $('sectionPreviewVideo'); if (preview && !preview.paused) preview.pause(); }
   if (view === 'review') {
     applyReviewFocus(true);
   } else {
@@ -3317,6 +3596,8 @@ let mediaFilter = 'transcript';
 let manualTranscriptScrollUntil = 0;
 let activeTranscriptId = null;
 let pendingLibrarySeek = null;
+let activeTimelinePreviewIndex = -1;
+let currentTimelineData = null;
 
 // Read bearer token from URL fragment (#token=...) — fragment is never sent
 // to the server so the token never appears in access logs.  Not persisted.
@@ -3325,6 +3606,29 @@ let _tok = '';
   const m = location.hash.replace(/^#/, '').match(/(?:^|&)token=([^&]*)/);
   if (m) _tok = decodeURIComponent(m[1]);
 })();
+
+function showError(error) {
+  // Global rejection handler used by many actions (.catch(showError)). It was
+  // referenced but never defined, so any failing action threw
+  // "showError is not defined" (e.g. the mid-roll "Chèn vào kịch bản" flow).
+  const message = (error && error.message) ? error.message : String(error || 'Đã xảy ra lỗi.');
+  try { console.error('showError:', error); } catch (ignored) {}
+  let toast = document.getElementById('globalErrorToast');
+  if (!toast) {
+    toast = document.createElement('div');
+    toast.id = 'globalErrorToast';
+    toast.setAttribute('role', 'alert');
+    toast.style.cssText = 'position:fixed;right:24px;bottom:24px;max-width:520px;z-index:2147483647;'
+      + 'background:#b3261e;color:#fff;padding:12px 16px;border-radius:8px;'
+      + 'box-shadow:0 4px 16px rgba(0,0,0,.35);font:14px/1.4 system-ui,sans-serif;'
+      + 'cursor:pointer;white-space:pre-wrap;word-break:break-word;';
+    toast.addEventListener('click', () => toast.remove());
+    document.body.appendChild(toast);
+  }
+  toast.textContent = message;
+  clearTimeout(showError._timer);
+  showError._timer = setTimeout(() => { if (toast && toast.parentNode) toast.remove(); }, 8000);
+}
 
 async function api(method, path, body) {
   const opts = { method, headers: {} };
@@ -3703,6 +4007,27 @@ function chunkTranscriptRow(row) {
     }
   }
   if (!blocks.length) return [];
+  // Prefer real per-word timings when the row carries them: give each block the
+  // start/end of the actual spoken words it holds, so a cue never drifts across a
+  // pause. Fall back to interpolating by character length for legacy rows.
+  const wordTimes = Array.isArray(row.words) ? row.words.filter(w =>
+    w && Number.isFinite(Number(w.start)) && Number.isFinite(Number(w.end))) : [];
+  if (wordTimes.length) {
+    const NL = String.fromCharCode(10);
+    const wordCues = [];
+    let wi = 0;
+    for (let i = 0; i < blocks.length; i++) {
+      const tokens = blocks[i].split(NL).join(' ').split(' ').filter(Boolean).length || 1;
+      const firstWord = wordTimes[Math.min(wi, wordTimes.length - 1)];
+      const lastWord = wordTimes[Math.min(wi + tokens - 1, wordTimes.length - 1)];
+      let cueStart = i === 0 ? start : Number(firstWord.start);
+      let cueEnd = i === blocks.length - 1 ? end : Number(lastWord.end);
+      if (!(cueEnd > cueStart)) cueEnd = Math.min(end, cueStart + CAPTION_MIN_CUE_SECONDS);
+      wordCues.push({ start: cueStart, end: cueEnd, text: blocks[i] });
+      wi += tokens;
+    }
+    return wordCues;
+  }
   const totalChars = blocks.reduce((sum, block) => sum + block.replace(/\\n/g, '').length, 0) || 1;
   const span = end - start;
   const cues = [];
@@ -3827,6 +4152,12 @@ async function refreshSectionPreview() {
   } else if (video.dataset.src) { video.pause(); video.removeAttribute('src'); video.load(); video.dataset.src = ''; }
 }
 $('sectionPreviewSelect').onchange = () => refreshSectionPreview().catch(showError);
+// Collapsing the preview panel hides the <video> (and its controls) but does
+// not stop playback, leaving audio running with no reachable pause button.
+// Pause the preview whenever the panel is folded shut.
+$('sectionPreviewPanel').addEventListener('toggle', () => {
+  if (!$('sectionPreviewPanel').open) { const preview = $('sectionPreviewVideo'); if (preview && !preview.paused) preview.pause(); }
+});
 $('sectionPreviewBtn').onclick = async () => {
   if (!current) return;
   const index = $('sectionPreviewSelect').value;
@@ -3843,6 +4174,60 @@ $('sectionPreviewBtn').onclick = async () => {
     await loadStatus();
   } catch (error) { $('sectionPreviewMsg').textContent = error.message; $('sectionPreviewBtn').disabled = false; }
 };
+
+async function refreshHookTeaser() {
+  if (!current) return;
+  try {
+    const data = await api('GET', '/api/jobs/' + encodeURIComponent(current) + '/hook');
+    const download = $('hookDownload');
+    const video = $('hookVideo');
+    const msg = $('hookMsg');
+    if (data.present && data.href) {
+      if (download) { download.hidden = false; download.href = data.href; }
+      if (video) {
+        video.hidden = false;
+        if (video.dataset.src !== data.href) { video.dataset.src = data.href; video.src = data.href; }
+      }
+      if (msg) {
+        msg.textContent = data.meta
+          ? ('Cảnh ' + data.meta.scene_index + ' (' + data.meta.duration_seconds + 's) · Điểm kịch tính: ' + Math.round((data.meta.dramatic_score || 0) * 100) + '%')
+          : 'Đã có hook teaser.';
+      }
+    } else {
+      if (download) download.hidden = true;
+      if (video) {
+        video.hidden = true;
+        if (video.dataset.src) { video.pause(); video.removeAttribute('src'); video.dataset.src = ''; }
+      }
+      if (msg) msg.textContent = 'Chưa tạo hook teaser cho project này.';
+    }
+  } catch (e) {
+    if ($('hookMsg')) $('hookMsg').textContent = e.message;
+  }
+}
+if ($('hookTeaserPanel')) {
+  $('hookTeaserPanel').addEventListener('toggle', () => {
+    if ($('hookTeaserPanel').open) refreshHookTeaser().catch(showError);
+    else { const v = $('hookVideo'); if (v && !v.paused) v.pause(); }
+  });
+}
+if ($('buildHookBtn')) {
+  $('buildHookBtn').onclick = async () => {
+    if (!current) return;
+    const btn = $('buildHookBtn');
+    btn.disabled = true;
+    $('hookMsg').textContent = 'Đang tìm cảnh kịch tính nhất và dựng hook teaser…';
+    try {
+      await api('POST', '/api/jobs/' + encodeURIComponent(current) + '/hook', {});
+      await refreshHookTeaser();
+      $('hookMsg').textContent = 'Đã tạo hook teaser thành công!';
+    } catch (e) {
+      $('hookMsg').textContent = 'Lỗi tạo hook teaser: ' + e.message;
+    } finally {
+      btn.disabled = false;
+    }
+  };
+}
 
 // Keep the Timeline/Continuity card on screen even when there is nothing to
 // edit yet; show a status line and a next action instead of hiding the card.
@@ -3861,6 +4246,7 @@ async function renderEditor() {
       api('GET', '/api/jobs/' + encodeURIComponent(current) + '/timeline'),
       api('GET', '/api/jobs/' + encodeURIComponent(current) + '/person-tracks'),
     ]);
+    currentTimelineData = timelineData;
   } catch (error) {
     $('timelineList').replaceChildren();
     $('continuityTracks').replaceChildren();
@@ -3937,8 +4323,26 @@ async function renderEditor() {
     const controls = document.createElement('div'); controls.className = 'timeline-controls';
 
     // Three most-used clip actions stay inline; the rest move to an overflow menu.
-    const preview = document.createElement('button'); preview.type = 'button'; preview.textContent = 'Xem trước';
-    preview.onclick = () => seekSource(source.start_seconds);
+    const preview = document.createElement('button');
+    preview.type = 'button';
+    preview.className = 'timeline-preview-btn';
+    preview.dataset.clipIndex = String(clip.timeline_index);
+    const isThisPlaying = activeTimelinePreviewIndex === clip.timeline_index && !$('sourceVideo').paused;
+    preview.textContent = isThisPlaying ? '⏸ Tạm dừng' : '▶ Xem trước';
+    preview.onclick = () => {
+      const video = $('sourceVideo');
+      if (activeTimelinePreviewIndex === clip.timeline_index && !video.paused) {
+        video.pause();
+        preview.textContent = '▶ Xem trước';
+        activeTimelinePreviewIndex = -1;
+      } else {
+        activeTimelinePreviewIndex = clip.timeline_index;
+        seekSource(source.start_seconds);
+        document.querySelectorAll('.timeline-preview-btn').forEach(btn => {
+          btn.textContent = (Number(btn.dataset.clipIndex) === clip.timeline_index) ? '⏸ Tạm dừng' : '▶ Xem trước';
+        });
+      }
+    };
 
     const trim = document.createElement('button'); trim.type = 'button'; trim.textContent = 'Cắt';
     trim.onclick = () => {
@@ -4491,6 +4895,20 @@ function badge(stage) {
   return `<span class="badge ${stage.status}" title="${stage.status_hint||''}">${stage.status_label}</span>`;
 }
 
+let reindexWasRunning = false;
+$('reindexTranscriptBtn').onclick = async () => {
+  if (!current) return;
+  const btn = $('reindexTranscriptBtn');
+  btn.disabled = true;
+  $('reindexMsg').textContent = 'Đang bắt đầu lập chỉ mục lại lời thoại…';
+  try {
+    await api('POST', '/api/jobs/' + encodeURIComponent(current) + '/reindex-transcript', {});
+    await loadStatus();
+  } catch (error) {
+    btn.disabled = false;
+    $('reindexMsg').textContent = error.message;
+  }
+};
 async function loadStatus() {
   if (!current) return;
   let s;
@@ -4505,12 +4923,26 @@ async function loadStatus() {
     + (s.running ? ' · đang chạy…' : '')
     + (s.is_indexing ? ` · đang lập chỉ mục nền${s.indexing && s.indexing.stage ? ` (${s.indexing.stage} ${s.indexing.done}/${s.indexing.total})` : ''}…` : '');
   $('runErr').textContent = s.run_error_vi ? ('Lỗi chạy: ' + s.run_error_vi) : '';
-  $('runBtn').disabled = !!s.running || !!s.uploading || !s.has_source_video;
+  $('runBtn').disabled = !!s.running || !!s.uploading || !s.has_source_video || !!(s.reindex && s.reindex.running);
   $('stopBtn').hidden = !s.running;
   $('stopBtn').disabled = !s.can_stop;
   $('deleteBtn').disabled = !!s.running || !!s.uploading;
   $('brandRenderBtn').disabled = !!s.running || !s.has_source_video;
   $('audioSaveBtn').disabled = !!s.running;
+  const reindexState = s.reindex || { running: false };
+  if ($('reindexTranscriptBtn')) {
+    $('reindexTranscriptBtn').disabled = !!reindexState.running || !!s.running || !!s.uploading || !!s.is_indexing || !s.has_source_video;
+    $('reindexMsg').textContent = reindexState.running
+      ? (reindexState.message || 'Đang lập chỉ mục lại lời thoại…')
+      : reindexState.error ? ('Lỗi: ' + reindexState.error) : (reindexState.message || '');
+    // When a re-index finishes cleanly, refresh the explorer so the recomputed
+    // caption timing is shown without a manual reload.
+    if (reindexWasRunning && !reindexState.running && !reindexState.error
+        && current && $('mediaExplorerCard').style.display !== 'none') {
+      renderMediaExplorer($('mediaSearch').value.trim()).catch(() => {});
+    }
+    reindexWasRunning = !!reindexState.running;
+  }
   if (document.activeElement !== $('brandTopBand')) $('brandTopBand').value = s.brand_top_band ?? 0;
   if (document.activeElement !== $('brandBottomBand')) $('brandBottomBand').value = s.brand_bottom_band ?? 0;
   $('sourceRetryCard').hidden = !!s.has_source_video;
@@ -4633,7 +5065,7 @@ async function loadStatus() {
   // freshly computed next action (reviewFocus) after state-driven visibility.
   if (!$('view-review').hidden) applyReviewFocus();
   if (poller) { clearInterval(poller); poller = null; }
-  if (s.running || s.is_indexing || s.section_preview?.running) { poller = setInterval(loadStatus, 1500); }
+  if (s.running || s.is_indexing || s.section_preview?.running || s.reindex?.running) { poller = setInterval(loadStatus, 1500); }
   if ($('sectionPreviewPanel').open && $('sectionPreviewSelect').value) {
     refreshSectionPreview().catch(showError);
   }
@@ -4700,6 +5132,10 @@ async function renderMeta(approvals) {
 $('createForm').onsubmit = async (e) => {
   e.preventDefault();
   const file = $('sourceFile').files[0];
+  const linkUrl = String($('linkUrl') ? $('linkUrl').value : '').trim();
+  const confirmRights = $('confirmDownloadRights') ? $('confirmDownloadRights').checked : false;
+  if (linkUrl && file) { $('createMsg').textContent = 'Chọn tải file lên hoặc dán link video, không dùng cả hai.'; return; }
+  if (linkUrl && !confirmRights) { $('createMsg').textContent = 'Vui lòng xác nhận bạn có quyền sử dụng video này để tải về.'; return; }
   const fd = new FormData(e.target);
   const payload = Object.fromEntries(fd.entries());
   payload.job_id = autoJobId(payload.movie_title, file);
@@ -4718,10 +5154,21 @@ $('createForm').onsubmit = async (e) => {
   let created = null;
   try {
     created = await api('POST', '/api/jobs', payload);
-    if (file) await uploadVideo(created.job_id, file);
-    // The project code is auto-generated and kept hidden; confirm by name only.
-    $('createMsg').textContent = file ? 'Đã tạo project và import video.' : 'Đã tạo project mới.';
+    if (file) {
+      await uploadVideo(created.job_id, file);
+      $('createMsg').textContent = 'Đã tạo project và import video.';
+    } else if (linkUrl) {
+      $('createMsg').textContent = 'Đang tải video từ liên kết (yt-dlp)...';
+      await api('POST', '/api/jobs/' + encodeURIComponent(created.job_id) + '/download-link', {
+        url: linkUrl,
+        confirm_rights: confirmRights,
+      });
+      $('createMsg').textContent = 'Đã tạo project và tải video từ liên kết thành công.';
+    } else {
+      $('createMsg').textContent = 'Đã tạo project mới.';
+    }
     e.target.reset();
+    if ($('linkPreview')) $('linkPreview').style.display = 'none';
     await loadJobs();
     selectJob(created.job_id);
   } catch (err) {
@@ -4729,6 +5176,55 @@ $('createForm').onsubmit = async (e) => {
     if (created) { await loadJobs(); selectJob(created.job_id); }
   } finally { submit.disabled = false; }
 };
+
+if ($('probeLinkBtn')) {
+  $('probeLinkBtn').onclick = async () => {
+    const url = String($('linkUrl') ? $('linkUrl').value : '').trim();
+    const btn = $('probeLinkBtn');
+    const preview = $('linkPreview');
+    if (!url) {
+      if (preview) {
+        preview.style.display = 'block';
+        preview.className = 'notice warn';
+        preview.textContent = 'Vui lòng nhập liên kết video trước khi kiểm tra.';
+      }
+      $('createMsg').textContent = 'Nhập liên kết video trước khi kiểm tra.';
+      return;
+    }
+    btn.disabled = true;
+    const origText = btn.textContent;
+    btn.textContent = 'Đang kiểm tra…';
+    if (preview) {
+      preview.style.display = 'block';
+      preview.className = 'notice info';
+      preview.textContent = 'Đang kết nối và đọc thông tin video qua yt-dlp…';
+    }
+    $('createMsg').textContent = 'Đang kiểm tra thông tin liên kết…';
+    try {
+      const meta = await api('POST', '/api/link-probe', { url });
+      if (meta.title && !$('createForm').elements.namedItem('movie_title').value) {
+        $('createForm').elements.namedItem('movie_title').value = meta.title;
+      }
+      const mins = meta.duration ? Math.round(meta.duration / 60) : null;
+      if (preview) {
+        preview.style.display = 'block';
+        preview.className = 'notice ok';
+        preview.textContent = '✓ Tìm thấy: ' + (meta.title || 'Video') + (mins ? ' (~' + mins + ' phút)' : '') + (meta.subtitle_languages && meta.subtitle_languages.length ? ' · Phụ đề: ' + meta.subtitle_languages.join(', ') : '');
+      }
+      $('createMsg').textContent = 'Đã đọc thông tin liên kết: ' + (meta.title || url);
+    } catch (err) {
+      if (preview) {
+        preview.style.display = 'block';
+        preview.className = 'notice err';
+        preview.textContent = 'Lỗi đọc liên kết: ' + err.message;
+      }
+      $('createMsg').textContent = 'Lỗi đọc liên kết: ' + err.message;
+    } finally {
+      btn.disabled = false;
+      btn.textContent = origText;
+    }
+  };
+}
 
 const agyPoolSelect = document.querySelector('select[name="content_agent"]');
 function setAgyBadge(state, text) {
@@ -4977,8 +5473,31 @@ $('mediaSearchBtn').onclick = () => renderMediaExplorer($('mediaSearch').value.t
 $('mediaSearch').onkeydown = event => { if (event.key === 'Enter') renderMediaExplorer($('mediaSearch').value.trim()); };
 document.querySelectorAll('[data-media-filter]').forEach(tab => tab.onclick = () => activateMediaFilter(tab.dataset.mediaFilter));
 $('mediaResults').addEventListener('scroll', () => { manualTranscriptScrollUntil = Date.now() + 4000; }, {passive: true});
-$('sourceVideo').addEventListener('timeupdate', event => { $('playerTime').textContent = formatTime(event.currentTarget.currentTime); syncActiveTranscript(event.currentTarget.currentTime); });
 $('chatQuestion').addEventListener('keydown', event => { if (event.key === 'Enter') askVideo().catch(showError); });
+$('sourceVideo').addEventListener('timeupdate', event => {
+  const curTime = event.currentTarget.currentTime;
+  $('playerTime').textContent = formatTime(curTime);
+  syncActiveTranscript(curTime);
+  if (activeTimelinePreviewIndex >= 0 && currentTimelineData && Array.isArray(currentTimelineData.clips)) {
+    const curClip = currentTimelineData.clips.find(c => c.timeline_index === activeTimelinePreviewIndex);
+    const endSec = Number(curClip && curClip.source_clip ? curClip.source_clip.end_seconds : 0);
+    if (endSec > 0 && curTime >= endSec) {
+      event.currentTarget.pause();
+    }
+  }
+});
+$('sourceVideo').addEventListener('pause', () => {
+  activeTimelinePreviewIndex = -1;
+  document.querySelectorAll('.timeline-preview-btn').forEach(btn => {
+    btn.textContent = '▶ Xem trước';
+  });
+});
+$('sourceVideo').addEventListener('ended', () => {
+  activeTimelinePreviewIndex = -1;
+  document.querySelectorAll('.timeline-preview-btn').forEach(btn => {
+    btn.textContent = '▶ Xem trước';
+  });
+});
 
 $('saveMetaBtn').onclick = async () => {
   const tags = $('metaTags').value.split(',').map(t => t.trim()).filter(Boolean);

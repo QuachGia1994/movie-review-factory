@@ -1,0 +1,18 @@
+# Dependencies for scripts/detectors/florence2_watermark_masks.py
+# Install into a SEPARATE environment - these are intentionally NOT part of the
+# movie-review-factory package (which only depends on Pillow at runtime).
+#
+#   python -m venv florence-env
+#   florence-env\Scripts\activate           # Windows  (Linux/macOS: source florence-env/bin/activate)
+#   pip install --upgrade pip
+#   # For CUDA, install the matching torch wheel first, e.g.:
+#   #   pip install torch --index-url https://download.pytorch.org/whl/cu121
+#   pip install -r scripts/detectors/requirements-florence2.txt
+
+torch
+transformers>=4.40
+pillow
+opencv-python
+numpy
+einops        # required by the Florence-2 remote code
+timm          # required by the Florence-2 vision backbone

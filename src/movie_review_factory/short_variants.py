@@ -13,7 +13,15 @@ from uuid import uuid4
 from PIL import Image, ImageDraw
 
 from . import branding
-from .pipeline import _escape_ffmpeg_filter_path, _srt_timestamp, caption_ass, load_manifest
+from .pipeline import (
+    _escape_ffmpeg_filter_path,
+    _srt_timestamp,
+    caption_ass,
+    ffmpeg_command_single_thread,
+    ffmpeg_thread_cap,
+    is_ffmpeg_memory_error,
+    load_manifest,
+)
 
 SHORT_SECONDS_MIN = 3
 SHORT_SECONDS_MAX = 60
@@ -207,12 +215,20 @@ def build_short(
         "-i", str(final), "-loop", "1", "-t", str(OUTRO_SECONDS),
         "-i", str(outro_path), "-filter_complex", filter_graph,
         "-map", "[v]", "-map", "[a]", "-c:v", "libx264",
+        "-threads", str(ffmpeg_thread_cap()),
         "-pix_fmt", "yuv420p", "-r", "30", "-c:a", "aac",
         "-b:a", "160k", "-movflags", "+faststart",
         "-t", str(end - start + OUTRO_SECONDS), "-f", "mp4", str(temporary),
     ]
     try:
         result = subprocess.run(command, capture_output=True, text=True)
+        if result.returncode and is_ffmpeg_memory_error(result.stderr):
+            # One bounded, single-threaded retry clears the transient x264
+            # "malloc failed / Cannot allocate memory" allocation flake.
+            temporary.unlink(missing_ok=True)
+            result = subprocess.run(
+                ffmpeg_command_single_thread(command), capture_output=True, text=True,
+            )
         if result.returncode or not temporary.is_file() or not temporary.stat().st_size:
             raise RuntimeError("short FFmpeg render failed: " + result.stderr[-4000:])
         current_stat = final.stat()

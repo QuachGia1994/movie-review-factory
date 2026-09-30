@@ -154,6 +154,48 @@ def test_short_export_retimes_cues_and_uses_final_review_only(
     assert receipt["qa_passed"] is True
 
 
+def test_short_retries_single_threaded_on_x264_oom(
+    review: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append(list(command))
+        if len(calls) == 1:  # first attempt dies with the x264 allocation flake
+            return subprocess.CompletedProcess(
+                command, 1, "",
+                "x264 [error]: malloc of size 7186688 failed\nCannot allocate memory",
+            )
+        Path(command[-1]).write_bytes(b"rendered-short")
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr("movie_review_factory.short_variants.subprocess.run", fake_run)
+    exported = build_short(review, 10, 20, ffmpeg="ffmpeg")
+
+    assert exported == review / "shorts" / "short-review.mp4"
+    assert len(calls) == 2  # exactly one bounded retry
+    assert "-threads" in calls[0]  # first attempt is thread-capped
+    # the retry forces single-threaded x264
+    assert calls[1][calls[1].index("-threads") + 1] == "1"
+
+
+def test_short_does_not_retry_on_non_memory_failure(
+    review: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append(list(command))
+        return subprocess.CompletedProcess(
+            command, 1, "", "Invalid data found when processing input",
+        )
+
+    monkeypatch.setattr("movie_review_factory.short_variants.subprocess.run", fake_run)
+    with pytest.raises(RuntimeError, match="short FFmpeg render failed"):
+        build_short(review, 10, 20, ffmpeg="ffmpeg")
+    assert len(calls) == 1  # no retry for a non-allocation failure
+
+
 def test_short_wraps_long_review_cue_for_portrait_safe_zone(
     review: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

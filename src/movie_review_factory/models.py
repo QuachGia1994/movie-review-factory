@@ -19,6 +19,44 @@ class CreativeBrief(BaseModel):
     forbidden_claims: list[Annotated[str, Field(max_length=300)]] = Field(default_factory=list, max_length=20)
 
 
+class WatermarkDetect(BaseModel):
+    """Auto-generate a per-frame watermark mask folder from the video.
+
+    Avoids hand-drawing masks: ``color`` thresholds pixels near a target colour
+    per frame (handles a moving watermark), ``temporal`` marks pixels that barely
+    change across frames (a fixed semi-transparent overlay), and ``external`` runs
+    a user-supplied detector command (e.g. Florence-2/SAM) via
+    ``MRF_MASK_DETECTOR_CMD`` so heavy ML deps are never bundled.
+    """
+
+    method: Literal["color", "temporal", "external"] = "color"
+    color: list[int] = Field(default_factory=lambda: [255, 255, 255])
+    tolerance: int = Field(default=30, ge=0, le=255)
+    dilation: int = Field(default=4, ge=0, le=64)
+    threshold: int = Field(default=12, ge=0, le=255)
+    fps: float = Field(default=0, ge=0, le=120)
+    external_cmd: str = ""
+
+
+class WatermarkRemoval(BaseModel):
+    """Optional full-frame ("đánh chìm") watermark removal via ProPainter.
+
+    Disabled by default so existing jobs are untouched. When enabled, the
+    ``watermark`` pipeline stage reconstructs a clean source video before the
+    scenes/render stages read it. ``mask`` may be a single PNG applied to every
+    frame (white = remove), or a folder of per-frame masks for a watermark that
+    moves over time; otherwise a rectangular mask is generated from ``top_band``
+    / ``bottom_band`` (fractions of frame height) or ``boxes``.
+    """
+
+    enabled: bool = False
+    mask: Path | None = None
+    detect: WatermarkDetect | None = None
+    top_band: float = Field(default=0, ge=0, le=0.5)
+    bottom_band: float = Field(default=0, ge=0, le=0.5)
+    boxes: list[list[float]] = Field(default_factory=list, max_length=12)
+
+
 class JobConfig(BaseModel):
     job_id: str
     language: str = "vi"
@@ -33,6 +71,10 @@ class JobConfig(BaseModel):
     # Optional branded intro/outro cards on the main render (0 = disabled).
     intro_seconds: float = Field(default=0, ge=0, le=15)
     outro_seconds: float = Field(default=0, ge=0, le=15)
+    # Optional full-frame watermark removal (ProPainter). Disabled by default.
+    watermark_removal: WatermarkRemoval = Field(default_factory=WatermarkRemoval)
+    # Optional Content ID bypass profile: 'off', 'light', 'balanced', 'aggressive'.
+    copyright_bypass: str = Field(default="off", max_length=30)
 
 
 class Artifact(BaseModel):
@@ -105,6 +147,13 @@ class Shot(BaseModel):
         return self
 
 
+class TranscriptWord(BaseModel):
+    """One spoken word with its measured start/end time (from Whisper word timings)."""
+    word: str = ""
+    start: float = Field(default=0.0, ge=0)
+    end: float = Field(default=0.0, ge=0)
+
+
 class TranscriptSegment(BaseModel):
     id: int | None = Field(default=None, ge=1)
     media_asset_id: int = Field(ge=1)
@@ -112,6 +161,9 @@ class TranscriptSegment(BaseModel):
     end_seconds: float = Field(gt=0)
     text: str = Field(min_length=1)
     speaker: str | None = None
+    # Per-word timings for this segment; empty for legacy rows indexed before word
+    # timings were persisted. Used to time captions on the real spoken words.
+    words: list[TranscriptWord] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def validate_time_range(self) -> "TranscriptSegment":

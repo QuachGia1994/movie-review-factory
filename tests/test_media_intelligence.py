@@ -68,6 +68,46 @@ def test_highlight_clip_validates_exports_vertical_and_caches(tmp_path: Path, mo
     assert kwargs["shell"] is False
 
 
+def test_highlight_clip_retries_single_threaded_on_x264_oom(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _indexed_job(tmp_path)
+    svc = JobsService(tmp_path)
+    monkeypatch.setattr(pipeline.shutil, "which", lambda name: "ffmpeg.exe")
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append(list(command))
+        if len(calls) == 1:  # first attempt dies with the x264 allocation flake
+            raise subprocess.CalledProcessError(
+                1, command, output="", stderr="x264 [error]: malloc of size 5759552 failed",
+            )
+        Path(command[-1]).write_bytes(b"clip")
+
+    monkeypatch.setattr(pipeline.subprocess, "run", fake_run)
+    out = svc.highlight_clip_path("intel", "h-1")
+    assert out.read_bytes() == b"clip"
+    assert len(calls) == 2  # exactly one bounded retry
+    assert "-threads" in calls[0]  # first attempt is thread-capped
+    assert calls[1][calls[1].index("-threads") + 1] == "1"  # retry forces single thread
+
+
+def test_highlight_clip_does_not_retry_on_non_memory_failure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _indexed_job(tmp_path)
+    svc = JobsService(tmp_path)
+    monkeypatch.setattr(pipeline.shutil, "which", lambda name: "ffmpeg.exe")
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append(list(command))
+        raise subprocess.CalledProcessError(
+            1, command, output="", stderr="Invalid data found when processing input",
+        )
+
+    monkeypatch.setattr(pipeline.subprocess, "run", fake_run)
+    with pytest.raises(subprocess.CalledProcessError):
+        svc.highlight_clip_path("intel", "h-1")
+    assert len(calls) == 1  # no retry for a non-allocation failure
+
+
 def test_retrieval_ranks_matching_dialogue_before_unrelated_segments(tmp_path: Path) -> None:
     root = _indexed_job(tmp_path)
     matches = mi.retrieve_segments(root / "media_index.sqlite3", "Who saves the town?")

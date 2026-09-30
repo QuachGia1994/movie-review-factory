@@ -66,6 +66,43 @@ def test_preview_selects_only_one_section_and_retimes_captions(section_job, monk
     assert section_preview_artifact(section_job, 2, "mp4") == output
 
 
+def test_preview_retries_single_threaded_on_x264_oom(section_job, monkeypatch):
+    import movie_review_factory.quick_preview as preview
+    monkeypatch.setattr(preview, "_probe_duration_seconds", lambda path, ffprobe: 10.0)
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(list(cmd))
+        if len(calls) == 1:  # first attempt dies with the x264 allocation flake
+            return subprocess.CompletedProcess(
+                cmd, 1, "", "x264 [error]: malloc of size 5759552 failed\nCannot allocate memory",
+            )
+        Path(cmd[-1]).write_bytes(b"preview-video")
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr(preview.subprocess, "run", fake_run)
+    output = build_section_preview(section_job, 2, ffmpeg="ffmpeg", ffprobe="ffprobe")
+    assert output.name == "section-2.mp4"
+    assert len(calls) == 2  # exactly one bounded retry
+    assert "-threads" in calls[0]  # first attempt is thread-capped
+    assert calls[1][calls[1].index("-threads") + 1] == "1"  # retry forces single thread
+
+
+def test_preview_does_not_retry_on_non_memory_failure(section_job, monkeypatch):
+    import movie_review_factory.quick_preview as preview
+    monkeypatch.setattr(preview, "_probe_duration_seconds", lambda path, ffprobe: 10.0)
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(list(cmd))
+        return subprocess.CompletedProcess(cmd, 1, "", "Invalid data found when processing input")
+
+    monkeypatch.setattr(preview.subprocess, "run", fake_run)
+    with pytest.raises(RuntimeError, match="section preview render failed"):
+        build_section_preview(section_job, 2, ffmpeg="ffmpeg", ffprobe="ffprobe")
+    assert len(calls) == 1  # no retry for a non-allocation failure
+
+
 def test_preview_stale_if_script_or_plan_changes(section_job, monkeypatch):
     import movie_review_factory.quick_preview as preview
     monkeypatch.setattr(preview, "_probe_duration_seconds", lambda path, ffprobe: 10.0)

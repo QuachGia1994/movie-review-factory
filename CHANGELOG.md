@@ -5,6 +5,12 @@ All notable changes to Movie Review Factory are documented here.
 ## [Unreleased]
 
 ### Added
+- Download-from-link ingest via yt-dlp, gated on an explicit usage-rights confirmation (`link_download.py`): fetches <=1080p mp4 + matching vi/en subtitles into a project as `source.mp4`, exposes a dashboard "Kiểm tra link" metadata probe, and ships no IP-block/cookie/proxy evasion tooling by design.
+- Copyright-safety clip transforms (`copyright_bypass.py`): per-clip horizontal flip, subtle zoom-crop and colour-grade applied in the render via `off`/`light`/`balanced`/`aggressive` profiles (`MRF_COPYRIGHT_BYPASS` / `cfg.copyright_bypass`) to reduce automated Content ID false-positives on reviewed footage.
+- Hook teaser (`hook_crafter.py`): deterministic bilingual (EN/VI) most-dramatic-scene selection from `scenes.json` cuts a standalone 3-5s `hook.mp4` (+`hook.json`) with a punch-in zoom and optional impact SFX (`MRF_HOOK_SFX`); it never reads or modifies `final.mp4`.
+- Full-frame watermark removal stage (`watermark_removal.py` + `mask_detection.py`): optional ProPainter-based reconstruction driven by a configured mask/band/box or color/temporal/external detectors, writing `source_clean.mp4` upstream of the render.
+- Word-level transcript timing (migration `007_transcript_words.sql`): the transcript stage records per-word start/end and splits coarse VAD segments on sentence ends and silent gaps, so caption cues anchor to real speech instead of drifting by character-count interpolation.
+- Visual rhythm helpers (`visual_rhythm.py`): optional Ken Burns motion (`MRF_KEN_BURNS`) and per-cut transition SFX (`MRF_TRANSITION_SFX`) in the render.
 - Recorded creator product identity and a production roadmap for measured narration timing, editorial QA, recoverable edits, channel branding, delivery package, audience feedback and clean-Windows release checks.
 - The creator dashboard now includes a reusable creative brief, exact-span recap/opinion tags with internal source references, named edit versions and conservative restore, decoded black/freeze/silence and loudness QA, optional rights-tracked voice/music/SFX mix, and approved-commentary 9:16 short export. Local series/brief/asset-rights planning and measured Studio analytics import modules are available; their dashboard integration and creator walkthrough remain in progress.
 - Spoken-word TTS timing now drives two-line subtitle cues and measured section cuts in the renderer; QA checks caption geometry, source provenance, repeated or stretched footage, and voice/visual section drift, and actual midroll placement within the central 40–60% of narration. Ambiguous spoken-word chapter matches fail QA. The AGY midroll remains behind script approval.
@@ -39,11 +45,21 @@ All notable changes to Movie Review Factory are documented here.
 - One-file packaging discovers numbered SQL migrations automatically instead of hard-coding a single migration; the full managed runtime now includes FastEmbed and an app-owned embedding-model cache with offline reuse.
 - Semantic search scores with exact numpy matrix math (chunked, pure-Python fallback when numpy is absent): `search_store` p95 on the real job index drops from ~128ms to ~1.2ms at 383 vectors with unchanged ranking, tie-breaks, and `-1.0` dim-mismatch/zero-norm parity.
 - AGY pool scheduler v2 (`pool_scheduler.py`): bounded retries with backoff (`MRF_AGY_RETRIES`, 0-3), a 300s role cooldown (`MRF_AGY_COOLDOWN_SECONDS`) that skips only the cooled-down role, partial resume via `ScheduleResult`, and per-role quota/health telemetry (status, latency_ms, cooldown_until) written to `%LOCALAPPDATA%\MovieReviewFactory\runtime\pool_health.json`. AGY prompts fit the measured ~26,000-char backend limit (`MRF_AGY_PROMPT_MAX`) with tiered scene/candidate context instead of failing the request.
+- Ignore local scratch/dev artifacts (`_*_tmp.py`, dashboard logs, clipboard images, scratch reports) via `.gitignore` so they never enter a release.
+
+### Removed
+- Removed the unwired micro-speed bypass knob (`speed_factor` / `speed_filter`): clip video is concatenated silent while the independent TTS narration is the fixed-length master audio, so a video-only tempo shift would desync the two - it is intentionally not applied.
 
 ### Fixed
+- yt-dlp metadata/download now run under bounded timeouts (metadata 60s; download `MRF_DOWNLOAD_TIMEOUT`, default 1800s, `0` disables) so a stalled connection or livestream can no longer hang the download thread indefinitely.
+- The dashboard link-download form now sends the actual rights-confirmation checkbox value instead of a hardcoded `true`, keeping the client consent gate authoritative.
+- The dashboard server forces UTF-8 on stdout/stderr so Vietnamese output can no longer crash a legacy Windows console (cp1258 `UnicodeEncodeError`).
 - Long Edge TTS scripts synthesize in short, retryable chunks with measured per-chunk word offsets, FFmpeg concatenation and atomic output replacement; a failed chunk cannot replace the previous narration or its approved export.
 - The transcript stage now skips with `source video has no audio track - nothing to transcribe` when the source container has no audio stream, instead of failing inside faster-whisper/PyAV with `tuple index out of range`.
 - Claude content-agent failures surface a bounded `head…tail` diagnostic (≤400 chars, no full stdout flood) and transient HTTP 429/5xx advisor errors are retried with `5×(attempt+1)` backoff instead of failing the stage on the first hiccup.
+
+### Security
+- Hardened the yt-dlp invocation against argument injection: URLs are validated as http(s)-only and a `--` end-of-options guard is placed before the URL, so a value like `--exec=...` can no longer be parsed as a yt-dlp option.
 
 ## [0.2.0] - 2026-09-23
 

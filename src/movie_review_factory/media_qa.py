@@ -110,3 +110,22 @@ def inspect_rendered_media(
     scan = {"check": "decoded_media_scan", "value": {"video": True, "audio": True},
             "passed": True, "message": ""}
     return [scan, *parse_signal_log(result.stderr, duration_seconds)]
+
+
+def signals_from_render_log(
+    log: str, duration_seconds: float | None = None
+) -> list[dict] | None:
+    """Build QA signal checks from the detect log captured during the render.
+
+    The render pass runs the same detect filters on the frames FFmpeg already
+    decoded for the encode, so QA reuses them instead of decoding final.mp4 a
+    second time. Returns ``None`` when the log carries no measurable loudness
+    summary - the detect pass did not run or the log is unusable - so the caller
+    can fall back to a fresh decode pass.
+    """
+    if "Integrated loudness" not in log:
+        return None
+    scan = {"check": "decoded_media_scan",
+            "value": {"video": True, "audio": True, "source": "render_pass"},
+            "passed": True, "message": ""}
+    return [scan, *parse_signal_log(log, duration_seconds)]

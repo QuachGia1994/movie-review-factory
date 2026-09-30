@@ -34,21 +34,47 @@ def prepare(script: dict, plan: dict, line: str, seconds: float = 10,
             boundaries.append((point, left_section, position))
     if not boundaries:
         raise ValueError("Không tìm thấy ranh giới phần ở 50% timeline.")
-    midpoint, after_section, clip_position = min(boundaries, key=lambda item: abs(item[0] - total / 2))
-    if abs(midpoint - total / 2) > total * .1:
-        raise ValueError("Không có ranh giới phần đủ gần 50% timeline.")
+
+    # The renderer re-times every section to its spoken narration, and QA measures the
+    # CTA against that narration timeline. So when the measured narration length is known
+    # we must pick and validate the boundary on the narration timeline -- not on the
+    # nominal visual budget, which can be on a completely different scale (e.g. a 10-minute
+    # target that only speaks ~3.6 minutes). Choosing on the visual budget can drop the CTA
+    # outside the central 40-60% of actual narration and fail editorial QA.
+    words_total = sum(len(str(s.get("narration") or "").split()) for s in sections)
+    use_voice = bool(
+        narration_seconds and math.isfinite(narration_seconds)
+        and narration_seconds > 0 and words_total
+    )
+
+    def voice_fraction(after: int) -> float:
+        """Estimate the rendered CTA-midpoint fraction of narration for a boundary."""
+        words_before = sum(len(str(s.get("narration") or "").split()) for s in sections[:after])
+        voice_before = narration_seconds * words_before / words_total
+        return (voice_before + seconds / 2) / (narration_seconds + seconds)
+
+    if use_voice:
+        midpoint, after_section, clip_position = min(
+            boundaries, key=lambda item: abs(voice_fraction(item[1]) - 0.5)
+        )
+        if abs(voice_fraction(after_section) - 0.5) > 0.1:
+            raise ValueError("Không có ranh giới phần nào nằm trong khoảng giữa 40–60% lời đọc.")
+    else:
+        midpoint, after_section, clip_position = min(
+            boundaries, key=lambda item: abs(item[0] - total / 2)
+        )
+        if abs(midpoint - total / 2) > total * .1:
+            raise ValueError("Không có ranh giới phần đủ gần 50% timeline.")
     if not 1 <= after_section < len(sections):
         raise ValueError("Chỉ số phần phim trong scene plan không khớp kịch bản.")
 
     extra_before = 0.0
-    if narration_seconds and math.isfinite(narration_seconds) and narration_seconds > 0:
+    if use_voice:
         words_before = sum(len(str(s.get("narration") or "").split()) for s in sections[:after_section])
-        words_total = sum(len(str(s.get("narration") or "").split()) for s in sections)
-        if words_total:
-            expected_voice_start = narration_seconds * words_before / words_total
-            extra_before = round(max(0.0, expected_voice_start - midpoint), 3)
-            if extra_before > total * .05:
-                raise ValueError("Lời đọc và hình lệch quá xa ở mốc 50% timeline.")
+        expected_voice_start = narration_seconds * words_before / words_total
+        extra_before = round(max(0.0, expected_voice_start - midpoint), 3)
+        if extra_before > total * .05:
+            raise ValueError("Lời đọc và hình lệch quá xa ở mốc 50% timeline.")
     amended_script = copy.deepcopy(script)
     amended_plan = copy.deepcopy(plan)
     amended_script["approved"] = False

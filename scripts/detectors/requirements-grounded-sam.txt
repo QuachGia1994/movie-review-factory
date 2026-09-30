@@ -1,0 +1,18 @@
+# Dependencies for scripts/detectors/grounded_sam_watermark_masks.py
+# Install into a SEPARATE environment - these are intentionally NOT part of the
+# movie-review-factory package (which only depends on Pillow at runtime).
+#
+#   python -m venv grounded-sam-env
+#   grounded-sam-env\Scripts\activate        # Windows (Linux/macOS: source .../bin/activate)
+#   pip install --upgrade pip
+#   # For CUDA, install the matching torch wheel first, e.g.:
+#   #   pip install torch --index-url https://download.pytorch.org/whl/cu121
+#   pip install -r scripts/detectors/requirements-grounded-sam.txt
+
+torch
+transformers>=4.44   # GroundingDINO + SAM + Florence-2 all shipped in transformers
+pillow
+opencv-python
+numpy
+einops               # required by the Florence-2 remote code (florence2 detector)
+timm                 # required by Florence-2 / DINO vision backbones

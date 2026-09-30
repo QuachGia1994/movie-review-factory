@@ -1,4 +1,4 @@
-﻿import json
+import json
 import sys
 import types
 from pathlib import Path
@@ -46,8 +46,8 @@ def test_run_job_no_video_skips_ingest_completes_text_stages(job_dir: Path) -> N
     for stage in ("research", "outline", "script", "scene_plan", "metadata"):
         assert by_stage[stage].status == "ready", f"{stage} expected ready, got {by_stage[stage].status}"
 
-    # media stages skipped honestly
-    for stage in ("transcript", "scenes", "tts", "alignment", "render", "qa"):
+    # media stages skipped honestly (incl. the optional watermark stage)
+    for stage in ("watermark", "transcript", "scenes", "tts", "alignment", "render", "qa"):
         assert by_stage[stage].status == "skipped"
 
     # publish skips because approvals are missing
@@ -176,7 +176,7 @@ def test_transcript_writes_timed_segments_and_srt(tmp_path: Path, monkeypatch: p
 
         def transcribe(self, source_path: str, **kwargs: object) -> tuple[list[object], object]:
             assert source_path == str(source)
-            assert kwargs == {"language": None, "vad_filter": True}
+            assert kwargs == {"language": None, "vad_filter": True, "word_timestamps": True}
             return [
                 types.SimpleNamespace(start=0.0, end=1.25, text=" Xin chào "),
                 types.SimpleNamespace(start=1.25, end=2.5, text="thế giới"),
@@ -195,6 +195,13 @@ def test_transcript_writes_timed_segments_and_srt(tmp_path: Path, monkeypatch: p
     ))
     monkeypatch.setenv("MRF_WHISPER_CPU_THREADS", "8")
     monkeypatch.setenv("MRF_WHISPER_BATCH_SIZE", str(batch_size))
+    # Pin the runtime so the assertion holds regardless of the test box's GPU, and
+    # stub the WAV pre-extract so the unit test stays hermetic (no real ffmpeg).
+    monkeypatch.setenv("MRF_WHISPER_DEVICE", "cpu")
+    monkeypatch.setenv("MRF_WHISPER_COMPUTE_TYPE", "int8")
+    monkeypatch.setattr(
+        "movie_review_factory.pipeline._prepare_whisper_audio", lambda root, src: src
+    )
     from movie_review_factory.pipeline import _transcript
 
     artifacts, message = _transcript(tmp_path, load_manifest(tmp_path))
@@ -206,13 +213,71 @@ def test_transcript_writes_timed_segments_and_srt(tmp_path: Path, monkeypatch: p
     assert transcript["language"] == "vi"
     assert transcript["output_language"] == "vi"
     assert transcript["segments"] == [
-        {"start_seconds": 0.0, "end_seconds": 1.25, "text": "Xin chào"},
-        {"start_seconds": 1.25, "end_seconds": 2.5, "text": "thế giới"},
+        {"start_seconds": 0.0, "end_seconds": 1.25, "text": "Xin chào", "words": []},
+        {"start_seconds": 1.25, "end_seconds": 2.5, "text": "thế giới", "words": []},
     ]
     assert (tmp_path / "captions.srt").read_text(encoding="utf-8") == (
         "1\n00:00:00,000 --> 00:00:01,250\nXin chào\n\n"
         "2\n00:00:01,250 --> 00:00:02,500\nthế giới\n"
     )
+
+
+def test_transcript_splits_long_segment_into_word_anchored_rows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A coarse multi-sentence VAD block is cut into sentence-sized rows whose timing
+    comes from the spoken words, so a mid-block pause never drifts a later caption
+    ahead of the audio (the Khám phá tab bug)."""
+    source = tmp_path / "owned-sample.mp4"
+    source.touch()
+    create_job(tmp_path, JobConfig(job_id="split-job", source_video=source))
+
+    def _w(word: str, start: float, end: float) -> object:
+        return types.SimpleNamespace(word=word, start=start, end=end)
+
+    # One 15.0–27.0s VAD block holding two utterances with a ~7s pause between them.
+    long_segment = types.SimpleNamespace(
+        start=15.0, end=27.0,
+        text="Dạ em tới lấy hàng đi giao á chị ơi. Ê dạ dạ.",
+        words=[
+            _w(" Dạ", 15.0, 15.3), _w(" em", 15.3, 15.5), _w(" tới", 15.5, 15.8),
+            _w(" lấy", 15.8, 16.1), _w(" hàng", 16.1, 16.5), _w(" đi", 16.5, 16.7),
+            _w(" giao", 16.7, 17.0), _w(" á", 17.0, 17.2), _w(" chị", 17.2, 17.5),
+            _w(" ơi.", 17.5, 19.0),
+            _w(" Ê", 26.0, 26.3), _w(" dạ", 26.3, 26.6), _w(" dạ.", 26.6, 27.0),
+        ],
+    )
+
+    class FakeModel:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            pass
+
+        def transcribe(self, source_path: str, **kwargs: object) -> tuple[list[object], object]:
+            assert kwargs.get("word_timestamps") is True
+            return [long_segment], types.SimpleNamespace(language="vi")
+
+    monkeypatch.setitem(sys.modules, "faster_whisper", types.SimpleNamespace(
+        WhisperModel=FakeModel, BatchedInferencePipeline=lambda model: model,
+    ))
+    monkeypatch.setenv("MRF_WHISPER_BATCH_SIZE", "1")
+    from movie_review_factory.pipeline import _transcript
+
+    _, message = _transcript(tmp_path, load_manifest(tmp_path))
+    transcript = json.loads((tmp_path / "transcript.json").read_text(encoding="utf-8"))
+    seg = transcript["segments"]
+    assert [(s["start_seconds"], s["end_seconds"], s["text"]) for s in seg] == [
+        (15.0, 19.0, "Dạ em tới lấy hàng đi giao á chị ơi."),
+        (26.0, 27.0, "Ê dạ dạ."),
+    ]
+    assert message == "transcribed 2 segments"
+    # Each row now carries its own word timings (Lượt 4); the frontend times captions
+    # from these instead of interpolating by character count.
+    assert seg[0]["words"][0] == {"word": "Dạ", "start": 15.0, "end": 15.3}
+    assert seg[0]["words"][-1] == {"word": "ơi.", "start": 17.5, "end": 19.0}
+    assert [w["word"] for w in seg[1]["words"]] == ["Ê", "dạ", "dạ."]
+    # The second utterance is anchored to its real spoken words at 26.0–27.0s, not
+    # interpolated linearly across the 12s block (which would place it near ~22s).
+    assert seg[1]["words"][0]["start"] == 26.0 and seg[1]["words"][-1]["end"] == 27.0
 
 
 def test_transcript_skips_when_source_has_no_audio(tmp_path: Path) -> None:
@@ -244,6 +309,136 @@ def test_whisper_model_options_use_app_cache_and_offline_flags(
         "download_root": str(cache),
         "local_files_only": True,
     }
+
+
+def test_whisper_runtime_auto_selects_cuda_then_falls_back_to_cpu(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import movie_review_factory.pipeline as pipeline
+
+    for name in ("MRF_WHISPER_MODEL", "MRF_WHISPER_DEVICE", "MRF_WHISPER_COMPUTE_TYPE"):
+        monkeypatch.delenv(name, raising=False)
+
+    monkeypatch.setattr(pipeline, "_cuda_available", lambda: True)
+    assert pipeline._whisper_runtime() == ("small", "cuda", "float16")
+
+    monkeypatch.setattr(pipeline, "_cuda_available", lambda: False)
+    assert pipeline._whisper_runtime() == ("small", "cpu", "int8")
+
+
+def test_whisper_runtime_honours_env_overrides(monkeypatch: pytest.MonkeyPatch) -> None:
+    import movie_review_factory.pipeline as pipeline
+
+    monkeypatch.setattr(pipeline, "_cuda_available", lambda: False)
+    monkeypatch.setenv("MRF_WHISPER_MODEL", "distil-large-v3")
+    monkeypatch.setenv("MRF_WHISPER_DEVICE", "cuda")
+    monkeypatch.setenv("MRF_WHISPER_COMPUTE_TYPE", "int8_float16")
+    assert pipeline._whisper_runtime() == ("distil-large-v3", "cuda", "int8_float16")
+
+
+def test_prepare_whisper_audio_prefers_wav_and_falls_back(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import movie_review_factory.pipeline as pipeline
+
+    source = tmp_path / "clip.mp4"
+    source.touch()
+
+    def fake_extract(src: Path, dest: Path) -> bool:
+        dest.write_bytes(b"RIFFfake")
+        return True
+
+    monkeypatch.setattr(pipeline, "_extract_wav_16k_mono", fake_extract)
+    prepared = pipeline._prepare_whisper_audio(tmp_path, source)
+    assert prepared == tmp_path / ".mrf_whisper_audio.wav"
+    assert prepared.exists()
+
+    monkeypatch.setattr(pipeline, "_extract_wav_16k_mono", lambda src, dest: False)
+    assert pipeline._prepare_whisper_audio(tmp_path, source) == source
+
+
+def test_parse_srt_segments_reads_timings_and_strips_tags() -> None:
+    import movie_review_factory.pipeline as pipeline
+
+    raw = (
+        "1\n00:00:01,000 --> 00:00:02,500\n<i>Hello</i> {\\an8}world\n\n"
+        "2\n00:00:03,000 --> 00:00:04,000\nsecond line\n"
+    )
+    assert pipeline._parse_srt_segments(raw) == [
+        {"start_seconds": 1.0, "end_seconds": 2.5, "text": "Hello world"},
+        {"start_seconds": 3.0, "end_seconds": 4.0, "text": "second line"},
+    ]
+
+
+def test_transcript_falls_back_to_cpu_when_gpu_runtime_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "owned-sample.mp4"
+    source.touch()
+    create_job(tmp_path, JobConfig(job_id="gpu-fallback-job", source_video=source))
+
+    attempted: list[str] = []
+
+    class FakeModel:
+        def __init__(self, model_name: str, *, device: str, compute_type: str, cpu_threads: int) -> None:
+            attempted.append(device)
+            if device == "cuda":
+                raise RuntimeError("CUDA driver not found")
+
+        def transcribe(self, source_path: str, **kwargs: object) -> tuple[list[object], object]:
+            return (
+                [types.SimpleNamespace(start=0.0, end=1.0, text="hi", words=[])],
+                types.SimpleNamespace(language="en"),
+            )
+
+    monkeypatch.setitem(sys.modules, "faster_whisper", types.SimpleNamespace(
+        WhisperModel=FakeModel, BatchedInferencePipeline=lambda model: model,
+    ))
+    monkeypatch.setenv("MRF_WHISPER_DEVICE", "cuda")
+    monkeypatch.setenv("MRF_WHISPER_BATCH_SIZE", "1")
+    monkeypatch.setattr(
+        "movie_review_factory.pipeline._prepare_whisper_audio", lambda root, src: src
+    )
+    from movie_review_factory.pipeline import _transcript
+
+    artifacts, message = _transcript(tmp_path, load_manifest(tmp_path))
+
+    assert attempted == ["cuda", "cpu"]
+    assert message == "transcribed 1 segments"
+    assert [artifact.name for artifact in artifacts] == ["transcript.json", "captions.srt"]
+
+
+def test_transcript_reuses_embedded_subtitles_when_enabled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "with-subs.mp4"
+    source.touch()
+    create_job(tmp_path, JobConfig(job_id="subs-job", language="vi", source_video=source))
+
+    import movie_review_factory.pipeline as pipeline
+
+    def fake_embedded(src: Path, want_langs: list, root: Path):
+        assert want_langs == ["vi"]
+        return (
+            [
+                {"start_seconds": 0.0, "end_seconds": 1.0, "text": "Xin ch\u00e0o"},
+                {"start_seconds": 1.0, "end_seconds": 2.0, "text": "th\u1ebf gi\u1edbi"},
+            ],
+            "vi",
+        )
+
+    monkeypatch.setattr(pipeline, "_embedded_subtitle_segments", fake_embedded)
+    monkeypatch.setenv("MRF_TRANSCRIPT_EMBEDDED_SUBS", "1")
+    from movie_review_factory.pipeline import _transcript
+
+    artifacts, message = _transcript(tmp_path, load_manifest(tmp_path))
+
+    assert "embedded subtitle" in message
+    transcript = json.loads((tmp_path / "transcript.json").read_text(encoding="utf-8"))
+    assert transcript["source"] == "embedded-subtitles"
+    assert transcript["language"] == "vi"
+    assert len(transcript["segments"]) == 2
+    assert [artifact.name for artifact in artifacts] == ["transcript.json", "captions.srt"]
 
 
 # --- scenes stage -----------------------------------------------------------
@@ -619,6 +814,59 @@ def test_tts_selects_default_voice_for_unknown_language(
     assert voice["voice"] == "en-US-AriaNeural"
 
 
+def test_tts_prosody_resolves_presets_overrides_and_drops_noops(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import movie_review_factory.pipeline as pipeline
+
+    for name in ("MRF_TTS_EMOTION", "MRF_TTS_RATE", "MRF_TTS_PITCH", "MRF_TTS_VOLUME"):
+        monkeypatch.delenv(name, raising=False)
+    assert pipeline._tts_prosody() == {}
+
+    monkeypatch.setenv("MRF_TTS_EMOTION", "dramatic")
+    assert pipeline._tts_prosody() == {"rate": "-6%", "pitch": "-4Hz"}
+
+    monkeypatch.setenv("MRF_TTS_RATE", "+20%")   # explicit override wins
+    monkeypatch.setenv("MRF_TTS_VOLUME", "+0%")  # no-op is dropped
+    assert pipeline._tts_prosody() == {"rate": "+20%", "pitch": "-4Hz"}
+
+    monkeypatch.setenv("MRF_TTS_EMOTION", "")
+    monkeypatch.delenv("MRF_TTS_RATE", raising=False)
+    monkeypatch.setenv("MRF_TTS_PITCH", "bogus")  # invalid is ignored
+    assert pipeline._tts_prosody() == {}
+
+
+def test_tts_applies_prosody_to_communicate_when_emotion_set(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _approved_script_job(tmp_path, [{"title": "Hook", "narration": "Xin ch\u00e0o th\u1ebf gi\u1edbi"}])
+
+    captured: dict[str, object] = {}
+
+    class ProsodyCommunicate:
+        def __init__(self, text: str, voice: str, *, boundary: str = "WordBoundary",
+                     rate: str | None = None, pitch: str | None = None, volume: str | None = None) -> None:
+            assert boundary == "WordBoundary"
+            captured.update(rate=rate, pitch=pitch, volume=volume)
+            self.text = text
+
+        async def stream(self):
+            yield {"type": "audio", "data": b"ID3-fake-mp3"}
+            for i, word in enumerate(self.text.split()):
+                yield {"type": "WordBoundary", "text": word,
+                       "offset": i * 3_000_000, "duration": 2_000_000}
+
+    monkeypatch.setitem(sys.modules, "edge_tts", types.SimpleNamespace(Communicate=ProsodyCommunicate))
+    monkeypatch.setenv("MRF_TTS_EMOTION", "energetic")
+    from movie_review_factory.pipeline import _tts
+
+    _tts(tmp_path, load_manifest(tmp_path))
+
+    assert (captured["rate"], captured["pitch"]) == ("+12%", "+8Hz")
+    voice_meta = json.loads((tmp_path / "voice.json").read_text(encoding="utf-8"))
+    assert voice_meta["prosody"] == {"rate": "+12%", "pitch": "+8Hz"}
+
+
 def test_tts_is_deterministic(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     _approved_script_job(tmp_path, [{"title": "Hook", "narration": "Xin chào."}])
     monkeypatch.setitem(sys.modules, "edge_tts", _fake_edge_tts())
@@ -848,9 +1096,9 @@ def test_job_status_reports_counts_covering_every_stage(job_dir: Path) -> None:
     counts = status["counts"]
     # Every stage is counted exactly once by its status.
     assert sum(counts.values()) == len(status["stages"])
-    # No-video run: 5 text stages ready, the rest skipped.
+    # No-video run: 5 text stages ready, the rest skipped (incl. optional watermark).
     assert counts["ready"] == 5
-    assert counts["skipped"] == 9
+    assert counts["skipped"] == 10
 
 
 def test_cli_status_command_succeeds(job_dir: Path) -> None:
@@ -1177,7 +1425,12 @@ def test_render_produces_deterministic_artifacts(
         "source_seconds": 2.0, "duration_seconds": 2.0,
     }]
     filter_complex = commands[0][commands[0].index("-filter_complex") + 1]
-    assert "trim=start=1.000000:end=3.000000" in filter_complex
+    # Each clip decodes from its own seeked source input (-ss/-t -i), not a trim
+    # of a shared input, so the whole timeline is never buffered (the OOM fix).
+    assert "trim=start=" not in filter_complex
+    _ss = commands[0].index("-ss")
+    assert commands[0][_ss:_ss + 4] == ["-ss", "1.000000", "-t", "2.000000"]
+    assert commands[0][_ss + 4] == "-i"
     # Captions burn from a generated ASS whose PlayRes matches the frame, so the
     # filter references aligned.ass and carries no libass-default force_style.
     assert "subtitles='" not in filter_complex
@@ -1202,6 +1455,122 @@ def test_render_produces_deterministic_artifacts(
     assert str(source) in commands[0]
     # Source range equals playback length, so no loop filter is introduced.
     assert "loop=loop=" not in filter_complex
+
+
+def test_render_ken_burns_adds_zoompan_when_enabled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _render_job(tmp_path)
+    import movie_review_factory.pipeline as pipeline
+
+    monkeypatch.setenv("MRF_KEN_BURNS", "1")
+    monkeypatch.setattr(pipeline, "_probe_duration_seconds", lambda path: _render_duration(path, tmp_path))
+    monkeypatch.setattr(pipeline.shutil, "which", lambda name: f"/{name}")
+
+    commands: list[list[str]] = []
+
+    def fake_run(command: list[str], **kwargs: object) -> object:
+        commands.append(command)
+        (tmp_path / "final.rendering.mp4").write_bytes(b"fake-mp4")
+        return object()
+
+    monkeypatch.setattr(pipeline.subprocess, "run", fake_run)
+    pipeline._render(tmp_path, load_manifest(tmp_path))
+
+    filter_complex = commands[0][commands[0].index("-filter_complex") + 1]
+    assert "zoompan=" in filter_complex
+
+
+def test_render_copyright_bypass_adds_filters_when_enabled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _render_job(tmp_path)
+    import movie_review_factory.pipeline as pipeline
+
+    manifest = load_manifest(tmp_path)
+    manifest.config.copyright_bypass = "balanced"
+    pipeline.save_manifest(tmp_path, manifest)
+
+    monkeypatch.setattr(pipeline, "_probe_duration_seconds", lambda path: _render_duration(path, tmp_path))
+    monkeypatch.setattr(pipeline.shutil, "which", lambda name: f"/{name}")
+
+    commands: list[list[str]] = []
+
+    def fake_run(command: list[str], **kwargs: object) -> object:
+        commands.append(command)
+        (tmp_path / "final.rendering.mp4").write_bytes(b"fake-mp4")
+        return object()
+
+    monkeypatch.setattr(pipeline.subprocess, "run", fake_run)
+    pipeline._render(tmp_path, manifest)
+
+    filter_complex = commands[0][commands[0].index("-filter_complex") + 1]
+    assert "hflip" in filter_complex
+    assert "crop=" in filter_complex
+    assert "eq=" in filter_complex
+
+
+
+def test_render_transition_sfx_mixes_whoosh_on_cuts_when_enabled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    whoosh = tmp_path / "whoosh.wav"
+    whoosh.write_bytes(b"RIFFfake")
+    _render_job(tmp_path, clips=[
+        {"section": "Hook", "type": "narration", "source_clip": {"start_seconds": 1.0, "end_seconds": 3.0}},
+        {"section": "Body", "type": "narration", "source_clip": {"start_seconds": 4.0, "end_seconds": 6.0}},
+    ])
+    import movie_review_factory.pipeline as pipeline
+
+    monkeypatch.setenv("MRF_TRANSITION_SFX", str(whoosh))
+    monkeypatch.setattr(pipeline, "_probe_duration_seconds", lambda path: _render_duration(path, tmp_path))
+    monkeypatch.setattr(pipeline.shutil, "which", lambda name: f"/{name}")
+
+    commands: list[list[str]] = []
+
+    def fake_run(command: list[str], **kwargs: object) -> object:
+        commands.append(command)
+        (tmp_path / "final.rendering.mp4").write_bytes(b"fake-mp4")
+        return object()
+
+    monkeypatch.setattr(pipeline.subprocess, "run", fake_run)
+    pipeline._render(tmp_path, load_manifest(tmp_path))
+
+    cmd = commands[0]
+    assert str(whoosh) in cmd  # whoosh SFX input appended after the clip inputs
+    filter_complex = cmd[cmd.index("-filter_complex") + 1]
+    assert "amix=inputs=2" in filter_complex  # base audio + one whoosh at the single cut
+    assert "adelay=" in filter_complex
+
+
+def test_render_falls_back_to_libx264_when_hardware_encoder_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _render_job(tmp_path)
+    import movie_review_factory.pipeline as pipeline
+
+    monkeypatch.setenv("MRF_VIDEO_ENCODER", "nvenc")
+    monkeypatch.setattr(pipeline, "_probe_duration_seconds", lambda path: _render_duration(path, tmp_path))
+    monkeypatch.setattr(pipeline.shutil, "which", lambda name: f"/{name}")
+
+    commands: list[list[str]] = []
+
+    def fake_run(command: list[str], **kwargs: object) -> object:
+        commands.append(command)
+        if "h264_nvenc" in command:
+            raise pipeline.subprocess.CalledProcessError(
+                1, command, output="", stderr="No NVENC capable devices found",
+            )
+        (tmp_path / "final.rendering.mp4").write_bytes(b"fake-mp4")
+        return object()
+
+    monkeypatch.setattr(pipeline.subprocess, "run", fake_run)
+    artifacts, _ = pipeline._render(tmp_path, load_manifest(tmp_path))
+
+    assert [artifact.name for artifact in artifacts] == ["render.json", "final.mp4"]
+    assert "h264_nvenc" in commands[0]        # hardware encoder attempted first
+    assert "libx264" in commands[-1]          # transparent software fallback
+    assert (tmp_path / "final.mp4").read_bytes() == b"fake-mp4"
 
 
 def test_render_default_has_no_intro_outro_concat(
@@ -1232,10 +1601,59 @@ def test_render_default_has_no_intro_outro_concat(
     assert "[showv]" not in filter_complex and "[showa]" not in filter_complex
     assert "[bodyv]" not in filter_complex
     assert "-loop" not in command
+    # The body stays on [rendered] and is encoded as a single output. The QA
+    # detect filters are no longer folded via split (that caused the render OOM),
+    # so the first mapped stream is [rendered] and the QA video split is gone.
+    assert "split=2[venc][vqa]" not in filter_complex
     assert command[command.index("-map") + 1] == "[rendered]"
     render = json.loads((tmp_path / "render.json").read_text(encoding="utf-8"))
     assert render["intro_seconds"] == 0.0 and render["outro_seconds"] == 0.0
     assert not (tmp_path / "intro-card.png").exists()
+
+
+def test_render_encodes_single_output_without_qa_fold(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Regression guard for the ffmpeg OOM (exit -12): the render must NOT fold the
+    # QA detect filters onto a second (-f null) output. Splitting (split=2) the
+    # encode and detect branches let the fast loop-filter frames queue unbounded
+    # against the slow ebur128 branch and exhausted memory on long timelines. The
+    # render now encodes a single output; the qa stage runs black/freeze/silence/
+    # loudness as its own decode pass over final.mp4, so no render-signals.log is
+    # written by the render pass.
+    _render_job(tmp_path)
+    import movie_review_factory.pipeline as pipeline
+
+    commands: list[list[str]] = []
+    monkeypatch.setattr(pipeline, "_probe_duration_seconds", lambda path: _render_duration(path, tmp_path))
+    monkeypatch.setattr(pipeline.shutil, "which", lambda name: f"/{name}")
+
+    def fake_run(command: list[str], **kwargs: object) -> object:
+        commands.append(command)
+        (tmp_path / "final.rendering.mp4").write_bytes(b"fake-mp4")
+        return object()
+
+    monkeypatch.setattr(pipeline.subprocess, "run", fake_run)
+    pipeline._render(tmp_path, load_manifest(tmp_path))
+
+    assert len(commands) == 1
+    command = commands[0]
+    filter_complex = command[command.index("-filter_complex") + 1]
+    # No QA fold: the video split and the detect filters are absent.
+    assert "split=2[venc][vqa]" not in filter_complex
+    assert "asplit=2[aenc][aqa]" not in filter_complex
+    assert "blackdetect=" not in filter_complex and "freezedetect=" not in filter_complex
+    assert "silencedetect=" not in filter_complex and "ebur128=" not in filter_complex
+    # A single encode output: [rendered] + audio, no discarded detect maps.
+    map_targets = [command[i + 1] for i, tok in enumerate(command) if tok == "-map"]
+    assert len(map_targets) == 2
+    assert map_targets[0] == "[rendered]"
+    assert "[vdet]" not in map_targets and "[adet]" not in map_targets
+    # The command ends at the single temp output; there is no "-f null -".
+    assert command[-1] == str(tmp_path / "final.rendering.mp4")
+    assert "null" not in command
+    # The render pass no longer writes a signal log; qa decodes final.mp4 itself.
+    assert not (tmp_path / "render-signals.log").exists()
 
 
 def test_render_bookends_body_with_branded_intro_outro_cards(
@@ -1278,7 +1696,11 @@ def test_render_bookends_body_with_branded_intro_outro_cards(
     # Both cards are looped stills fed as extra inputs at their exact durations.
     assert command.count("-loop") == 2
     assert "2.000" in command and "3.000" in command
-    # Output maps switch to the concatenated show streams.
+    # Output maps switch to the concatenated show streams and are encoded
+    # directly; the QA detect fold (split/asplit) was removed to fix the render
+    # OOM, so the show streams are mapped straight to the encoder.
+    assert "split=2[venc][vqa]" not in filter_complex
+    assert "asplit=2[aenc][aqa]" not in filter_complex
     map_indices = [i for i, tok in enumerate(command) if tok == "-map"]
     assert command[map_indices[0] + 1] == "[showv]"
     assert command[map_indices[1] + 1] == "[showa]"
@@ -1377,8 +1799,13 @@ def test_render_uses_authorized_music_mix_only_when_configured(
     pipeline._render(tmp_path, load_manifest(tmp_path))
     command = commands[0]
     assert str(music) in command
-    assert "[audio]" in command
-    assert "sidechaincompress" in command[command.index("-filter_complex") + 1]
+    filter_complex = command[command.index("-filter_complex") + 1]
+    # The mix output [audio] is mapped directly for encode; the QA detect fold
+    # that consumed it via asplit was removed to fix the render OOM.
+    assert "asplit=2[aenc][aqa]" not in filter_complex
+    map_indices = [i for i, tok in enumerate(command) if tok == "-map"]
+    assert command[map_indices[1] + 1] == "[audio]"
+    assert "sidechaincompress" in filter_complex
     render = json.loads((tmp_path / "render.json").read_text(encoding="utf-8"))
     assert render["audio_mix"]["provenance"][0]["rights_note"] == "licensed by creator"
 
@@ -1452,7 +1879,11 @@ def test_render_trims_long_source_to_exact_shot_duration(
     pipeline._render(tmp_path, load_manifest(tmp_path))
 
     filter_complex = commands[0][commands[0].index("-filter_complex") + 1]
-    assert "trim=start=0.000000:end=3.000000" in filter_complex
+    # Clip decodes from its own seeked input (-ss/-t); a target shorter than the
+    # source still trims to the target, but there is no shared-input trim=start.
+    assert "trim=start=" not in filter_complex
+    _ss = commands[0].index("-ss")
+    assert commands[0][_ss:_ss + 4] == ["-ss", "0.000000", "-t", "3.000000"]
     assert "trim=end=1.000000" in filter_complex
     assert "loop=loop=" not in filter_complex
     doc = json.loads((tmp_path / "render.json").read_text(encoding="utf-8"))
@@ -1824,6 +2255,42 @@ def test_qa_report_success(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> N
     assert "positive_duration" in check_names
     assert "duration_drift" in check_names
     assert all(c["passed"] for c in doc["checks"])
+
+
+def test_qa_reuses_render_signal_log_without_second_decode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # When the render pass left a usable detect log, QA parses it instead of
+    # decoding final.mp4 a second time.
+    _qa_job(tmp_path)
+    import movie_review_factory.pipeline as pipeline
+    from movie_review_factory import media_qa
+
+    (tmp_path / "render-signals.log").write_text(
+        "[blackdetect @ 1] black_start:1 black_end:2 black_duration:1\n"
+        "[Parsed_ebur128 @ 2] Integrated loudness:\n    I:  -15.0 LUFS\n"
+        "[Parsed_ebur128 @ 2] True peak:\n    Peak:  -2.0 dBFS\n",
+        encoding="utf-8",
+    )
+
+    def _no_decode(*_a: object, **_kw: object) -> list[dict]:
+        raise AssertionError("QA must not decode final.mp4 again when a render log exists")
+
+    monkeypatch.setattr(media_qa, "inspect_rendered_media", _no_decode)
+    monkeypatch.setattr(pipeline.shutil, "which", lambda name: f"/{name}")
+    monkeypatch.setattr(pipeline.subprocess, "run",
+                        lambda command, **kwargs: types.SimpleNamespace(
+                            returncode=0, stdout=_qa_probe_output(), stderr=""))
+
+    artifacts, message = pipeline._qa(tmp_path, load_manifest(tmp_path))
+
+    assert [a.name for a in artifacts] == ["qa.json"]
+    doc = json.loads((tmp_path / "qa.json").read_text(encoding="utf-8"))
+    assert doc["passed"] is True
+    scan = next(c for c in doc["checks"] if c["check"] == "decoded_media_scan")
+    assert scan["value"]["source"] == "render_pass"
+    check_names = [c["check"] for c in doc["checks"]]
+    assert "black_intervals" in check_names and "decoded_audio_loudness" in check_names
 
 
 def test_qa_fails_and_records_wrong_codec(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

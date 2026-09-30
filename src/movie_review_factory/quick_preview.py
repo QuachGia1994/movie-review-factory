@@ -21,6 +21,9 @@ from .pipeline import (
     _render_source_ranges,
     _srt_timestamp,
     caption_ass,
+    ffmpeg_command_single_thread,
+    ffmpeg_thread_cap,
+    is_ffmpeg_memory_error,
     load_manifest,
 )
 
@@ -173,13 +176,21 @@ def build_section_preview(
     command = [
         encoder, "-y", "-i", str(source), "-i", str(audio),
         "-filter_complex", ";".join(filters), "-map", "[v]", "-map", "[a]",
-        "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28",
+        "-c:v", "libx264", "-threads", str(ffmpeg_thread_cap()),
+        "-preset", "ultrafast", "-crf", "28",
         "-pix_fmt", "yuv420p", "-r", str(RENDER_FRAME_RATE),
         "-c:a", "aac", "-b:a", "128k", "-t", f"{duration:.6f}",
         "-movflags", "+faststart", "-f", "mp4", str(tmp_video),
     ]
     try:
         result = subprocess.run(command, capture_output=True, text=True)
+        if result.returncode and is_ffmpeg_memory_error(result.stderr):
+            # One bounded, single-threaded retry clears the transient x264
+            # "malloc failed / Cannot allocate memory" allocation flake.
+            tmp_video.unlink(missing_ok=True)
+            result = subprocess.run(
+                ffmpeg_command_single_thread(command), capture_output=True, text=True,
+            )
         if result.returncode or not tmp_video.is_file() or not tmp_video.stat().st_size:
             raise RuntimeError("section preview render failed: " + result.stderr[-3000:])
         if _fingerprints(root, source) != fingerprints:

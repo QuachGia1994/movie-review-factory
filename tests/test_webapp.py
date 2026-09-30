@@ -10,6 +10,7 @@ import json
 import os
 import threading
 import time
+import types
 import urllib.error
 from datetime import datetime, timezone
 import urllib.request
@@ -249,6 +250,46 @@ def test_run_targets_video_after_script_approved(tmp_path: Path, monkeypatch: py
     while time.time() < deadline and svc.status("demo")["running"]:
         time.sleep(0.02)
     assert captured["until"] == "thumbnail"
+
+
+def test_reindex_transcript_resets_transcript_and_scenes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    svc = JobsService(tmp_path)
+    svc.create_job({"job_id": "demo"})
+    root = tmp_path / "demo"
+    # Give the job a source video and mark transcript/scenes/outline done so we
+    # can prove the re-index flips exactly the first two back to pending.
+    manifest = pipeline.load_manifest(root)
+    manifest.config.source_video = root / "source.mp4"
+    for stage in manifest.stages:
+        if stage.stage in ("transcript", "scenes", "outline"):
+            stage.status = "ready"
+    pipeline.save_manifest(root, manifest)
+
+    captured: dict = {}
+    monkeypatch.setattr(
+        pipeline, "run_job",
+        lambda root, *, until=None, force=False: captured.setdefault("until", until),
+    )
+    assert svc.reindex_transcript("demo")["started"] is True
+    deadline = time.time() + 5
+    while time.time() < deadline and svc.status("demo").get("reindex", {}).get("running"):
+        time.sleep(0.02)
+    # It re-runs only up to the scene index, never toward the finished video.
+    assert captured["until"] == "scenes"
+    after = {stage.stage: stage.status for stage in pipeline.load_manifest(root).stages}
+    assert after["transcript"] == "pending"
+    assert after["scenes"] == "pending"
+    # Downstream stages (already produced) are left untouched.
+    assert after["outline"] == "ready"
+
+
+def test_reindex_transcript_requires_source_video(tmp_path: Path) -> None:
+    svc = JobsService(tmp_path)
+    svc.create_job({"job_id": "demo"})
+    with pytest.raises(ValueError):
+        svc.reindex_transcript("demo")
 
 
 # --- approval + publishing gate ---------------------------------------------
@@ -999,6 +1040,110 @@ def test_cli_init_job_accepts_content_agent_options(tmp_path: Path) -> None:
     assert manifest.config.content_agent == "claude"
 
 
+def test_cli_init_job_enables_external_watermark_detect(tmp_path: Path) -> None:
+    root = tmp_path / "wm-cli"
+    result = runner.invoke(app, [
+        "init-job", str(root),
+        "--watermark-detect", "external",
+        "--detector-cmd", "python detect.py --in {video} --out {out}",
+    ])
+    assert result.exit_code == 0, result.output
+    wm = pipeline.load_manifest(root).config.watermark_removal
+    assert wm.enabled is True
+    assert wm.detect is not None
+    assert wm.detect.method == "external"
+    assert wm.detect.external_cmd == "python detect.py --in {video} --out {out}"
+
+
+def test_cli_init_job_watermark_detect_defaults_off(tmp_path: Path) -> None:
+    root = tmp_path / "wm-off"
+    assert runner.invoke(app, ["init-job", str(root)]).exit_code == 0
+    wm = pipeline.load_manifest(root).config.watermark_removal
+    assert wm.enabled is False
+    assert wm.detect is None
+
+
+def test_cli_init_job_rejects_bad_watermark_detect(tmp_path: Path) -> None:
+    result = runner.invoke(app, ["init-job", str(tmp_path / "wm-bad"), "--watermark-detect", "bogus"])
+    assert result.exit_code != 0
+
+
+def test_create_job_enables_external_watermark_detect(tmp_path: Path) -> None:
+    service = JobsService(tmp_path)
+    service.create_job({
+        "job_id": "wm-web",
+        "watermark_detect": "external",
+        "detector_cmd": "python detect.py --in {video} --out {out}",
+    })
+    wm = pipeline.load_manifest(tmp_path / "wm-web").config.watermark_removal
+    assert wm.enabled is True
+    assert wm.detect.method == "external"
+    assert wm.detect.external_cmd == "python detect.py --in {video} --out {out}"
+
+
+def test_create_job_rejects_bad_watermark_detect(tmp_path: Path) -> None:
+    service = JobsService(tmp_path)
+    with pytest.raises(ValueError):
+        service.create_job({"job_id": "wm-web-bad", "watermark_detect": "bogus"})
+
+
+def _fake_detector_run(cmd, **kwargs):
+    """Fake ffmpeg (1-frame extract) + external detector (writes one mask)."""
+    if "-frames:v" in cmd:
+        Path(cmd[-1]).write_bytes(b"clip")
+    else:
+        out = Path(cmd[cmd.index("--out") + 1])
+        out.mkdir(parents=True, exist_ok=True)
+        (out / "00000.png").write_bytes(b"mask")
+    return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+
+def test_cli_probe_detector_reports_ok(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    video = tmp_path / "v.mp4"
+    video.write_bytes(b"v")
+    monkeypatch.setattr("movie_review_factory.mask_detection.subprocess.run", _fake_detector_run)
+    monkeypatch.setattr("movie_review_factory.mask_detection.shutil.which", lambda name: "ffmpeg")
+    result = runner.invoke(app, [
+        "probe-detector", str(video), "--detector-cmd", "detect --in {video} --out {out}",
+    ])
+    assert result.exit_code == 0, result.output
+    assert "ok" in result.output.lower()
+
+
+def test_cli_probe_detector_without_command_exits_nonzero(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("MRF_MASK_DETECTOR_CMD", raising=False)
+    monkeypatch.setattr("movie_review_factory.mask_detection.shutil.which", lambda name: "ffmpeg")
+    video = tmp_path / "v.mp4"
+    video.write_bytes(b"v")
+    result = runner.invoke(app, ["probe-detector", str(video)])
+    assert result.exit_code == 1
+
+
+def test_service_probe_detector_reports_ok(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    video = tmp_path / "v.mp4"
+    video.write_bytes(b"v")
+    root = tmp_path / "wm-probe"
+    pipeline.create_job(root, JobConfig(
+        job_id="wm-probe",
+        source_video=video,
+        watermark_removal={
+            "enabled": True,
+            "detect": {"method": "external", "external_cmd": "detect --in {video} --out {out}"},
+        },
+    ))
+    monkeypatch.setattr("movie_review_factory.mask_detection.subprocess.run", _fake_detector_run)
+    monkeypatch.setattr("movie_review_factory.mask_detection.shutil.which", lambda name: "ffmpeg")
+    result = JobsService(tmp_path).probe_detector("wm-probe")
+    assert result["ok"] is True
+    assert result["masks"] >= 1
+
+
+def test_service_probe_detector_requires_source(tmp_path: Path) -> None:
+    pipeline.create_job(tmp_path / "no-src", JobConfig(job_id="no-src"))
+    with pytest.raises(ValueError):
+        JobsService(tmp_path).probe_detector("no-src")
+
+
 def test_cli_approve_script_requires_confirm_and_syncs_markdown(tmp_path: Path) -> None:
     root = _job_with_metadata(tmp_path, "demo")
     script_path = root / "script.json"
@@ -1222,6 +1367,91 @@ def test_import_can_retry_when_manifest_save_fails(tmp_path: Path, monkeypatch: 
     assert svc.import_video("retry", "source.mp4", 4, io.BytesIO(b"data"))["has_source_video"]
 
 
+def test_create_job_stores_copyright_bypass_setting(tmp_path: Path) -> None:
+    svc = JobsService(tmp_path)
+    svc.create_job({"job_id": "bypass-test", "copyright_bypass": "balanced"})
+    manifest = pipeline.load_manifest(tmp_path / "bypass-test")
+    assert manifest.config.copyright_bypass == "balanced"
+
+
+def test_probe_link_and_download_link_video(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    svc = JobsService(tmp_path)
+    svc.create_job({"job_id": "dl-job"})
+
+    from movie_review_factory import link_download
+
+    fake_meta = {
+        "title": "Online Review Clip",
+        "duration": 600.0,
+        "thumbnail": "https://example.com/thumb.jpg",
+        "subtitle_languages": ["vi", "en"],
+        "webpage_url": "https://example.com/watch?v=123",
+    }
+    monkeypatch.setattr(link_download, "fetch_metadata", lambda url, runner=None: fake_meta)
+
+    meta = svc.probe_link("https://example.com/watch?v=123")
+    assert meta["title"] == "Online Review Clip"
+    assert meta["duration"] == 600.0
+
+    with pytest.raises(link_download.RightsConfirmationRequired):
+        svc.download_link_video("dl-job", "https://example.com/watch?v=123", confirm_rights=False)
+
+    def fake_download(url, dest_dir, *, confirm_rights=None, sub_langs="vi,en", runner=None):
+        out = Path(dest_dir) / "source.mp4"
+        out.write_bytes(b"downloaded-mp4")
+        return {"source_video": str(out), "subtitles": [], "url": url}
+
+    monkeypatch.setattr(link_download, "download_video", fake_download)
+
+    status = svc.download_link_video("dl-job", "https://example.com/watch?v=123", confirm_rights=True)
+    assert status["has_source_video"] is True
+    source = tmp_path / "dl-job" / "source.mp4"
+    assert source.read_bytes() == b"downloaded-mp4"
+    assert pipeline.load_manifest(source.parent).config.source_video == source
+
+
+def test_generate_hook_and_hook_routes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    svc = JobsService(tmp_path)
+    svc.create_job({"job_id": "hook-job"})
+
+    with pytest.raises(ValueError, match="scenes.json"):
+        svc.generate_hook("hook-job")
+
+    (tmp_path / "hook-job" / "scenes.json").write_text('{"scenes": []}', encoding="utf-8")
+    with pytest.raises(ValueError, match="video nguồn"):
+        svc.generate_hook("hook-job")
+
+    source = tmp_path / "hook-job" / "source.mp4"
+    source.write_bytes(b"source-bytes")
+    manifest = pipeline.load_manifest(tmp_path / "hook-job")
+    manifest.config.source_video = source
+    pipeline.save_manifest(tmp_path / "hook-job", manifest)
+
+    from movie_review_factory import hook_crafter
+
+    def fake_build(root, **kwargs):
+        dest = Path(root) / "hook.mp4"
+        dest.write_bytes(b"hook-video-bytes")
+        (Path(root) / "hook.json").write_text('{"scene_index": 1, "duration_seconds": 4.0, "dramatic_score": 0.8}', encoding="utf-8")
+        return dest
+
+    monkeypatch.setattr(hook_crafter, "build_hook_teaser", fake_build)
+
+    result = svc.generate_hook("hook-job")
+    assert result["present"] is True
+    assert result["href"] == "/api/jobs/hook-job/hook.mp4"
+    assert result["meta"]["scene_index"] == 1
+
+    path = svc.hook_path("hook-job")
+    assert path.read_bytes() == b"hook-video-bytes"
+
+    info = svc.get_hook_info("hook-job")
+    assert info["present"] is True
+    assert info["meta"]["duration_seconds"] == 4.0
+
+
+
+
 def test_http_import_and_delete_project_are_authenticated(tmp_path: Path) -> None:
     server, base, orig = _serve_with_token(tmp_path, "s3cr3t")
     try:
@@ -1442,6 +1672,17 @@ def test_agy_pool_badge_and_probe_button_are_wired_into_the_dashboard() -> None:
     assert 'id="agyProbeBtn"' in html
     assert "api('GET', '/api/agy-pool')" in html
     assert "api('POST', '/api/agy-pool/probe')" in html
+
+
+def test_showerror_rejection_handler_is_defined() -> None:
+    # Regression: showError is passed as the rejection handler in many
+    # `.catch(showError)` sites (highlight/transcript downloads, section preview,
+    # timeline edits, save-search, chat, and the mid-roll "Chèn vào kịch bản"
+    # flow via loadStatus). It was referenced but never defined, so any failing
+    # action threw "showError is not defined". Guard that a definition ships.
+    html = webapp_mod.INDEX_HTML
+    assert "function showError(" in html
+    assert ".catch(showError)" in html
 
 
 def test_dashboard_root_layout_dialog_tools_and_project_switcher_are_wired() -> None:

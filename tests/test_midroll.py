@@ -55,6 +55,39 @@ def test_adjusts_visual_midpoint_to_match_existing_narration():
     assert amended["clips"][4]["start_seconds"] == start + 10
 
 
+def test_places_cta_by_narration_when_visual_budget_is_a_different_scale():
+    """Nominal 10-minute visual budget, but the spoken narration is ~3.6 min and
+    front-loaded. The nearest *visual* boundary to 50% lands the CTA past 60% of
+    actual narration (the QA failure); the placer must instead pick the boundary
+    that keeps the CTA inside the central 40-60% of narration."""
+    visual = (90, 120, 150, 150, 90)   # sums to 600s (the 10-minute target budget)
+    words = (165, 180, 181, 174, 143)  # measured narration ~3.6 min, front-loaded
+    script = {"approved": True, "target_minutes": 10, "sections": [
+        {"title": f"Phần {i}", "duration_seconds": d, "budget_minutes": d / 60,
+         "narration": "từ " * w}
+        for i, (d, w) in enumerate(zip(visual, words), 1)
+    ]}
+    clips = []
+    start = 0.0
+    for i, d in enumerate(visual, 1):
+        clips.append({"section": f"Phần {i}", "section_index": i, "start_seconds": start,
+                      "duration_seconds": d,
+                      "source_clip": {"start_seconds": start, "end_seconds": start + d}})
+        start += d
+    plan = {"total_seconds": 600, "clips": clips}
+    _, amended, _ = midroll.prepare(
+        script, plan, "Bấm thích và đăng ký kênh Màn Kể nhé!", 10, 215.856,
+    )
+    cta = next(clip for clip in amended["clips"] if clip.get("type") == "midroll")
+    # Section-2/3 boundary (script section 2) keeps narration fraction ~0.41; the
+    # section-3/4 boundary the visual budget would have chosen sits at ~0.62.
+    assert cta["section_index"] == 3
+    words_before = sum(words[:2])
+    voice_before = 215.856 * words_before / sum(words)
+    fraction = (voice_before + 5) / (215.856 + 10)
+    assert 0.4 <= fraction <= 0.6
+
+
 def test_rejects_duplicate_and_far_from_middle():
     script, plan = fixtures()
     first, modified, _ = midroll.prepare(script, plan, "Hãy bấm thích và đăng ký Màn Kể.", 15)
