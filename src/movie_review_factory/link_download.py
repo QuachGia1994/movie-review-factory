@@ -35,6 +35,9 @@ _VIDEO_SUFFIXES = {".mp4", ".mkv", ".webm", ".mov", ".m4v"}
 # MRF_DOWNLOAD_TIMEOUT (set it to 0 to disable the cap entirely).
 METADATA_TIMEOUT_SECONDS = 60.0
 DEFAULT_DOWNLOAD_TIMEOUT_SECONDS = 1800.0
+# yt-dlp per-socket read timeout: abort a stalled chunk fast so a mid-transfer
+# TCP stall is caught in seconds rather than waiting out the whole-process cap.
+SOCKET_TIMEOUT_SECONDS = 30
 
 # Only real web links are ever handed to yt-dlp. A value starting with "-" could
 # otherwise be parsed by yt-dlp as an OPTION instead of a URL - e.g. --exec,
@@ -142,6 +145,7 @@ def build_download_command(
     return [
         ytdlp,
         "--no-playlist",
+        "--socket-timeout", str(SOCKET_TIMEOUT_SECONDS),
         "-f", DEFAULT_FORMAT,
         "--merge-output-format", "mp4",
         "--write-subs", "--write-auto-subs",

@@ -29,6 +29,7 @@ def test_build_download_command_shape() -> None:
     assert cmd[-1] == "https://x/v"
     assert "--merge-output-format" in cmd and "mp4" in cmd
     assert "--write-subs" in cmd
+    assert cmd[cmd.index("--socket-timeout") + 1] == "30"
     assert cmd[cmd.index("--sub-langs") + 1] == "vi"
     assert cmd[cmd.index("-o") + 1] == "/out/source.%(ext)s"
     # No cookie / proxy / IP-evasion flags by design.
