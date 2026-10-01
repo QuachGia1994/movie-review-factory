@@ -961,10 +961,65 @@ function readLock(file) {
   }
 }
 
+function findAppBrowser() {
+  var roots = [process.env["ProgramFiles(x86)"], process.env.ProgramFiles, process.env.LOCALAPPDATA];
+  var suffixes = [
+    ["Microsoft", "Edge", "Application", "msedge.exe"],
+    ["Google", "Chrome", "Application", "chrome.exe"]
+  ];
+  for (var s = 0; s < suffixes.length; s++) {
+    for (var r = 0; r < roots.length; r++) {
+      if (!roots[r]) {
+        continue;
+      }
+      var candidate = path.join.apply(path, [roots[r]].concat(suffixes[s]));
+      if (fs.existsSync(candidate)) {
+        return candidate;
+      }
+    }
+  }
+  return null;
+}
+
+// Opens the dashboard as a chromeless app window with its own profile so extensions stay out of the UI.
+function openAppWindow(url) {
+  var exe = findAppBrowser();
+  if (!exe) {
+    return false;
+  }
+  try {
+    var app = childProcess.spawn(
+      exe,
+      [
+        "--app=" + url,
+        "--user-data-dir=" + path.join(appDataRoot(), "app-window"),
+        "--no-first-run",
+        "--no-default-browser-check",
+        "--window-size=1440,900"
+      ],
+      { detached: true, stdio: "ignore" }
+    );
+    app.on("error", function () {
+      openDefaultBrowser(url);
+    });
+    app.unref();
+    return true;
+  } catch (error) {
+    return false;
+  }
+}
+
 function openBrowser(url) {
   if (hasArg("--no-browser")) {
     return;
   }
+  if (process.platform === "win32" && !hasArg("--browser-tab") && openAppWindow(url)) {
+    return;
+  }
+  openDefaultBrowser(url);
+}
+
+function openDefaultBrowser(url) {
   var opener;
   if (process.platform === "win32") {
     opener = childProcess.spawn(

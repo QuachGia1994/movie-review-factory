@@ -113,7 +113,10 @@ _CONTENT_TYPES = {
     ".png": "image/png",
     ".svg": "image/svg+xml",
     ".zip": "application/zip",
+    ".woff2": "font/woff2",
 }
+
+_UI_FONTS = branding.ASSETS / "fonts"
 
 _ARTIFACT_KINDS = {
     ".mp4": "video",
@@ -2752,6 +2755,11 @@ class MRFRequestHandler(BaseHTTPRequestHandler):
         if route in ("/", "/index.html"):
             self._send_html(ACTIVATION_HTML if self._license_blocked() else INDEX_HTML)
             return
+        # UI fonts are public static files: CSS @font-face requests carry no bearer token.
+        font_match = re.fullmatch(r"/assets/fonts/([a-z-]+\.woff2)", route)
+        if font_match and (_UI_FONTS / font_match[1]).is_file():
+            self._serve_file(_UI_FONTS / font_match[1])
+            return
         if not self._check_auth():
             self._send_401()
             return
@@ -3267,64 +3275,101 @@ def run_server(host: str = "127.0.0.1", port: int = 8765,
 # --- single-page UI ----------------------------------------------------------
 # Vanilla HTML + JS (no framework, no build step). Kept as one inline document so the whole UI ships with the package and needs no static-file plumbing.
 
+_UI_FONT_FACES = """  @font-face{ font-family:'Montserrat'; font-style:normal; font-weight:400 700; font-display:swap; src:url(/assets/fonts/montserrat-vietnamese.woff2) format('woff2');
+    unicode-range:U+0102-0103, U+0110-0111, U+0128-0129, U+0168-0169, U+01A0-01A1, U+01AF-01B0, U+0300-0301, U+0303-0304, U+0308-0309, U+0323, U+0329, U+1EA0-1EF9, U+20AB; }
+  @font-face{ font-family:'Montserrat'; font-style:normal; font-weight:400 700; font-display:swap; src:url(/assets/fonts/montserrat-latin.woff2) format('woff2');
+    unicode-range:U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD; }
+  @font-face{ font-family:'Cormorant'; font-style:normal; font-weight:500 700; font-display:swap; src:url(/assets/fonts/cormorant-vietnamese.woff2) format('woff2');
+    unicode-range:U+0102-0103, U+0110-0111, U+0128-0129, U+0168-0169, U+01A0-01A1, U+01AF-01B0, U+0300-0301, U+0303-0304, U+0308-0309, U+0323, U+0329, U+1EA0-1EF9, U+20AB; }
+  @font-face{ font-family:'Cormorant'; font-style:normal; font-weight:500 700; font-display:swap; src:url(/assets/fonts/cormorant-latin.woff2) format('woff2');
+    unicode-range:U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD; }"""
+
+
 ACTIVATION_HTML = """<!DOCTYPE html>
 <html lang="vi">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Kích hoạt — Xưởng Review Phim</title>
+<title>Kích hoạt · Xưởng Review Phim</title>
 <style>
-  body { margin:0; font-family: system-ui, "Segoe UI", Roboto, sans-serif; background:#0f1115; color:#e6e8ee;
+/*@ui-fonts*/
+  :root{ color-scheme:dark; --gold-grad:linear-gradient(135deg, #8c6a2f 0%, #c9a961 34%, #f3dfa8 52%, #c9a961 70%, #9a7735 100%); }
+  body { margin:0; font-family:'Montserrat', system-ui, "Segoe UI", sans-serif; color:#f2ede4;
+         background:radial-gradient(1100px 560px at 50% -12%, #221d15 0%, #0b0a08 62%) #0b0a08;
          display:flex; min-height:100vh; align-items:center; justify-content:center; }
-  .box { width:min(560px, 92vw); background:#171a21; border:1px solid #262b36; border-radius:12px; padding:24px; }
-  h1 { font-size:18px; margin:0 0 6px; }
-  p { color:#9aa3b2; font-size:13px; line-height:1.5; }
-  code { background:#0f1115; border:1px solid #262b36; border-radius:6px; padding:2px 6px; word-break:break-all; color:#e6e8ee; }
-  textarea { width:100%; min-height:90px; margin-top:10px; background:#0f1115; color:#e6e8ee;
-             border:1px solid #262b36; border-radius:8px; padding:10px; font:inherit; }
-  button { margin-top:12px; padding:9px 16px; border-radius:8px; border:1px solid #338ef7;
-           background:#338ef7; color:#fff; cursor:pointer; }
-  .msg { margin-top:10px; font-size:13px; min-height:18px; }
+  .box { width:min(560px, 92vw); background:#15130f; border:1px solid #2a251d; border-radius:18px; padding:30px;
+         box-shadow:0 28px 70px rgba(0,0,0,.6), inset 0 1px 0 rgba(243,223,168,.07); }
+  .brand { display:flex; align-items:center; gap:10px; margin-bottom:18px; color:#c9a961; font-size:11.5px; font-weight:600; letter-spacing:.16em; text-transform:uppercase; }
+  .brand-mark { display:grid; place-items:center; width:34px; height:34px; border-radius:10px; background:var(--gold-grad); color:#1a1407;
+                box-shadow:0 6px 20px rgba(201,169,97,.22), inset 0 1px 0 rgba(255,255,255,.35); }
+  h1 { font-family:'Cormorant', Georgia, serif; font-size:32px; font-weight:600; line-height:1.12; margin:0 0 10px;
+       background:var(--gold-grad); -webkit-background-clip:text; background-clip:text; color:transparent; }
+  p { color:#b8ae9c; font-size:13.5px; line-height:1.6; margin:0 0 8px; }
+  code { display:inline-block; background:#100e0b; border:1px solid #3a3328; border-radius:8px; padding:4px 10px; word-break:break-all;
+         color:#f3dfa8; font:12.5px/1.5 Consolas, "Cascadia Mono", monospace; }
+  label { display:block; color:#948873; font-size:12px; font-weight:600; letter-spacing:.04em; margin-top:18px; }
+  textarea { box-sizing:border-box; width:100%; min-height:96px; margin-top:8px; background:#100e0b; color:#f2ede4; resize:vertical;
+             border:1px solid #3a3328; border-radius:12px; padding:10px 12px; font:12.5px/1.5 Consolas, "Cascadia Mono", monospace;
+             transition:border-color .2s, box-shadow .2s; }
+  textarea::placeholder { color:#6f6556; }
+  textarea:focus, button:focus-visible { outline:none; border-color:#c9a961; box-shadow:0 0 0 3px rgba(201,169,97,.42); }
+  button { margin-top:16px; padding:11px 22px; border:0; border-radius:999px; background:var(--gold-grad); color:#1a1407;
+           font:600 14px 'Montserrat', system-ui, sans-serif; cursor:pointer; box-shadow:0 8px 22px rgba(201,169,97,.2);
+           transition:filter .2s, transform .2s; }
+  button:hover { filter:brightness(1.08); }
+  button:active { transform:translateY(1px); }
+  button[disabled] { opacity:.65; cursor:progress; }
+  .msg { margin-top:12px; font-size:13px; min-height:18px; color:#b8ae9c; }
+  .msg[data-kind="ok"] { color:#a9d69a; }
+  .msg[data-kind="err"] { color:#f0a58e; }
+  .msg[data-kind="busy"] { background-image:linear-gradient(100deg, #b8ae9c 40%, #f3dfa8 50%, #b8ae9c 60%); background-size:250% 100%;
+                           -webkit-background-clip:text; background-clip:text; color:transparent; animation:mrf-sheen 1.8s linear infinite; }
+  @keyframes mrf-sheen{ from{ background-position:100% 0; } to{ background-position:-150% 0; } }
+  @media (prefers-reduced-motion:reduce){ .msg[data-kind="busy"]{ animation:none; } button{ transition:none; } }
 </style>
 </head>
 <body>
   <div class="box">
+    <div class="brand"><span class="brand-mark" aria-hidden="true"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="9" width="18" height="11" rx="2"/><path d="M3 9l2.5-5 15 2.5L18 9"/><path d="M8.5 4.6L7 9M13.5 5.4L12 9"/><path d="M10.5 12.5v4.5l3.8-2.25z" fill="currentColor" stroke="none"/></svg></span>Xưởng Review Phim</div>
     <h1>Cần kích hoạt bản quyền</h1>
     <p id="reason">Phần mềm chưa được kích hoạt trên máy này.</p>
-    <p style="margin-top:8px">Mã máy (gửi cho nhà cung cấp để lấy license key):</p>
+    <p style="margin-top:14px">Mã máy (gửi cho nhà cung cấp để lấy license key):</p>
     <p><code id="machine">…</code></p>
-    <label for="key" style="display:block;color:#9aa3b2;font-size:12px;margin-top:12px">Dán license key:</label>
+    <label for="key">Dán license key:</label>
     <textarea id="key" placeholder="dán chuỗi license tại đây"></textarea>
     <button id="activate" type="button">Kích hoạt</button>
     <div class="msg" id="msg" role="status"></div>
   </div>
 <script>
   const $ = (id) => document.getElementById(id);
+  const say = (text, kind) => { $('msg').textContent = text; $('msg').dataset.kind = kind || ''; };
   async function loadStatus() {
     try {
       const res = await fetch('/api/license');
       const data = await res.json();
       $('machine').textContent = data.machine || '(không đọc được)';
       if (data.reason) $('reason').textContent = data.reason;
-    } catch (error) { $('msg').textContent = error.message; }
+    } catch (error) { say(error.message, 'err'); }
   }
   $('activate').onclick = async () => {
-    $('msg').textContent = 'Đang kiểm tra…';
+    say('Đang kiểm tra…', 'busy');
+    $('activate').disabled = true;
     try {
       const res = await fetch('/api/license/activate', {
         method: 'POST', headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({license: $('key').value.trim()}),
       });
       const data = await res.json();
-      if (data.ok) { $('msg').textContent = 'Đã kích hoạt. Đang mở…'; setTimeout(() => location.reload(), 700); }
-      else { $('msg').textContent = '✗ ' + (data.reason || data.error_vi || 'License không hợp lệ'); }
-    } catch (error) { $('msg').textContent = error.message; }
+      if (data.ok) { say('Đã kích hoạt. Đang mở…', 'ok'); setTimeout(() => location.reload(), 700); return; }
+      say('✗ ' + (data.reason || data.error_vi || 'License không hợp lệ'), 'err');
+    } catch (error) { say(error.message, 'err'); }
+    $('activate').disabled = false;
   };
   loadStatus();
 </script>
 </body>
 </html>
-"""
+""".replace("/*@ui-fonts*/", _UI_FONT_FACES)
 
 
 INDEX_HTML = """<!DOCTYPE html>
@@ -3770,6 +3815,94 @@ INDEX_HTML = """<!DOCTYPE html>
     #video{ max-height:56dvh; }
   }
 </style>
+<style>
+  /* Noir & champagne skin: token overrides plus bounded loading shimmer; markup and ids unchanged. */
+/*@ui-fonts*/
+  :root{
+    --bg-base:#0b0a08; --panel:#15130f; --panel-raised:#1d1a15; --field-bg:#100e0b;
+    --line:#2a251d; --line-strong:#3a3328;
+    --text:#f2ede4; --text-dim:#b8ae9c; --text-muted:#948873;
+    --accent:#c9a961; --accent-hover:#e6c687; --accent-contrast:#1a1407;
+    --accent-soft:rgba(201,169,97,.13); --ring:rgba(201,169,97,.42);
+    --gold-deep:#8c6a2f; --gold-light:#f3dfa8;
+    --gold-grad:linear-gradient(135deg, #8c6a2f 0%, #c9a961 34%, #f3dfa8 52%, #c9a961 70%, #9a7735 100%);
+    --sheen:rgba(243,223,168,.07);
+    --shadow-1:0 1px 2px rgba(0,0,0,.5), inset 0 1px 0 var(--sheen);
+    --shadow-2:0 10px 30px rgba(0,0,0,.45);
+    --shadow-3:0 28px 70px rgba(0,0,0,.6);
+    --font-body:'Montserrat', system-ui, "Segoe UI", Roboto, sans-serif;
+    --font-display:'Cormorant', Georgia, "Times New Roman", serif;
+    --ease-out:cubic-bezier(.22,1,.36,1);
+  }
+  :root[data-theme="light"]{
+    --bg-base:#faf8f3; --panel:#ffffff; --panel-raised:#ffffff; --field-bg:#f5f1e8;
+    --line:#e8e1d3; --line-strong:#d6ccb8;
+    --text:#1c1917; --text-dim:#57534e; --text-muted:#78716c;
+    --accent:#8a6516; --accent-hover:#74540f; --accent-contrast:#ffffff;
+    --accent-soft:rgba(138,101,22,.10); --ring:rgba(138,101,22,.32);
+    --gold-grad:linear-gradient(135deg, #74540f 0%, #a07a28 40%, #c9a961 55%, #8a6516 100%);
+    --sheen:rgba(255,255,255,.7);
+    --shadow-1:0 1px 2px rgba(60,45,20,.08);
+    --shadow-2:0 10px 28px rgba(60,45,20,.12);
+    --shadow-3:0 28px 60px rgba(60,45,20,.18);
+  }
+  body{ font-family:var(--font-body); letter-spacing:.005em;
+        background-image:radial-gradient(900px 420px at 50% -12%, rgba(201,169,97,.10), transparent 70%),
+                         radial-gradient(700px 500px at 100% 0%, rgba(140,106,47,.08), transparent 65%); }
+  h1, h2, .empty-state h2, .media-title h2, dialog h2{ font-family:var(--font-display); font-weight:650; letter-spacing:.015em; font-size-adjust:ex-height .5; }
+  header{ box-shadow:0 1px 0 rgba(201,169,97,.16); }
+  header h1{ font-size:21px; background:var(--gold-grad); -webkit-background-clip:text; background-clip:text; color:transparent; }
+  header .sub{ letter-spacing:.06em; text-transform:uppercase; font-size:10.5px; }
+  .brand-mark{ background:var(--gold-grad); color:var(--accent-contrast); box-shadow:0 6px 20px rgba(201,169,97,.22), inset 0 1px 0 rgba(255,255,255,.35); }
+  :root[data-theme="light"] .brand-mark{ color:#ffffff; }
+  .theme-toggle-icon{ display:inline-grid; }
+  .theme-toggle-icon .icon-sun, :root[data-theme="light"] .theme-toggle-icon .icon-moon{ display:none; }
+  :root[data-theme="light"] .theme-toggle-icon .icon-sun{ display:block; }
+  .card, .library-section, .project-card, .highlight-card, .timeline-card, .track-card, .thumb-item{
+    background-image:linear-gradient(180deg, rgba(243,223,168,.025), transparent 40%); }
+  .card{ box-shadow:var(--shadow-1); transition:border-color .2s var(--ease-out), box-shadow .2s var(--ease-out); }
+  .project-card:hover, .media-result:hover{ border-color:rgba(201,169,97,.35); }
+  button.primary, button.primary:hover, .button-link, .workspace-tabs button[aria-selected="true"], .media-tab[aria-selected="true"], .clip-more[open] > summary{
+    background:var(--gold-grad); color:var(--accent-contrast); border-color:transparent; }
+  button.primary, .button-link{ position:relative; overflow:hidden; box-shadow:0 8px 22px rgba(201,169,97,.20), inset 0 1px 0 rgba(255,255,255,.3); }
+  :root[data-theme="light"] button.primary, :root[data-theme="light"] .button-link,
+  :root[data-theme="light"] .workspace-tabs button[aria-selected="true"], :root[data-theme="light"] .media-tab[aria-selected="true"]{ color:#ffffff; }
+  /* One-shot hover glint, never looping. */
+  button.primary::after, .button-link::after{ content:""; position:absolute; inset:0; pointer-events:none;
+    background:linear-gradient(105deg, transparent 35%, rgba(255,255,255,.45) 50%, transparent 65%);
+    transform:translateX(-120%); transition:transform .7s var(--ease-out); }
+  button.primary:hover::after, .button-link:hover::after{ transform:translateX(120%); }
+  button:hover{ border-color:rgba(201,169,97,.55); }
+  .progress > div{ background:linear-gradient(90deg, var(--gold-deep), var(--accent), var(--gold-light)); }
+  .badge.running{ background:var(--accent-soft); color:var(--accent); border-color:rgba(201,169,97,.35); }
+  .speaker-chip{ color:var(--gold-light); background:rgba(201,169,97,.12); }
+  :root[data-theme="light"] .speaker-chip{ color:var(--accent); }
+  dialog{ background-image:linear-gradient(180deg, rgba(243,223,168,.03), transparent 30%); }
+  dialog::backdrop{ background:rgba(8,6,3,.66); }
+  ::selection{ background:rgba(201,169,97,.32); }
+  /* Loading shimmer: animates only while a request is slow or a panel is in its loading state. */
+  #mrfBusyBar{ position:fixed; inset:0 0 auto 0; height:2px; z-index:1000; pointer-events:none; opacity:0;
+    background:linear-gradient(90deg, transparent 0%, var(--gold-deep) 30%, var(--gold-light) 50%, var(--accent) 70%, transparent 100%) 0 0 / 40% 100% no-repeat;
+    transition:opacity .25s var(--ease-out); }
+  :root[data-busy="1"] #mrfBusyBar{ opacity:1; animation:mrf-busy 1.25s cubic-bezier(.45,0,.55,1) infinite; box-shadow:0 0 10px rgba(243,223,168,.45); }
+  @keyframes mrf-busy{ from{ background-position:-60% 0; } to{ background-position:160% 0; } }
+  .mrf-loading{ display:inline-block; }
+  #scoutLoading:not([hidden]), #mediaState[data-kind="loading"], .mrf-loading{
+    background-image:linear-gradient(100deg, var(--text-dim) 40%, var(--gold-light) 50%, var(--text-dim) 60%); background-size:250% 100%;
+    -webkit-background-clip:text; background-clip:text; color:transparent; animation:mrf-sheen 1.8s linear infinite; }
+  :root[data-theme="light"] #scoutLoading:not([hidden]), :root[data-theme="light"] #mediaState[data-kind="loading"], :root[data-theme="light"] .mrf-loading{
+    background-image:linear-gradient(100deg, var(--text-dim) 40%, var(--accent) 50%, var(--text-dim) 60%); }
+  @keyframes mrf-sheen{ from{ background-position:100% 0; } to{ background-position:-150% 0; } }
+  #mediaResults[aria-busy="true"]:empty{ min-height:180px; border-radius:var(--r-md);
+    background:linear-gradient(100deg, transparent 30%, rgba(243,223,168,.09) 50%, transparent 70%) 0 0 / 250% 100%,
+               repeating-linear-gradient(180deg, var(--panel-raised) 0 44px, transparent 44px 56px);
+    animation:mrf-sheen 1.6s linear infinite; }
+  @media (prefers-reduced-motion:reduce){
+    :root[data-busy="1"] #mrfBusyBar, #scoutLoading:not([hidden]), #mediaState[data-kind="loading"], .mrf-loading, #mediaResults[aria-busy="true"]:empty{ animation:none; }
+    :root[data-busy="1"] #mrfBusyBar{ background-size:100% 100%; }
+    button.primary::after, .button-link::after{ display:none; }
+  }
+</style>
 <script>
   (function(){
     try{
@@ -3781,16 +3914,17 @@ INDEX_HTML = """<!DOCTYPE html>
 </script>
 </head>
 <body>
+<div id="mrfBusyBar" aria-hidden="true"></div>
 <header>
   <div class="brand">
-    <span class="brand-mark" aria-hidden="true">🎬</span>
+    <span class="brand-mark" aria-hidden="true"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="9" width="18" height="11" rx="2"/><path d="M3 9l2.5-5 15 2.5L18 9"/><path d="M8.5 4.6L7 9M13.5 5.4L12 9"/><path d="M10.5 12.5v4.5l3.8-2.25z" fill="currentColor" stroke="none"/></svg></span>
     <div class="brand-text">
       <h1>Xưởng Review Phim</h1>
       <div class="sub">Import → khám phá → biên tập → duyệt và xuất</div>
     </div>
   </div>
   <button id="themeToggle" class="theme-toggle" type="button" title="Đổi giao diện sáng/tối" aria-label="Đổi giao diện sáng/tối" aria-pressed="false">
-    <span class="theme-toggle-icon" aria-hidden="true">🌙</span>
+    <span class="theme-toggle-icon" aria-hidden="true"><svg class="icon-moon" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M20 14.5A8 8 0 0 1 9.5 4a8 8 0 1 0 10.5 10.5z"/></svg><svg class="icon-sun" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg></span>
     <span class="theme-toggle-label">Tối</span>
   </button>
 </header>
@@ -3800,9 +3934,7 @@ INDEX_HTML = """<!DOCTYPE html>
     if(!btn){ return; }
     function sync(){
       var cur = document.documentElement.getAttribute('data-theme') || 'dark';
-      var icon = btn.querySelector('.theme-toggle-icon');
       var label = btn.querySelector('.theme-toggle-label');
-      if(icon){ icon.textContent = cur === 'light' ? '☀️' : '🌙'; }
       if(label){ label.textContent = cur === 'light' ? 'Sáng' : 'Tối'; }
       btn.setAttribute('aria-pressed', cur === 'light' ? 'true' : 'false');
     }
@@ -3828,7 +3960,7 @@ INDEX_HTML = """<!DOCTYPE html>
           <button id="deleteSelectedBtn" class="danger" type="button" disabled>Xóa đã chọn (0)</button>
         </div>
         <div id="bulkMsg" class="notice" role="status"></div>
-        <div id="jobList" class="project-list" aria-live="polite">Đang tải…</div>
+        <div id="jobList" class="project-list" aria-live="polite"><span class="mrf-loading">Đang tải…</span></div>
       </div>
     </details>
     <button id="openCreateProject" class="primary toolbar-action" type="button" hidden>＋ Tạo project</button>
@@ -4421,7 +4553,7 @@ INDEX_HTML = """<!DOCTYPE html>
               <details class="extras-panel"><summary>Khoảnh khắc nổi bật và hỏi đáp video</summary>
               <section class="highlight-section" aria-labelledby="highlightsHeading">
                 <div class="section-heading"><h3 id="highlightsHeading">Khoảnh khắc nổi bật thông minh</h3><span class="muted">Đoạn gợi ý cho video dọc</span></div>
-                <div id="highlightResults" class="highlight-grid"><div class="state-panel">Đang tải khoảnh khắc nổi bật…</div></div>
+                <div id="highlightResults" class="highlight-grid"><div class="state-panel"><span class="mrf-loading">Đang tải khoảnh khắc nổi bật…</span></div></div>
               </section>
               <section class="chat-box" aria-labelledby="askHeading">
                 <div class="section-heading"><h3 id="askHeading">Hỏi đáp về video này</h3><span class="muted">Dựa trên lời thoại đã lập chỉ mục</span></div>
@@ -4735,15 +4867,29 @@ function showError(error) {
   showError._timer = setTimeout(() => { if (toast && toast.parentNode) toast.remove(); }, 8000);
 }
 
+// The gold busy bar appears only for requests slower than 300ms, so fast status polls never flash it.
+let _busyCount = 0, _busyTimer = 0;
+function setBusy(delta) {
+  _busyCount = Math.max(0, _busyCount + delta);
+  const root = document.documentElement;
+  if (!_busyCount) { clearTimeout(_busyTimer); _busyTimer = 0; delete root.dataset.busy; return; }
+  if (!_busyTimer && root.dataset.busy !== '1') { _busyTimer = setTimeout(() => { _busyTimer = 0; if (_busyCount) root.dataset.busy = '1'; }, 300); }
+}
+
 async function api(method, path, body) {
   const opts = { method, headers: {} };
   if (body !== undefined) { opts.headers['Content-Type'] = 'application/json'; opts.body = JSON.stringify(body); }
   if (_tok) opts.headers['Authorization'] = 'Bearer ' + _tok;
-  const res = await fetch(path, opts);
-  const text = await res.text();
-  const data = text ? JSON.parse(text) : {};
-  if (!res.ok) { throw new Error(data.error_vi || data.error || ('HTTP ' + res.status)); }
-  return data;
+  setBusy(1);
+  try {
+    const res = await fetch(path, opts);
+    const text = await res.text();
+    const data = text ? JSON.parse(text) : {};
+    if (!res.ok) { throw new Error(data.error_vi || data.error || ('HTTP ' + res.status)); }
+    return data;
+  } finally {
+    setBusy(-1);
+  }
 }
 
 async function loadBrand() {
@@ -5075,7 +5221,7 @@ function syncActiveTranscript(currentTime, allowScroll = true) {
 
 async function loadHighlights() {
   const box = $('highlightResults');
-  box.innerHTML = '<div class="state-panel">Đang tải khoảnh khắc nổi bật…</div>';
+  box.innerHTML = '<div class="state-panel"><span class="mrf-loading">Đang tải khoảnh khắc nổi bật…</span></div>';
   try {
     const data = await api('GET', '/api/jobs/' + encodeURIComponent(current) + '/highlights');
     mediaExplorerData.highlights = Array.isArray(data.highlights) ? data.highlights : [];
@@ -7483,4 +7629,4 @@ $('chatAskBtn').addEventListener('click', () => askVideo().catch(showError));
 </script>
 </body>
 </html>
-"""
+""".replace("/*@ui-fonts*/", _UI_FONT_FACES)

@@ -1430,6 +1430,42 @@ def test_token_mode_serves_public_shell_then_protects_api(tmp_path: Path) -> Non
         _restore_token(server, orig)
 
 
+def test_ui_fonts_are_public_but_confined_to_the_fonts_folder(tmp_path: Path) -> None:
+    server, base, orig = _serve_with_token(tmp_path, "s3cr3t")
+    try:
+        with urllib.request.urlopen(base + "/assets/fonts/montserrat-latin.woff2", timeout=5) as response:
+            assert response.status == 200
+            assert response.headers["Content-Type"] == "font/woff2"
+            assert response.read(4) == b"wOF2"
+        for bad in ("/assets/fonts/missing.woff2", "/assets/fonts/..%2Fman-ke.svg", "/assets/man-ke.svg"):
+            with pytest.raises(urllib.error.HTTPError) as exc:
+                urllib.request.urlopen(base + bad, timeout=5)
+            assert exc.value.code == 401
+    finally:
+        _restore_token(server, orig)
+
+
+def test_dashboard_shell_ships_bounded_gold_shimmer() -> None:
+    from movie_review_factory.webapp import INDEX_HTML
+
+    assert "/assets/fonts/montserrat-vietnamese.woff2" in INDEX_HTML
+    assert ':root[data-busy="1"] #mrfBusyBar' in INDEX_HTML
+    assert "prefers-reduced-motion:reduce" in INDEX_HTML
+    assert "setBusy(1);" in INDEX_HTML and "setBusy(-1);" in INDEX_HTML
+    assert '<span class="mrf-loading">' in INDEX_HTML
+    assert "/*@ui-fonts*/" not in INDEX_HTML
+
+
+def test_activation_page_shares_the_noir_skin() -> None:
+    from movie_review_factory.webapp import ACTIVATION_HTML
+
+    assert "/assets/fonts/cormorant-vietnamese.woff2" in ACTIVATION_HTML
+    assert "/*@ui-fonts*/" not in ACTIVATION_HTML
+    assert "#338ef7" not in ACTIVATION_HTML
+    assert '.msg[data-kind="busy"]' in ACTIVATION_HTML
+    assert "\u2014" not in ACTIVATION_HTML
+
+
 def test_auth_passes_with_correct_token(tmp_path: Path) -> None:
     server, base, orig = _serve_with_token(tmp_path, "s3cr3t")
     try:

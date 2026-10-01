@@ -62,6 +62,10 @@ for (const name of runtimeFiles) {
 for (const name of ["man-ke.svg", "man-ke.png"]) {
   bundle["movie_review_factory/assets/" + name] = fs.readFileSync(path.join(packageRoot, "assets", name)).toString("base64");
 }
+const fontRoot = path.join(packageRoot, "assets", "fonts");
+for (const name of fs.readdirSync(fontRoot).filter(name => name.endsWith(".woff2")).sort()) {
+  bundle["movie_review_factory/assets/fonts/" + name] = fs.readFileSync(path.join(fontRoot, name)).toString("base64");
+}
 const migrationRoot = path.join(packageRoot, "migrations");
 const migrationFiles = fs.readdirSync(migrationRoot)
   .filter(name => name === "__init__.py" || name.endsWith(".sql"))
