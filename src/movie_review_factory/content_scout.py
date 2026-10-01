@@ -1069,8 +1069,15 @@ def search_youtube_live(
     try:
         import yt_dlp
     except ImportError:
-        logger.warning("yt-dlp is not installed; skipping YouTube live discovery")
-        return []
+        import importlib
+        from .link_download import _ensure_ytdlp
+        _ensure_ytdlp()
+        importlib.invalidate_caches()
+        try:
+            import yt_dlp
+        except ImportError:
+            logger.warning("yt-dlp is not installed; skipping YouTube live discovery")
+            return []
 
     query = build_youtube_live_query(topic)
     fetch_count = max(limit * 2, 20)

@@ -156,3 +156,30 @@ def test_ytdlp_binary_auto_installs_when_missing(monkeypatch: pytest.MonkeyPatch
     assert installed is True
     assert result is None
 
+
+def test_ensure_ytdlp_falls_back_to_uv_when_pip_is_absent(monkeypatch: pytest.MonkeyPatch) -> None:
+    found: list[str | None] = [None]
+    calls: list[list[str]] = []
+    monkeypatch.setattr(link_download, "_find_ytdlp", lambda explicit=None: found[0])
+    monkeypatch.setattr(link_download, "find_spec", lambda name: None)
+    monkeypatch.setenv("MRF_UV", "C:/mrf/uv.exe")
+
+    def fake_run(cmd: list[str], **kwargs: object) -> object:
+        calls.append(cmd)
+        found[0] = "C:/venv/Scripts/yt-dlp.exe"
+        return type("R", (), {"returncode": 0})()
+
+    monkeypatch.setattr(link_download.subprocess, "run", fake_run)
+    assert link_download._ensure_ytdlp() == "C:/venv/Scripts/yt-dlp.exe"
+    assert calls == [["C:/mrf/uv.exe", "pip", "install", "--python", link_download.sys.executable, link_download.YTDLP_REQUIREMENT]]
+
+
+def test_missing_ytdlp_error_explains_the_failed_auto_install(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(link_download, "_find_ytdlp", lambda explicit=None: None)
+    monkeypatch.setattr(link_download, "find_spec", lambda name: None)
+    monkeypatch.delenv("MRF_UV", raising=False)
+    monkeypatch.setattr(link_download.shutil, "which", lambda cmd: None)
+    monkeypatch.setattr(link_download, "_last_install_error", "")
+    with pytest.raises(RuntimeError, match=r"yt-dlp is not installed.*no pip or uv available"):
+        link_download.download_video("https://example.com/v", tmp_path, confirm_rights=True)
+

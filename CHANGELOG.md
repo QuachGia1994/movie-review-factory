@@ -67,6 +67,7 @@ All notable changes to Movie Review Factory are documented here.
 - Removed the unwired micro-speed bypass knob (`speed_factor` / `speed_filter`): clip video is concatenated silent while the independent TTS narration is the fixed-length master audio, so a video-only tempo shift would desync the two - it is intentionally not applied.
 
 ### Fixed
+- Download-from-link no longer fails with "yt-dlp is not installed" on the one-file runtime: the launcher now installs `yt-dlp` and `httpx` with the core dependencies (httpx is import-checked) and hands its `uv` to the server (`MRF_UV`); on first use the app self-installs yt-dlp via pip or, when the uv-made venv has no pip, via `uv pip install`, and a remaining failure reports why. Scout live discovery uses the same self-install. `yt-dlp` is now a core package dependency.
 - Watermark color/temporal detection now streams decoded FFmpeg frames instead of materializing full-resolution PNG scratch frames, preventing multi-gigabyte disk spikes; partial masks and legacy extraction frames are removed on failure, and temporal detection stays bounded in memory.
 - yt-dlp metadata/download now run under bounded timeouts (metadata 60s; download `MRF_DOWNLOAD_TIMEOUT`, default 1800s, `0` disables) plus a 30s per-socket read timeout on downloads, so a stalled connection or livestream can no longer hang the download thread indefinitely.
 - The dashboard link-download form now sends the actual rights-confirmation checkbox value instead of a hardcoded `true`, keeping the client consent gate authoritative.

@@ -18,6 +18,8 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
+from importlib.util import find_spec
 from pathlib import Path
 from typing import Callable
 
@@ -121,21 +123,53 @@ def _find_ytdlp(explicit: str | None = None) -> str | None:
     return None
 
 
+YTDLP_REQUIREMENT = "yt-dlp>=2025.1"
+_install_lock = threading.Lock()
+_last_install_error = ""
+
+
+def _install_commands() -> list[list[str]]:
+    """pip first, then uv: the launcher's uv-made venv ships without pip."""
+    commands = []
+    if find_spec("pip") is not None:
+        commands.append([sys.executable, "-m", "pip", "install", "--disable-pip-version-check", YTDLP_REQUIREMENT])
+    uv = os.environ.get("MRF_UV") or shutil.which("uv")
+    if uv:
+        commands.append([uv, "pip", "install", "--python", sys.executable, YTDLP_REQUIREMENT])
+    return commands
+
+
 def _ensure_ytdlp() -> str | None:
-    found = _find_ytdlp()
-    if found:
-        return found
-    try:
-        subprocess.run(
-            [sys.executable, "-m", "pip", "install", "yt-dlp"],
-            capture_output=True,
-            text=True,
-            check=True,
-            timeout=120,
-        )
-        return _find_ytdlp()
-    except Exception:
+    """Install yt-dlp into the running interpreter on first use; None plus a recorded reason on failure."""
+    global _last_install_error
+    with _install_lock:
+        found = _find_ytdlp()
+        if found:
+            return found
+        commands = _install_commands()
+        errors = [] if commands else ["no pip or uv available"]
+        for command in commands:
+            try:
+                result = subprocess.run(command, capture_output=True, text=True, timeout=300)
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                errors.append(f"{Path(command[0]).name}: {exc}")
+                continue
+            if getattr(result, "returncode", 1) == 0:
+                found = _find_ytdlp()
+                if found:
+                    _last_install_error = ""
+                    return found
+                errors.append(f"{Path(command[0]).name}: installed but yt-dlp executable not found")
+            else:
+                tail = (getattr(result, "stderr", "") or getattr(result, "stdout", "") or "").strip()[-300:]
+                errors.append(f"{Path(command[0]).name}: {tail or 'install failed'}")
+        _last_install_error = "; ".join(errors)
         return None
+
+
+def _missing_ytdlp_message(action: str) -> str:
+    reason = f" (auto-install failed: {_last_install_error})" if _last_install_error else ""
+    return f"yt-dlp is not installed - install it to {action}{reason}"
 
 
 def _ytdlp_binary(explicit: str | None = None, *, auto_install: bool = True) -> str | None:
@@ -208,7 +242,7 @@ def fetch_metadata(
     url = _require_web_url(url)
     binary = _ytdlp_binary(ytdlp)
     if not binary:
-        raise RuntimeError("yt-dlp is not installed - install it to read a link's metadata")
+        raise RuntimeError(_missing_ytdlp_message("read a link's metadata"))
     runner = runner or subprocess.run
     try:
         result = runner(
@@ -267,7 +301,7 @@ def download_video(
         )
     binary = _ytdlp_binary(ytdlp)
     if not binary:
-        raise RuntimeError("yt-dlp is not installed - install it to download from a link")
+        raise RuntimeError(_missing_ytdlp_message("download from a link"))
     dest_dir = Path(dest_dir)
     dest_dir.mkdir(parents=True, exist_ok=True)
     runner = runner or subprocess.run

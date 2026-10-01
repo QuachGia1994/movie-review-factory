@@ -174,6 +174,8 @@ def test_onefile_contains_zero_install_bootstrap_contract() -> None:
     assert "faster-whisper>=1.1,<2" in text
     assert "fastembed>=0.7,<1" in text
     assert "edge-tts>=7,<8" in text
+    assert "yt-dlp>=2025.1" in text and "httpx>=0.27,<1" in text
+    assert "childEnv.MRF_UV" in text
     assert "MRF_EMBED_CACHE" in text
     assert "MRF_EMBED_OFFLINE" in text
     assert "Node archive checksum mismatch" in text

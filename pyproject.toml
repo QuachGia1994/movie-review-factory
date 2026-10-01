@@ -3,7 +3,7 @@ name = "movie-review-factory"
 version = "0.2.0"
 description = "Deterministic AI movie review/recap production pipeline"
 requires-python = ">=3.11"
-dependencies = ["typer>=0.16,<1", "pydantic>=2.11,<3", "Pillow>=11,<13", "cryptography>=42,<50", "httpx>=0.27,<1"]
+dependencies = ["typer>=0.16,<1", "pydantic>=2.11,<3", "Pillow>=11,<13", "cryptography>=42,<50", "httpx>=0.27,<1", "yt-dlp>=2025.1"]
 [project.optional-dependencies]
 media = ["faster-whisper>=1.1,<2", "ffmpeg-python>=0.2,<1"]
 semantic = ["fastembed>=0.7,<1"]

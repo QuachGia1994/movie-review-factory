@@ -167,7 +167,9 @@ var CORE_REQUIREMENTS = [
   "pydantic>=2.11,<3",
   "typer>=0.16,<1",
   "Pillow>=11,<13",
-  "cryptography>=42,<50"
+  "cryptography>=42,<50",
+  "httpx>=0.27,<1",
+  "yt-dlp>=2025.1"
 ];
 var FULL_REQUIREMENTS = CORE_REQUIREMENTS.concat([
   "faster-whisper>=1.1,<2",
@@ -529,9 +531,10 @@ function checkCoreDependencies(py) {
 }
 
 function checkRuntimeDependencies(py, env) {
+  // yt-dlp is installed with the requirements but not import-gated: a PATH binary works and the app self-installs it on first use.
   var imports = runtimeProfile() === "core"
-    ? "import pydantic, typer, PIL, cryptography"
-    : "import pydantic, typer, PIL, cryptography, faster_whisper, fastembed, edge_tts";
+    ? "import pydantic, typer, PIL, cryptography, httpx"
+    : "import pydantic, typer, PIL, cryptography, httpx, faster_whisper, fastembed, edge_tts";
   var result = runSync(
     py.command,
     pythonArgs(py, ["-c", imports]),
@@ -922,6 +925,9 @@ function ensureToolchain() {
   var childEnv = mergeEnv(pythonRuntime.env || {});
   prependEnvPath(childEnv, ffmpegBin);
   childEnv.MRF_FFMPEG_BIN = ffmpegBin;
+  if (pythonRuntime.uv) {
+    childEnv.MRF_UV = pythonRuntime.uv;
+  }
   childEnv.MRF_WHISPER_CACHE = path.join(appDataRoot(), "models", "whisper");
   childEnv.MRF_WHISPER_BATCH_SIZE = childEnv.MRF_WHISPER_BATCH_SIZE ||
     (os.totalmem() >= 16 * 1024 * 1024 * 1024 ? "8" : "4");
