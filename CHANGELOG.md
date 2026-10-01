@@ -68,6 +68,10 @@ All notable changes to Movie Review Factory are documented here.
 - Claude content-agent failures surface a bounded `head…tail` diagnostic (≤400 chars, no full stdout flood) and transient HTTP 429/5xx advisor errors are retried with `5×(attempt+1)` backoff instead of failing the stage on the first hiccup.
 - QA source provenance compares against the video the render actually read (`source_clean.mp4` after watermark removal) and normalizes job-relative vs absolute paths, so a CLI run with watermark removal no longer fails with "The rendered source differs from the job source".
 - `mrf` CLI output is forced to UTF-8 so Vietnamese text prints on Windows cp1252 pipes.
+- Link download no longer fails when YouTube rejects the subtitle fetch (`HTTP Error 429` on `vi`/`en` subs): the video is retried without subtitles (the transcript stage falls back to Whisper) and the result carries `subtitle_warning`; failure messages show only yt-dlp's `ERROR:` lines instead of the JS-runtime/impersonation warnings.
+- Media subprocesses are bounded: ffprobe (45s) and short FFmpeg calls (240s) in ingest, audio extraction, subtitle probing, duration probe, QA and chunked-TTS concat time out with the command in the error and remove partial outputs.
+- Job SQLite indexes open with a busy timeout, WAL journaling and a `quick_check` that refuses a corrupt database; license keys are written atomically (temp file + fsync + replace).
+- Windows packaging downloads are checksum-verified, reject a corrupt cache and extract ZIPs without path traversal; the release gate's artifact mode tests only the designated packaged runtime and never falls back to source; the one-file launcher installs and checks Pillow + cryptography as core dependencies.
 
 ### Security
 - Hardened the yt-dlp invocation against argument injection: URLs are validated as http(s)-only and a `--` end-of-options guard is placed before the URL, so a value like `--exec=...` can no longer be parsed as a yt-dlp option.

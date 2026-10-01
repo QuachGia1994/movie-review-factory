@@ -6,8 +6,13 @@ script, ._pth patch) and the installer script's key invariants.
 """
 from __future__ import annotations
 
+import hashlib
 import importlib.util
+import io
+import zipfile
 from pathlib import Path
+
+import pytest
 
 REPO = Path(__file__).resolve().parents[1]
 SCRIPT = REPO / "scripts" / "package_windows.py"
@@ -53,6 +58,35 @@ def test_patch_embed_pth_enables_site_and_is_idempotent():
     assert "#import site" not in patched
     assert "Lib\\site-packages" in patched
     assert pkg.patch_embed_pth(patched).count("import site") == 1
+
+
+def test_download_rejects_corrupt_cache_and_checksum_mismatch(tmp_path, monkeypatch):
+    dest = tmp_path / "artifact.bin"
+    dest.write_bytes(b"corrupt-cache")
+    payload = b"partial-or-wrong"
+
+    class Response(io.BytesIO):
+        headers = {"Content-Length": str(len(payload))}
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            self.close()
+
+    monkeypatch.setattr(pkg.urllib.request, "urlopen", lambda *args, **kwargs: Response(payload))
+    expected = hashlib.sha256(b"expected").hexdigest()
+    with pytest.raises(RuntimeError, match="SHA-256 mismatch"):
+        pkg.download("https://example.invalid/artifact", dest, sha256=expected)
+    assert dest.read_bytes() == b"corrupt-cache"
+    assert not (tmp_path / "artifact.bin.part").exists()
+
+
+@pytest.mark.parametrize("member", ["../escape", "/absolute", "C:/drive", "//server/share"])
+def test_safe_extract_rejects_zip_traversal(tmp_path, member):
+    archive_path = tmp_path / "bad.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr(member, b"bad")
+    with zipfile.ZipFile(archive_path) as archive, pytest.raises(RuntimeError, match="unsafe ZIP"):
+        pkg.safe_extract_zip(archive, tmp_path / "out")
 
 
 def test_iss_is_per_user_and_wires_the_launcher():

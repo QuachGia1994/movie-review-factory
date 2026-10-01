@@ -14,10 +14,18 @@ _MIGRATION_PACKAGE = "movie_review_factory.migrations"
 class MediaStore:
     """Small SQLite persistence boundary for media intelligence records."""
 
-    def __init__(self, database: str | Path = ":memory:") -> None:
-        self.connection = sqlite3.connect(database)
+    def __init__(self, database: str | Path = ":memory:", *, busy_timeout_ms: int = 5000) -> None:
+        self.database = database
+        self.connection = sqlite3.connect(database, timeout=max(0, busy_timeout_ms) / 1000)
         self.connection.row_factory = sqlite3.Row
         self.connection.execute("PRAGMA foreign_keys = ON")
+        self.connection.execute(f"PRAGMA busy_timeout = {max(0, int(busy_timeout_ms))}")
+        if str(database) != ":memory:":
+            self.connection.execute("PRAGMA journal_mode = WAL")
+            result = self.connection.execute("PRAGMA quick_check").fetchone()
+            if not result or str(result[0]).lower() != "ok":
+                self.connection.close()
+                raise sqlite3.DatabaseError(f"SQLite quick_check failed: {result[0] if result else 'no result'}")
 
     def close(self) -> None:
         self.connection.close()

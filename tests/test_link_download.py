@@ -43,8 +43,11 @@ def test_build_metadata_command_skips_download() -> None:
 
 def test_download_video_returns_source_and_subtitles(tmp_path: Path) -> None:
     def fake_runner(command: list[str], **kwargs: object) -> object:
-        (tmp_path / "source.mp4").write_bytes(b"fake-mp4")
-        (tmp_path / "source.vi.srt").write_text("1\n00:00:00,000 --> 00:00:01,000\nXin chao\n", encoding="utf-8")
+        if "-o" not in command:
+            return type("R", (), {"returncode": 0, "stdout": '{"format":{"duration":"1.0"}}', "stderr": ""})()
+        staging = Path(command[command.index("-o") + 1]).parent
+        (staging / "source.mp4").write_bytes(b"fake-mp4")
+        (staging / "source.vi.srt").write_text("1\n00:00:00,000 --> 00:00:01,000\nXin chao\n", encoding="utf-8")
         return type("R", (), {"returncode": 0, "stderr": ""})()
 
     result = link_download.download_video(
@@ -68,6 +71,48 @@ def test_download_video_raises_when_no_output_produced(tmp_path: Path) -> None:
         link_download.download_video(
             "https://x/v", tmp_path, confirm_rights=True, ytdlp="/yt-dlp", runner=empty_runner,
         )
+
+
+_SUB_429 = (
+    "WARNING: [youtube] No supported JavaScript runtime could be found.\n"
+    "ERROR: Unable to download video subtitles for 'vi': HTTP Error 429: Too Many Requests\n"
+)
+
+
+def test_download_retries_without_subtitles_when_subtitles_fail(tmp_path: Path) -> None:
+    calls: list[list[str]] = []
+
+    def runner(command: list[str], **kwargs: object) -> object:
+        if "-o" not in command:
+            return type("R", (), {"returncode": 0, "stdout": '{"format":{"duration":"1.0"}}', "stderr": ""})()
+        calls.append(command)
+        if "--write-subs" in command:
+            return type("R", (), {"returncode": 1, "stderr": _SUB_429})()
+        (Path(command[command.index("-o") + 1]).parent / "source.mp4").write_bytes(b"fake-mp4")
+        return type("R", (), {"returncode": 0, "stderr": ""})()
+
+    result = link_download.download_video(
+        "https://x/v", tmp_path, confirm_rights=True, ytdlp="/yt-dlp", runner=runner,
+    )
+    assert len(calls) == 2 and "--write-subs" not in calls[1]
+    assert result["source_video"] == str(tmp_path / "source.mp4")
+    assert result["subtitles"] == []
+    assert "429" in result["subtitle_warning"]
+
+
+def test_download_failure_reports_only_error_lines(tmp_path: Path) -> None:
+    calls: list[list[str]] = []
+
+    def runner(command: list[str], **kwargs: object) -> object:
+        calls.append(command)
+        return type("R", (), {"returncode": 1, "stderr": "WARNING: noise\nERROR: [youtube] abc: Video unavailable\n"})()
+
+    with pytest.raises(RuntimeError) as excinfo:
+        link_download.download_video(
+            "https://x/v", tmp_path, confirm_rights=True, ytdlp="/yt-dlp", runner=runner,
+        )
+    assert str(excinfo.value) == "yt-dlp download failed: ERROR: [youtube] abc: Video unavailable"
+    assert len(calls) == 1
 
 
 def test_fetch_metadata_parses_json(tmp_path: Path) -> None:

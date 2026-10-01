@@ -142,21 +142,13 @@ def configure_env() -> dict:
     return info
 
 
-def package_candidates() -> list[Path]:
-    """Repo source first, then launcher-extracted runtimes, newest first."""
-    candidates: list[Path] = []
+def package_candidates(args: argparse.Namespace) -> list[Path]:
+    """Return only candidates permitted by the explicit gate mode."""
+    if args.mode == "artifact":
+        artifact = Path(args.artifact).resolve()
+        return [artifact] if (artifact / "movie_review_factory" / "pipeline.py").is_file() else []
     source = REPO_ROOT / "src"
-    if (source / "movie_review_factory" / "pipeline.py").is_file():
-        candidates.append(source)
-    runtime_root = app_root() / "runtime"
-    if runtime_root.is_dir():
-        runtimes = [
-            entry for entry in runtime_root.iterdir()
-            if entry.is_dir() and (entry / "movie_review_factory" / "pipeline.py").is_file()
-        ]
-        runtimes.sort(key=lambda entry: entry.stat().st_mtime, reverse=True)
-        candidates.extend(runtimes)
-    return candidates
+    return [source] if (source / "movie_review_factory" / "pipeline.py").is_file() else []
 
 
 def probe_package(root: Path) -> tuple[bool, str]:
@@ -559,34 +551,24 @@ def run_gate(args: argparse.Namespace) -> int:
 
     rows: dict[str, dict] = {}
     repo_src = REPO_ROOT / "src"
-    candidates = package_candidates()
-    src_present = (repo_src / "movie_review_factory" / "pipeline.py").is_file()
-    if src_present:
-        emit("probing repo src import ...")
-        src_ok, src_detail = probe_package(repo_src)
-    else:
-        src_ok, src_detail = True, "repo src not shipped with this gate - nothing to validate"
-    selected: Path | None = repo_src if (src_present and src_ok) else None
-    fallback_note = ""
-    if selected is None:
-        for candidate in candidates:
-            if candidate == repo_src:
-                continue
-            emit(f"repo src unusable; probing runtime copy {candidate} ...")
-            ok, detail = probe_package(candidate)
-            if ok:
-                selected = candidate
-                fallback_note = f" | chain continues on runtime copy {candidate}"
-                break
-            fallback_note = f" | runtime copy also unusable: {detail}"
-    if src_ok:
-        detail = f"repo src: {src_detail}"
-        if selected is not None and selected != repo_src:
-            detail += f" | package source = {selected}"
-        rows["package-import"] = make_row("package-import", PASS, detail)
-    else:
+    candidates = package_candidates(args)
+    selected: Path | None = None
+    detail = ""
+    for candidate in candidates:
+        emit(f"probing {args.mode} package {candidate} ...")
+        ok, detail = probe_package(candidate)
+        if ok:
+            selected = candidate
+            break
+    if selected is not None:
         rows["package-import"] = make_row(
-            "package-import", FAIL, f"repo src: {src_detail}{fallback_note}"
+            "package-import", PASS, f"{args.mode} package {selected}: {detail}"
+        )
+    else:
+        requested = args.artifact if args.mode == "artifact" else str(repo_src)
+        rows["package-import"] = make_row(
+            "package-import", FAIL,
+            f"{args.mode} package {requested} is missing or not importable: {detail or 'no runtime found'}",
         )
     if selected is None:
         print_row(rows["package-import"])
@@ -848,6 +830,14 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         description="R15 clean-Windows release gate (prints PASS/FAIL/BOO per step)."
     )
     parser.add_argument(
+        "--mode", choices=("source", "artifact"), default="source",
+        help="explicit package source; artifact mode never falls back to repo source",
+    )
+    parser.add_argument(
+        "--artifact", default="",
+        help="extracted runtime package root (required with --mode artifact)",
+    )
+    parser.add_argument(
         "--python", default=None,
         help="interpreter to use (default: auto-detect the fullest installed profile)",
     )
@@ -860,6 +850,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(list(sys.argv[1:] if argv is None else argv))
+    if args.mode == "artifact" and not args.artifact:
+        emit("[FAIL] environment       --artifact is required with --mode artifact")
+        return 1
     if os.environ.get("MRF_GATE_CHILD") == "1":
         return run_gate(args)
 

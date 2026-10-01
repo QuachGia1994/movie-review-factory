@@ -240,7 +240,18 @@ def save_license_text(text: str) -> Path:
     directory = license_dir()
     directory.mkdir(parents=True, exist_ok=True)
     path = license_path()
-    path.write_text((text or "").strip(), encoding="utf-8")
+    temporary = directory / f".{path.name}.{os.getpid()}.tmp"
+    try:
+        with temporary.open("w", encoding="utf-8", newline="") as handle:
+            handle.write((text or "").strip())
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
     return path
 
 

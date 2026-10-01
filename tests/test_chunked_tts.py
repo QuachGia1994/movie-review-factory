@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+import movie_review_factory.chunked_tts as chunked_tts
 from movie_review_factory.chunked_tts import split_narration, synthesize_chunked
 
 
@@ -186,6 +187,24 @@ def test_chunk_failure_does_not_replace_approved_audio(tmp_path: Path):
     assert calls >= 3
     assert output.read_bytes() == b"previous approved result"
     assert sorted(path.name for path in tmp_path.iterdir()) == ["narration.mp3"]
+
+
+def test_concat_timeout_maps_context_and_cleans_partial_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    part = tmp_path / "part.mp3"
+    part.write_bytes(b"audio")
+    output = tmp_path / "merged.mp3"
+
+    def timeout(command, **_kwargs):
+        output.write_bytes(b"partial")
+        raise subprocess.TimeoutExpired(command, chunked_tts.FFMPEG_CONCAT_TIMEOUT_SECONDS)
+
+    monkeypatch.setattr(chunked_tts.subprocess, "run", timeout)
+    with pytest.raises(RuntimeError, match=r"timed out.*ffmpeg.*merged\.mp3"):
+        chunked_tts.concat_mp3([part], output)
+    assert not output.exists()
+    assert not output.with_suffix(".concat.txt").exists()
 
 
 @pytest.mark.skipif(not shutil.which("ffmpeg") or not shutil.which("ffprobe"), reason="FFmpeg binaries unavailable")

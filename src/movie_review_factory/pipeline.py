@@ -68,6 +68,24 @@ SUBTITLE_BOTTOM_FRACTION = 0.10   # caption block sits ~10% above the frame bott
 SUBTITLE_SIDE_FRACTION = 0.075    # left/right margin -> caption width capped at ~85%
 SUBTITLE_FONT_FRACTION = 0.042    # caption font size as a fraction of frame height
 
+FFPROBE_TIMEOUT_SECONDS = 45
+FFMPEG_SHORT_TIMEOUT_SECONDS = 240
+
+
+def _run_media_command(
+    command: list[str], *, timeout: float, cleanup: tuple[Path, ...] = (), **kwargs
+) -> subprocess.CompletedProcess:
+    """Run a bounded FFmpeg/ffprobe command and clean partial outputs on timeout."""
+    try:
+        return subprocess.run(command, timeout=timeout, **kwargs)
+    except subprocess.TimeoutExpired as exc:
+        for path in cleanup:
+            path.unlink(missing_ok=True)
+        context = subprocess.list2cmdline(command)
+        raise RuntimeError(
+            f"media command timed out after {timeout:g}s: {context}"
+        ) from exc
+
 
 # --- manifest I/O -----------------------------------------------------------
 
@@ -237,10 +255,10 @@ def _ingest(root: Path, manifest: JobManifest) -> tuple[list[Artifact], str]:
     ffprobe = shutil.which("ffprobe")
     if not ffprobe:
         raise SkipStage("ffprobe not on PATH - install FFmpeg to ingest")
-    proc = subprocess.run(
+    proc = _run_media_command(
         [ffprobe, "-v", "error", "-print_format", "json",
          "-show_format", "-show_streams", str(src)],
-        capture_output=True, text=True,
+        timeout=FFPROBE_TIMEOUT_SECONDS, capture_output=True, text=True,
     )
     if proc.returncode != 0:
         raise RuntimeError(f"ffprobe failed: {proc.stderr.strip()[:200]}")
@@ -461,7 +479,10 @@ def _extract_wav_16k_mono(src: Path, dest: Path) -> bool:
         "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", str(dest),
     ]
     try:
-        subprocess.run(command, capture_output=True, text=True, check=True)
+        _run_media_command(
+            command, timeout=FFMPEG_SHORT_TIMEOUT_SECONDS, cleanup=(dest,),
+            capture_output=True, text=True, check=True,
+        )
     except (subprocess.CalledProcessError, OSError):
         dest.unlink(missing_ok=True)
         return False
@@ -522,11 +543,11 @@ def _embedded_subtitle_segments(
     if not ffprobe or not ffmpeg:
         return None
     try:
-        probe = subprocess.run(
+        probe = _run_media_command(
             [ffprobe, "-v", "error", "-select_streams", "s",
              "-show_entries", "stream=index:stream_tags=language",
              "-of", "json", str(src)],
-            capture_output=True, text=True, check=True,
+            timeout=FFPROBE_TIMEOUT_SECONDS, capture_output=True, text=True, check=True,
         )
         streams = json.loads(probe.stdout or "{}").get("streams") or []
     except (subprocess.CalledProcessError, OSError, json.JSONDecodeError):
@@ -545,8 +566,9 @@ def _embedded_subtitle_segments(
     dest.unlink(missing_ok=True)
     raw = ""
     try:
-        subprocess.run(
+        _run_media_command(
             [ffmpeg, "-y", "-i", str(src), "-map", f"0:s:{chosen_rel}", str(dest)],
+            timeout=FFMPEG_SHORT_TIMEOUT_SECONDS, cleanup=(dest,),
             capture_output=True, text=True, check=True,
         )
         if dest.exists():
@@ -754,9 +776,9 @@ def _probe_duration_seconds(src: Path) -> float | None:
     ffprobe = shutil.which("ffprobe")
     if not ffprobe:
         return None
-    proc = subprocess.run(
+    proc = _run_media_command(
         [ffprobe, "-v", "error", "-print_format", "json", "-show_format", str(src)],
-        capture_output=True, text=True,
+        timeout=FFPROBE_TIMEOUT_SECONDS, capture_output=True, text=True,
     )
     if proc.returncode != 0:
         raise RuntimeError(f"ffprobe failed: {proc.stderr.strip()[:200]}")
@@ -3386,10 +3408,10 @@ def _qa(root: Path, manifest: JobManifest) -> tuple[list[Artifact], str]:
     intro_seconds = float(render.get("intro_seconds") or 0.0)
     outro_seconds = float(render.get("outro_seconds") or 0.0)
 
-    proc = subprocess.run(
+    proc = _run_media_command(
         [ffprobe_bin, "-v", "error", "-print_format", "json",
          "-show_format", "-show_streams", str(final_path)],
-        capture_output=True, text=True,
+        timeout=FFPROBE_TIMEOUT_SECONDS, capture_output=True, text=True,
     )
 
     checks: list[dict] = []

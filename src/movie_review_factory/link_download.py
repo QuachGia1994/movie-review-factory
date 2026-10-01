@@ -17,6 +17,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from typing import Callable
 
@@ -29,12 +30,13 @@ DEFAULT_FORMAT = (
 DEFAULT_SUB_LANGS = "vi,en"
 _VIDEO_SUFFIXES = {".mp4", ".mkv", ".webm", ".mov", ".m4v"}
 
-# Bounded timeouts stop a stalled connection or a never-ending livestream from
-# hanging the yt-dlp child (and the request thread) forever. Metadata is a quick
-# --skip-download probe; the download cap is generous and overridable via
-# MRF_DOWNLOAD_TIMEOUT (set it to 0 to disable the cap entirely).
+# Bounded timeouts stop a stalled connection or endless livestream from hanging yt-dlp; config may lower, never disable or raise, the ceiling.
 METADATA_TIMEOUT_SECONDS = 60.0
 DEFAULT_DOWNLOAD_TIMEOUT_SECONDS = 1800.0
+HARD_DOWNLOAD_TIMEOUT_SECONDS = 3600.0
+HARD_MAX_FILESIZE_BYTES = 20 * 1024 * 1024 * 1024
+HARD_MAX_DURATION_SECONDS = 6 * 60 * 60
+PROBE_TIMEOUT_SECONDS = 30.0
 # yt-dlp per-socket read timeout: abort a stalled chunk fast so a mid-transfer
 # TCP stall is caught in seconds rather than waiting out the whole-process cap.
 SOCKET_TIMEOUT_SECONDS = 30
@@ -54,16 +56,46 @@ def _require_web_url(url: str) -> str:
     return cleaned
 
 
-def _download_timeout_seconds() -> float | None:
-    """Resolve the download timeout cap; ``MRF_DOWNLOAD_TIMEOUT=0`` disables it."""
+def _download_timeout_seconds() -> float:
+    """Resolve a positive timeout capped by the non-disableable hard ceiling."""
     raw = os.environ.get("MRF_DOWNLOAD_TIMEOUT", "").strip()
-    if not raw:
-        return DEFAULT_DOWNLOAD_TIMEOUT_SECONDS
     try:
-        value = float(raw)
+        value = float(raw) if raw else DEFAULT_DOWNLOAD_TIMEOUT_SECONDS
     except ValueError:
-        return DEFAULT_DOWNLOAD_TIMEOUT_SECONDS
-    return value if value > 0 else None
+        value = DEFAULT_DOWNLOAD_TIMEOUT_SECONDS
+    if value <= 0:
+        value = DEFAULT_DOWNLOAD_TIMEOUT_SECONDS
+    return min(value, HARD_DOWNLOAD_TIMEOUT_SECONDS)
+
+
+def _configured_limit(name: str, hard_limit: int) -> int:
+    try:
+        configured = int(os.environ.get(name, "") or hard_limit)
+    except ValueError:
+        configured = hard_limit
+    return min(max(1, configured), hard_limit)
+
+
+def _validate_video(path: Path, *, runner: Callable[..., object]) -> None:
+    if not path.is_file() or path.stat().st_size <= 0:
+        raise RuntimeError("downloaded source video is empty")
+    if path.stat().st_size > _configured_limit("MRF_DOWNLOAD_MAX_FILESIZE", HARD_MAX_FILESIZE_BYTES):
+        raise RuntimeError("downloaded source video exceeds the maximum file size")
+    ffprobe = shutil.which("ffprobe")
+    if not ffprobe:  # yt-dlp may run without ffprobe; retain basic non-empty validation.
+        return
+    result = runner(
+        [ffprobe, "-v", "error", "-show_entries", "format=duration", "-of", "json", str(path)],
+        capture_output=True, text=True, timeout=PROBE_TIMEOUT_SECONDS,
+    )
+    if getattr(result, "returncode", 1) != 0:
+        raise RuntimeError("downloaded source video failed ffprobe validation")
+    try:
+        duration = float(json.loads(getattr(result, "stdout", "") or "{}")["format"]["duration"])
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise RuntimeError("downloaded source video has no valid duration") from exc
+    if duration <= 0 or duration > _configured_limit("MRF_DOWNLOAD_MAX_DURATION", HARD_MAX_DURATION_SECONDS):
+        raise RuntimeError("downloaded source video duration is outside allowed limits")
 
 
 class RightsConfirmationRequired(RuntimeError):
@@ -140,20 +172,30 @@ def build_download_command(
     output_template: str,
     *,
     sub_langs: str = DEFAULT_SUB_LANGS,
+    include_subs: bool = True,
 ) -> list[str]:
-    """`yt-dlp` command that fetches <=1080p mp4 and pulls matching subtitles."""
+    """`yt-dlp` command that fetches <=1080p mp4 and, optionally, matching subtitles."""
+    subs = ["--write-subs", "--write-auto-subs", "--sub-langs", sub_langs, "--convert-subs", "srt"]
     return [
         ytdlp,
         "--no-playlist",
         "--socket-timeout", str(SOCKET_TIMEOUT_SECONDS),
         "-f", DEFAULT_FORMAT,
         "--merge-output-format", "mp4",
-        "--write-subs", "--write-auto-subs",
-        "--sub-langs", sub_langs,
-        "--convert-subs", "srt",
+        *(subs if include_subs else []),
         "-o", output_template,
         "--", url,
     ]
+
+
+# yt-dlp aborts the whole download when a subtitle fetch fails (YouTube often answers 429).
+_SUBTITLE_FAILURE = "Unable to download video subtitles"
+
+
+def _ytdlp_error(stderr: str) -> str:
+    """The ERROR lines of yt-dlp stderr, without the WARNING noise; tail as fallback."""
+    errors = [line.strip() for line in (stderr or "").splitlines() if line.strip().startswith("ERROR:")]
+    return (" ".join(errors) or (stderr or "").strip())[-1000:]
 
 
 def fetch_metadata(
@@ -229,20 +271,41 @@ def download_video(
     dest_dir = Path(dest_dir)
     dest_dir.mkdir(parents=True, exist_ok=True)
     runner = runner or subprocess.run
-    template = str(dest_dir / "source.%(ext)s")
-    command = build_download_command(binary, url, template, sub_langs=sub_langs)
     timeout = _download_timeout_seconds()
     try:
-        result = runner(command, capture_output=True, text=True, timeout=timeout)
-    except subprocess.TimeoutExpired as exc:
-        raise RuntimeError(
-            f"yt-dlp download timed out after {timeout:.0f}s "
-            "(raise or disable via MRF_DOWNLOAD_TIMEOUT)"
-        ) from exc
-    if getattr(result, "returncode", 1) != 0:
-        raise RuntimeError("yt-dlp download failed: " + (getattr(result, "stderr", "") or "")[-1000:])
-    source = _find_source_video(dest_dir)
-    if source is None:
-        raise RuntimeError("yt-dlp reported success but no source video was produced")
-    subtitles = sorted(str(path) for path in dest_dir.glob("source*.srt"))
-    return {"source_video": str(source), "subtitles": subtitles, "url": url}
+        with tempfile.TemporaryDirectory(prefix=".download-", dir=dest_dir) as staging_name:
+            staging = Path(staging_name)
+            template = str(staging / "source.%(ext)s")
+            subtitle_warning = None
+            for include_subs in (True, False):
+                command = build_download_command(
+                    binary, url, template, sub_langs=sub_langs, include_subs=include_subs,
+                )
+                try:
+                    result = runner(command, capture_output=True, text=True, timeout=timeout)
+                except subprocess.TimeoutExpired as exc:
+                    raise RuntimeError(f"yt-dlp download timed out after {timeout:.0f}s") from exc
+                if getattr(result, "returncode", 1) == 0:
+                    break
+                error = _ytdlp_error(getattr(result, "stderr", "") or "")
+                if not (include_subs and _SUBTITLE_FAILURE in error):
+                    raise RuntimeError("yt-dlp download failed: " + error)
+                # Subtitles only save a Whisper pass; retry the video without them.
+                subtitle_warning = error
+            source = _find_source_video(staging)
+            if source is None:
+                raise RuntimeError("yt-dlp reported success but no source video was produced")
+            _validate_video(source, runner=runner)
+            promoted_source = dest_dir / "source.mp4"
+            os.replace(source, promoted_source)
+            promoted_subtitles: list[str] = []
+            for subtitle in sorted(staging.glob("source*.srt")):
+                target = dest_dir / subtitle.name
+                os.replace(subtitle, target)
+                promoted_subtitles.append(str(target))
+            return {
+                "source_video": str(promoted_source), "subtitles": promoted_subtitles, "url": url,
+                "subtitle_warning": subtitle_warning,
+            }
+    except OSError as exc:
+        raise RuntimeError(f"could not stage/promote downloaded video: {exc}") from exc

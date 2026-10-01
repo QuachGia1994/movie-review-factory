@@ -15,6 +15,23 @@ from typing import Callable
 from .narration_alignment import TICKS_PER_SECOND, synthesize_with_boundaries
 
 
+FFPROBE_TIMEOUT_SECONDS = 45
+FFMPEG_CONCAT_TIMEOUT_SECONDS = 240
+
+
+def _run_media_command(
+    command: list[str], *, timeout: float, cleanup: tuple[Path, ...] = (), **kwargs
+) -> subprocess.CompletedProcess:
+    try:
+        return subprocess.run(command, timeout=timeout, **kwargs)
+    except subprocess.TimeoutExpired as exc:
+        for path in cleanup:
+            path.unlink(missing_ok=True)
+        raise RuntimeError(
+            f"media command timed out after {timeout:g}s: {subprocess.list2cmdline(command)}"
+        ) from exc
+
+
 def split_narration(narration: str, *, max_chars: int = 500) -> list[str]:
     """Split at sentence endings or whitespace, preserving the original characters."""
     if max_chars < 2:
@@ -61,10 +78,10 @@ def _bisect_failed_chunk(chunk: str, *, min_chars: int = 60) -> tuple[str, str] 
 
 def probe_mp3_duration(path: Path, *, ffprobe_bin: str = "ffprobe") -> float:
     """Read each actual MP3 duration; a synthetic duration would drift across batches."""
-    result = subprocess.run(
+    result = _run_media_command(
         [ffprobe_bin, "-v", "error", "-show_entries", "format=duration",
          "-of", "json", str(path)],
-        capture_output=True, text=True, check=True,
+        timeout=FFPROBE_TIMEOUT_SECONDS, capture_output=True, text=True, check=True,
     )
     duration = float(json.loads(result.stdout)["format"]["duration"])
     if not math.isfinite(duration) or duration <= 0:
@@ -81,9 +98,10 @@ def concat_mp3(parts: list[Path], output: Path, *, ffmpeg_bin: str = "ffmpeg") -
     listing.write_text(
         "".join(f"file '{part.name}'\n" for part in parts), encoding="utf-8",
     )
-    subprocess.run(
+    _run_media_command(
         [ffmpeg_bin, "-nostdin", "-y", "-v", "error", "-f", "concat",
          "-safe", "0", "-i", str(listing), "-c:a", "copy", str(output)],
+        timeout=FFMPEG_CONCAT_TIMEOUT_SECONDS, cleanup=(output, listing),
         check=True, capture_output=True, text=True,
     )
     if not output.is_file() or output.stat().st_size == 0:

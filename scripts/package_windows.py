@@ -28,13 +28,17 @@ See docs/windows-installer.md for prerequisites and code-signing guidance.
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
 import os
 import shutil
+import stat
 import subprocess
 import sys
+import tempfile
 import urllib.request
 import zipfile
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 
 APP_NAME = "Movie Review Factory"
 APP_VERSION = "0.2.0"
@@ -54,19 +58,29 @@ def python_embed_url(version: str) -> str:
     return f"https://www.python.org/ftp/python/{version}/python-{version}-embed-amd64.zip"
 
 
-def download_plan(cache_dir: Path, *, python_version: str = DEFAULT_PYTHON_VERSION) -> list[dict]:
-    """Pure: the artifacts to fetch and where they land in the cache.
+def download_plan(
+    cache_dir: Path, *, python_version: str = DEFAULT_PYTHON_VERSION,
+    manifest: dict[str, dict] | None = None,
+) -> list[dict]:
+    """Return artifacts, optionally overlaying pinned URL and required SHA-256.
 
-    Returned dicts have ``name``, ``url`` and ``dest`` (a path inside ``cache_dir``).
+    Digests are deliberately not guessed. Release builds must supply a JSON
+    manifest whose keys are artifact names and values contain ``url`` and
+    ``sha256`` from the named upstream release.
     """
     cache_dir = Path(cache_dir)
-    return [
+    plan = [
         {"name": "python-embed", "url": python_embed_url(python_version),
          "dest": cache_dir / f"python-{python_version}-embed-amd64.zip"},
         {"name": "get-pip", "url": GET_PIP_URL, "dest": cache_dir / "get-pip.py"},
         {"name": "ffmpeg", "url": FFMPEG_ZIP_URL, "dest": cache_dir / "ffmpeg-release-essentials.zip"},
         {"name": "yt-dlp", "url": YTDLP_EXE_URL, "dest": cache_dir / "yt-dlp.exe"},
     ]
+    for item in plan:
+        configured = (manifest or {}).get(item["name"], {})
+        item["url"] = configured.get("url", item["url"])
+        item["sha256"] = configured.get("sha256", "").lower()
+    return plan
 
 
 def patch_embed_pth(text: str) -> str:
@@ -137,24 +151,82 @@ def _log(message: str) -> None:
     print(f"[package-windows] {message}", flush=True)
 
 
-def download(url: str, dest: Path, *, force: bool = False) -> Path:
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def download(
+    url: str, dest: Path, *, sha256: str, force: bool = False,
+    max_bytes: int = 1_500_000_000,
+) -> Path:
+    """Download transactionally and accept cache/download only after digest match."""
+    if len(sha256) != 64 or any(char not in "0123456789abcdefABCDEF" for char in sha256):
+        raise ValueError(f"a valid SHA-256 is required for release artifact {dest.name}")
+    expected = sha256.lower()
     dest = Path(dest)
     dest.parent.mkdir(parents=True, exist_ok=True)
-    if dest.is_file() and dest.stat().st_size > 0 and not force:
-        _log(f"cached {dest.name}")
+    if dest.is_file() and not force and sha256_file(dest) == expected:
+        _log(f"cached {dest.name} (SHA-256 verified)")
         return dest
+    part = dest.with_name(dest.name + ".part")
+    part.unlink(missing_ok=True)
     _log(f"downloading {url}")
-    with urllib.request.urlopen(url) as response, open(dest, "wb") as handle:  # noqa: S310 (trusted URLs)
-        shutil.copyfileobj(response, handle)
-    if not dest.is_file() or dest.stat().st_size == 0:
-        raise RuntimeError(f"download produced no bytes: {url}")
+    try:
+        request = urllib.request.Request(url, headers={"User-Agent": "movie-review-factory-packager/1"})
+        with urllib.request.urlopen(request, timeout=60) as response, open(part, "xb") as handle:  # noqa: S310
+            declared = response.headers.get("Content-Length")
+            if declared and int(declared) > max_bytes:
+                raise RuntimeError(f"download exceeds {max_bytes} byte limit: {url}")
+            total = 0
+            while True:
+                chunk = response.read(1024 * 1024)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > max_bytes:
+                    raise RuntimeError(f"download exceeds {max_bytes} byte limit: {url}")
+                handle.write(chunk)
+            handle.flush()
+            os.fsync(handle.fileno())
+        if sha256_file(part) != expected:
+            raise RuntimeError(f"SHA-256 mismatch for {url}")
+        os.replace(part, dest)
+    finally:
+        part.unlink(missing_ok=True)
     return dest
+
+
+def safe_extract_zip(archive: zipfile.ZipFile, destination: Path) -> None:
+    """Extract regular files only; reject traversal, Windows roots and links."""
+    destination.mkdir(parents=True, exist_ok=True)
+    root = destination.resolve()
+    for info in archive.infolist():
+        posix = PurePosixPath(info.filename)
+        windows = PureWindowsPath(info.filename)
+        mode = info.external_attr >> 16
+        if (not info.filename or posix.is_absolute() or windows.is_absolute()
+                or windows.drive or ".." in posix.parts or ".." in windows.parts
+                or stat.S_ISLNK(mode) or (info.external_attr & 0x400)):
+            raise RuntimeError(f"unsafe ZIP member: {info.filename!r}")
+        target = destination.joinpath(*posix.parts)
+        if os.path.commonpath((str(root), str(target.resolve()))) != str(root):
+            raise RuntimeError(f"unsafe ZIP member: {info.filename!r}")
+        if info.is_dir():
+            target.mkdir(parents=True, exist_ok=True)
+        else:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with archive.open(info) as src, open(target, "xb") as dst:
+                shutil.copyfileobj(src, dst)
 
 
 def stage_python(cache: dict[str, Path], python_dir: Path, *, python_version: str) -> None:
     python_dir.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(cache["python-embed"]) as archive:
-        archive.extractall(python_dir)
+        safe_extract_zip(archive, python_dir)
     pth = next(python_dir.glob("python*._pth"), None)
     if pth is None:
         raise RuntimeError("embeddable Python is missing its ._pth file")
@@ -176,10 +248,16 @@ def stage_tools(cache: dict[str, Path], bin_dir: Path) -> None:
     shutil.copy2(cache["yt-dlp"], bin_dir / "yt-dlp.exe")
     with zipfile.ZipFile(cache["ffmpeg"]) as archive:
         wanted = ("ffmpeg.exe", "ffprobe.exe")
-        for member in archive.namelist():
-            base = member.rsplit("/", 1)[-1]
-            if base in wanted and not member.endswith("/"):
-                with archive.open(member) as src, open(bin_dir / base, "wb") as dst:
+        for info in archive.infolist():
+            posix = PurePosixPath(info.filename)
+            windows = PureWindowsPath(info.filename)
+            mode = info.external_attr >> 16
+            if (posix.is_absolute() or windows.is_absolute() or windows.drive
+                    or ".." in posix.parts or stat.S_ISLNK(mode)):
+                raise RuntimeError(f"unsafe ZIP member: {info.filename!r}")
+            base = posix.name
+            if base in wanted and not info.is_dir():
+                with archive.open(info) as src, open(bin_dir / base, "xb") as dst:
                     shutil.copyfileobj(src, dst)
     missing = [name for name in ("ffmpeg.exe", "ffprobe.exe", "yt-dlp.exe") if not (bin_dir / name).is_file()]
     if missing:
@@ -201,18 +279,43 @@ def build(args: argparse.Namespace) -> int:
     out_root = Path(args.out)
     cache_dir = Path(args.cache)
     payload = out_root / "payload"
-    if payload.exists():
-        shutil.rmtree(payload)
-    plan = download_plan(cache_dir, python_version=args.python_version)
-    cache = {item["name"]: download(item["url"], item["dest"], force=args.force_download) for item in plan}
+    manifest = json.loads(Path(args.download_manifest).read_text(encoding="utf-8"))
+    plan = download_plan(cache_dir, python_version=args.python_version, manifest=manifest)
+    cache = {
+        item["name"]: download(
+            item["url"], item["dest"], sha256=item["sha256"], force=args.force_download,
+        ) for item in plan
+    }
 
-    stage_python(cache, payload / "python", python_version=args.python_version)
-    install_app(payload / "python", cache["get-pip"], extras=[e for e in args.extras.split(",") if e.strip()])
-    stage_tools(cache, payload / "bin")
-    (payload / "mrf-launch.vbs").write_text(render_launcher_vbs(args.port), encoding="utf-8")
-    (payload / "README.txt").write_text(
-        f"{APP_NAME} {APP_VERSION}\n\nDouble-click the Desktop shortcut to start. "
-        f"The dashboard opens at http://localhost:{args.port}/\n", encoding="utf-8")
+    out_root.mkdir(parents=True, exist_ok=True)
+    staging = Path(tempfile.mkdtemp(prefix="payload-", dir=out_root))
+    backup = out_root / "payload.last-known-good"
+    try:
+        stage_python(cache, staging / "python", python_version=args.python_version)
+        install_app(staging / "python", cache["get-pip"], extras=[e for e in args.extras.split(",") if e.strip()])
+        stage_tools(cache, staging / "bin")
+        (staging / "mrf-launch.vbs").write_text(render_launcher_vbs(args.port), encoding="utf-8")
+        (staging / "README.txt").write_text(
+            f"{APP_NAME} {APP_VERSION}\n\nDouble-click the Desktop shortcut to start. "
+            f"The dashboard opens at http://localhost:{args.port}/\n", encoding="utf-8")
+        required = (staging / "python" / "python.exe", staging / "bin" / "ffmpeg.exe",
+                    staging / "bin" / "ffprobe.exe", staging / "bin" / "yt-dlp.exe",
+                    staging / "mrf-launch.vbs")
+        if not all(path.is_file() and path.stat().st_size > 0 for path in required):
+            raise RuntimeError("staged payload failed validation")
+        if backup.exists():
+            shutil.rmtree(backup)
+        if payload.exists():
+            os.replace(payload, backup)
+        try:
+            os.replace(staging, payload)
+        except Exception:
+            if backup.exists() and not payload.exists():
+                os.replace(backup, payload)
+            raise
+    finally:
+        if staging.exists():
+            shutil.rmtree(staging)
     _log(f"payload staged at {payload}")
 
     if args.skip_iscc:
@@ -234,6 +337,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--cache", default=str(PROJECT_ROOT / "build" / "win" / "cache"), help="download cache")
     parser.add_argument("--extras", default="tts", help="comma extras to pip install (e.g. tts,media,semantic)")
     parser.add_argument("--python-version", default=DEFAULT_PYTHON_VERSION)
+    parser.add_argument("--download-manifest", required=True,
+                        help="JSON mapping artifact names to pinned url + sha256")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
     parser.add_argument("--version", default=APP_VERSION, help="installer AppVersion")
     parser.add_argument("--iscc", default="", help="path to ISCC.exe (default: search PATH)")

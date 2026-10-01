@@ -165,7 +165,9 @@ var BUNDLE = __MRF_BUNDLE__;
 var MANAGED_PYTHON = "3.12";
 var CORE_REQUIREMENTS = [
   "pydantic>=2.11,<3",
-  "typer>=0.16,<1"
+  "typer>=0.16,<1",
+  "Pillow>=11,<13",
+  "cryptography>=42,<50"
 ];
 var FULL_REQUIREMENTS = CORE_REQUIREMENTS.concat([
   "faster-whisper>=1.1,<2",
@@ -520,7 +522,7 @@ function checkCoreDependencies(py) {
     py.command,
     pythonArgs(py, [
       "-c",
-      "import pydantic, typer; from pydantic import BaseModel; print(pydantic.__version__)"
+      "import pydantic, typer, PIL, cryptography; from pydantic import BaseModel; print(pydantic.__version__)"
     ])
   );
   return result.status === 0;
@@ -528,8 +530,8 @@ function checkCoreDependencies(py) {
 
 function checkRuntimeDependencies(py, env) {
   var imports = runtimeProfile() === "core"
-    ? "import pydantic, typer"
-    : "import pydantic, typer, faster_whisper, fastembed, edge_tts";
+    ? "import pydantic, typer, PIL, cryptography"
+    : "import pydantic, typer, PIL, cryptography, faster_whisper, fastembed, edge_tts";
   var result = runSync(
     py.command,
     pythonArgs(py, ["-c", imports]),
@@ -545,13 +547,12 @@ function ensureCoreDependencies(py) {
   if (hasArg("--no-auto-install") || process.env.MRF_NO_AUTO_INSTALL === "1") {
     return false;
   }
-  log("Thiếu dependency lõi; đang cài pydantic + typer một lần...");
+  log("Thiếu dependency lõi; đang cài pydantic + typer + Pillow + cryptography một lần...");
   var install = childProcess.spawnSync(
     py.command,
     pythonArgs(py, [
-      "-m", "pip", "install", "--user",
-      "pydantic>=2.11,<3", "typer>=0.16,<1"
-    ]),
+      "-m", "pip", "install", "--user"
+    ].concat(CORE_REQUIREMENTS)),
     { stdio: "inherit", windowsHide: false }
   );
   return install.status === 0 && checkCoreDependencies(py);

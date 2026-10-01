@@ -6,6 +6,10 @@ flake: a bounded thread cap on every encode and a single single-threaded retry.
 """
 from __future__ import annotations
 
+import subprocess
+from pathlib import Path
+from types import SimpleNamespace
+
 import pytest
 
 import movie_review_factory.pipeline as pipeline
@@ -90,3 +94,36 @@ def test_video_encoder_auto_prefers_hardware_then_falls_back(monkeypatch: pytest
     monkeypatch.setattr(pipeline, "_available_ffmpeg_encoders", lambda: {"libx264"})
     args, is_hardware = pipeline._video_encoder_args()
     assert (args[:2], is_hardware) == (["-c:v", "libx264"], False)
+
+
+def test_duration_probe_passes_bounded_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    seen = {}
+
+    def fake_run(command, **kwargs):
+        seen.update(kwargs)
+        return SimpleNamespace(returncode=0, stdout='{"format":{"duration":"3.5"}}', stderr="")
+
+    monkeypatch.setattr(pipeline.shutil, "which", lambda _name: "ffprobe")
+    monkeypatch.setattr(pipeline.subprocess, "run", fake_run)
+    assert pipeline._probe_duration_seconds(Path("movie.mp4")) == 3.5
+    assert seen["timeout"] == pipeline.FFPROBE_TIMEOUT_SECONDS
+
+
+def test_media_timeout_maps_context_and_cleans_partial(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    partial = tmp_path / "partial.wav"
+    partial.write_bytes(b"partial")
+
+    def timeout(command, **_kwargs):
+        raise subprocess.TimeoutExpired(command, pipeline.FFMPEG_SHORT_TIMEOUT_SECONDS)
+
+    monkeypatch.setattr(pipeline.subprocess, "run", timeout)
+    with pytest.raises(RuntimeError, match=r"timed out.*ffmpeg.*partial\.wav") as error:
+        pipeline._run_media_command(
+            ["ffmpeg", "-i", "input.mp4", str(partial)],
+            timeout=pipeline.FFMPEG_SHORT_TIMEOUT_SECONDS,
+            cleanup=(partial,),
+        )
+    assert isinstance(error.value.__cause__, subprocess.TimeoutExpired)
+    assert not partial.exists()
