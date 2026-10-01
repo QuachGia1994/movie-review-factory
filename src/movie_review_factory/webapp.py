@@ -25,9 +25,11 @@ import hashlib
 import hmac
 import json
 import os
+import ipaddress
 import queue
 import re
 import shutil
+import socket
 import sys
 import tempfile
 import threading
@@ -36,12 +38,12 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 
-from . import analytics, audio_mix, branding, cancellation, copyright_bypass, creative_brief, editor_ops, hook_crafter, licensing, link_download, localization, mask_detection, midroll, pipeline, semantic_search, tts_providers, versions
+from . import analytics, audio_mix, branding, cancellation, content_scout, copyright_bypass, creative_brief, editor_ops, hook_crafter, licensing, link_download, localization, mask_detection, midroll, pipeline, propainter_setup, semantic_search, tts_providers, versions
 from .content_agent import _terminate_process_tree
 from .media_store import MediaStore
 from .creator_library import CreatorLibrary
 from . import media_intelligence
-from .models import CONTENT_AGENT_MODES, JobConfig
+from .models import CONTENT_AGENT_MODES, WATERMARK_METHODS, JobConfig
 
 # A job id / artifact name must be a single safe path segment. This is the only thing standing between a URL and the filesystem, so it is deliberately strict.
 _SAFE_SEGMENT = re.compile(r"^[A-Za-z0-9._-]+$")
@@ -57,6 +59,29 @@ _DASHBOARD_TOKEN: str = os.environ.get("DASHBOARD_TOKEN", "")
 
 # Maximum JSON request-body size accepted before returning 413.
 _MAX_BODY_BYTES = 1_048_576  # 1 MiB
+_REQUEST_TIMEOUT_SECONDS = 15.0
+_MAX_CONCURRENT_HANDLERS = 32
+
+
+def _is_loopback_host(host: str) -> bool:
+    """Return whether a bind target is unambiguously local-only."""
+    candidate = host.strip().lower().rstrip(".")
+    if candidate == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(candidate).is_loopback
+    except ValueError:
+        return False
+
+
+def _require_safe_bind(host: str) -> None:
+    if not _is_loopback_host(host) and not _DASHBOARD_TOKEN.strip():
+        raise ValueError("DASHBOARD_TOKEN is required when binding to a non-loopback host")
+
+
+class RequestTimeoutError(TimeoutError):
+    pass
+
 
 # Conservative security headers added to every response.
 _SECURITY_HEADERS: dict[str, str] = {
@@ -147,6 +172,13 @@ def _render_webvtt(segments) -> str:
     return "\n".join(lines).rstrip("\n") + "\n"
 
 
+# Whitelist (pip name -> import module) for POST /api/system/install-package so arbitrary input never reaches pip; token-gated on a localhost bind.
+_INSTALLABLE_PACKAGES = {
+    "vieneu": "vieneu",
+    "edge-tts": "edge_tts",
+}
+
+
 class JobsService:
     """Filesystem-backed operations behind the API, decoupled from HTTP.
 
@@ -172,12 +204,16 @@ class JobsService:
         self._batch: dict = {"running": False, "stop": False, "items": [], "started_at": None}
         self._lock = threading.Lock()
         self._version_lock = threading.Lock()
+        # 1-click TTS library installer (POST /api/system/install-package): per-package
+        # {status: running|done|error} tracked here and polled by the settings UI.
+        self._installs: dict[str, dict] = {}
         # Background indexing queue (roadmap #14): a single FIFO worker builds
         # media_index/embeddings/scene-memory for imported jobs one at a time so
         # import returns immediately and other projects stay usable meanwhile.
         self._indexing: dict[str, dict] = {}
-        self._index_queue: "queue.Queue[str]" = queue.Queue()
+        self._index_queue: "queue.Queue[str | None]" = queue.Queue()
         self._index_cv = threading.Condition(self._lock)
+        self._closed = threading.Event()
         self._index_auto = os.environ.get("MRF_AUTO_INDEX", "0").strip().lower() not in (
             "0", "false", "no", "off",
         )
@@ -189,6 +225,29 @@ class JobsService:
             pipeline.recover_interrupted_run(self._job_root(job["job_id"]))
 
     # -- helpers -------------------------------------------------------------
+
+    def close(self, timeout: float = 5.0) -> None:
+        """Stop accepting background work and boundedly join owned workers."""
+        if self._closed.is_set():
+            return
+        self._closed.set()
+        with self._lock:
+            self._batch["stop"] = True
+            for state in self._indexing.values():
+                state["cancel"].set()
+            for state in self._runs.values():
+                event = state.get("event")
+                if event is not None:
+                    event.set()
+        self._index_queue.put(None)
+        if self._index_worker_thread is not threading.current_thread():
+            self._index_worker_thread.join(max(0.0, timeout))
+
+    shutdown = close
+
+    def _ensure_open(self) -> None:
+        if self._closed.is_set():
+            raise RuntimeError("service is shutting down")
 
     def _job_root(self, job_id: str) -> Path:
         if not _is_safe_segment(job_id):
@@ -238,6 +297,114 @@ class JobsService:
 
     def search_creator_projects(self, query: str) -> dict:
         return {"projects": self.creator_library.search_projects(query)}
+
+    def list_channels(self) -> dict:
+        return self.creator_library.list_channels()
+
+    def save_channel(self, payload: dict) -> dict:
+        return self.creator_library.save_channel(str(payload.get("id") or ""), payload)
+
+    def activate_channel(self, profile_id: str) -> dict:
+        return self.creator_library.activate_channel(profile_id)
+
+    def delete_channel(self, profile_id: str) -> dict:
+        self.creator_library.delete_channel(profile_id)
+        return {"deleted": profile_id, **self.creator_library.list_channels()}
+
+    def save_channel_logo(self, profile_id: str, data: bytes) -> dict:
+        self.creator_library.set_channel_logo(profile_id, data)
+        return {"logo_url": f"/api/channels/{profile_id}/logo"}
+
+    def channel_logo_file(self, profile_id: str) -> Path:
+        return branding.channel_logo_path(self.jobs_root, profile_id) or branding.logo_path(self.jobs_root)
+
+    def save_channel_sfx(self, profile_id: str, payload: dict) -> dict:
+        return self.creator_library.save_channel_sfx(profile_id, payload)
+
+    def save_channel_sfx_file(self, profile_id: str, slug: str, content_type: str, data: bytes) -> dict:
+        return self.creator_library.set_channel_sfx_file(profile_id, slug, content_type, data)
+
+    def delete_channel_sfx(self, profile_id: str, slug: str) -> dict:
+        return self.creator_library.delete_channel_sfx(profile_id, slug)
+
+    def channel_sfx_file(self, profile_id: str, slug: str) -> Path:
+        path = branding.channel_sfx_path(self.jobs_root, profile_id, slug)
+        if path is None:
+            raise FileNotFoundError("SFX chưa có tệp")
+        return path
+
+    def active_channel_sfx(self) -> dict:
+        return self.creator_library.active_channel_sfx()
+
+    def add_audio_mix_sfx(self, job_id: str, payload: dict) -> dict:
+        """Append an active-channel SFX to a job's audio mix at the given timestamp."""
+        root = self._require_job(job_id)
+        path, meta = self.creator_library.resolve_active_sfx(str(payload.get("slug") or ""))
+        config = self._read_json(root, "audio_mix.json") or {"voice_gain_db": 0, "music": None, "effects": []}
+        effects = list(config.get("effects") or [])
+        if len(effects) >= 16:
+            raise ValueError("Đã đạt tối đa 16 hiệu ứng âm thanh; xoá bớt trước khi thêm.")
+        try:
+            at = float(payload.get("at_seconds", 0))
+        except (TypeError, ValueError):
+            at = 0.0
+        effects.append({
+            "path": str(path),
+            "rights_note": meta.get("rights_note", ""),
+            "gain_db": float(meta.get("gain_db", -8)),
+            "at_seconds": max(0.0, at),
+        })
+        return self.update_audio_mix(job_id, {
+            "voice_gain_db": config.get("voice_gain_db", 0),
+            "music": config.get("music"),
+            "effects": effects,
+        })
+
+    def place_transition_sfx(self, job_id: str) -> dict:
+        """Auto-place channel SFX at each scene cut using render.json timings (mode B).
+
+        Cut offsets are body-relative cumulative clip durations from render.json;
+        auto effects are tagged so a re-run replaces the previous set rather than
+        stacking. Requires a prior render so the cut times are exact.
+        """
+        root = self._require_job(job_id)
+        render = self._read_json(root, "render.json")
+        if not render or not render.get("clips"):
+            raise ValueError("Cần dựng video một lần trước để biết mốc cắt cảnh, rồi tự rải SFX và dựng lại.")
+        durations = [float(clip.get("duration_seconds") or 0) for clip in render["clips"]]
+        cuts = pipeline.transition_cut_offsets(durations)
+        narration = float(render.get("narration_duration_seconds") or 0)
+        if narration > 0:
+            cuts = [cut for cut in cuts if cut < narration - 0.05]
+        if not cuts:
+            raise ValueError("Không tìm thấy điểm chuyển cảnh phù hợp để chèn SFX.")
+        palette = self.creator_library.active_channel_sfx()["sfx"]
+        if not palette:
+            raise ValueError("Kênh đang dùng chưa có SFX (đã tải tệp). Thêm SFX trong mục Kênh trước.")
+        config = self._read_json(root, "audio_mix.json") or {"voice_gain_db": 0, "music": None, "effects": []}
+        manual = [e for e in (config.get("effects") or []) if e.get("source") != "channel-transition"]
+        budget = 16 - len(manual)
+        if budget <= 0:
+            raise ValueError("Đã đủ 16 hiệu ứng âm thanh; xoá bớt trước khi tự rải.")
+        chosen = pipeline.select_evenly(cuts, budget)
+        resolved = {item["slug"]: self.creator_library.resolve_active_sfx(item["slug"]) for item in palette}
+        auto = []
+        for position, at in enumerate(chosen):
+            path, meta = resolved[palette[position % len(palette)]["slug"]]
+            auto.append({
+                "path": str(path),
+                "rights_note": meta.get("rights_note", ""),
+                "gain_db": float(meta.get("gain_db", -8)),
+                "at_seconds": float(at),
+                "source": "channel-transition",
+            })
+        result = self.update_audio_mix(job_id, {
+            "voice_gain_db": config.get("voice_gain_db", 0),
+            "music": config.get("music"),
+            "effects": manual + auto,
+        })
+        result["placed"] = len(auto)
+        return result
 
     def list_creator_rights(self, job_id: str) -> dict:
         self._require_job(job_id)
@@ -304,6 +471,7 @@ class JobsService:
         info["has_source_video"] = bool(cfg.source_video)
         info["brand_top_band"] = cfg.brand_top_band
         info["brand_bottom_band"] = cfg.brand_bottom_band
+        info["config"] = cfg.model_dump(mode="json")
         info["run_error"] = run_error
         info["run_error_vi"] = localization.localize_message(run_error) if run_error else None
 
@@ -1169,6 +1337,9 @@ class JobsService:
         if content_agent not in CONTENT_AGENT_MODES:
             raise ValueError(f"content_agent phải là {' hoặc '.join(CONTENT_AGENT_MODES)}")
         watermark_detect = str(payload.get("watermark_detect") or "").strip().lower()
+        watermark_method = str(payload.get("watermark_method") or "propainter").strip().lower()
+        if watermark_method not in WATERMARK_METHODS:
+            raise ValueError(f"watermark_method phải là {', '.join(WATERMARK_METHODS)}")
         watermark_removal: dict = {}
         if watermark_detect:
             if watermark_detect not in ("color", "temporal", "external"):
@@ -1177,25 +1348,98 @@ class JobsService:
             detector_cmd = str(payload.get("detector_cmd") or "").strip()
             if detector_cmd:
                 detect["external_cmd"] = detector_cmd
-            watermark_removal = {"enabled": True, "detect": detect}
+            watermark_removal = {"enabled": True, "method": watermark_method, "detect": detect}
+        # Prefill unset fields from the active channel profile; existing jobs are never mutated by a channel switch.
+        defaults = self.creator_library.active_channel_defaults() or {}
+
+        def _with_default(key: str, fallback):
+            value = payload.get(key)
+            if value in (None, ""):
+                value = defaults.get(key, fallback)
+            return fallback if value in (None, "") else value
+
         config = JobConfig(
             job_id=job_id,
-            language=str(payload.get("language") or "vi"),
+            language=str(_with_default("language", "vi")),
             target_minutes=float(payload.get("target_minutes") or 10),
-            aspect_ratio=str(payload.get("aspect_ratio") or "16:9"),
+            aspect_ratio=str(_with_default("aspect_ratio", "16:9")),
             source_video=Path(source_video) if source_video else None,
             movie_title=str(payload.get("movie_title") or "").strip() or None,
             creative_brief=payload.get("creative_brief") or {},
             content_agent=content_agent,
-            brand_top_band=float(payload.get("brand_top_band") or 0),
-            brand_bottom_band=float(payload.get("brand_bottom_band") or 0),
+            intro_seconds=float(_with_default("intro_seconds", 0)),
+            outro_seconds=float(_with_default("outro_seconds", 0)),
+            brand_top_band=float(_with_default("brand_top_band", 0)),
+            brand_bottom_band=float(_with_default("brand_bottom_band", 0)),
             watermark_removal=watermark_removal,
-            copyright_bypass=str(payload.get("copyright_bypass") or "off"),
-            tts_provider=str(payload.get("tts_provider") or "edge"),
-            tts_voice=str(payload.get("tts_voice") or "").strip(),
+            copyright_bypass=str(_with_default("copyright_bypass", "off")),
+            tts_provider=str(_with_default("tts_provider", "edge")),
+            tts_voice=str(_with_default("tts_voice", "")).strip(),
         )
         pipeline.create_job(root, config)
         return self.status(job_id)
+
+    def update_job_config(self, job_id: str, payload: dict) -> dict:
+        """Validate and persist the operator-editable pre-production settings."""
+        root = self._require_job(job_id)
+        if self._is_running(job_id):
+            raise RuntimeError("Chờ pipeline hoàn tất trước khi sửa cấu hình dự án.")
+        if not isinstance(payload, dict):
+            raise ValueError("cấu hình dự án phải là một object JSON")
+        allowed = {
+            "movie_title", "content_agent", "copyright_bypass", "watermark_removal",
+            "tts_provider", "tts_voice", "target_minutes", "aspect_ratio",
+        }
+        unknown = set(payload) - allowed
+        if unknown:
+            raise ValueError("trường cấu hình không được hỗ trợ: " + ", ".join(sorted(unknown)))
+
+        manifest = pipeline.load_manifest(root)
+        current = manifest.config.model_dump(mode="python")
+        updates = dict(payload)
+        if "movie_title" in updates:
+            title = str(updates["movie_title"] or "").strip()
+            if len(title) > 300:
+                raise ValueError("movie_title tối đa 300 ký tự")
+            updates["movie_title"] = title or None
+        if "content_agent" in updates and updates["content_agent"] not in CONTENT_AGENT_MODES:
+            raise ValueError(f"content_agent phải là {' hoặc '.join(CONTENT_AGENT_MODES)}")
+        if "copyright_bypass" in updates and updates["copyright_bypass"] not in copyright_bypass.PROFILES:
+            raise ValueError("copyright_bypass phải là off, light, balanced, hoặc aggressive")
+        if "tts_provider" in updates and updates["tts_provider"] not in tts_providers.SUPPORTED_PROVIDERS:
+            raise ValueError("tts_provider không được hỗ trợ")
+        if "tts_voice" in updates:
+            updates["tts_voice"] = str(updates["tts_voice"] or "").strip()
+        if "watermark_removal" in updates:
+            watermark = updates["watermark_removal"]
+            if not isinstance(watermark, dict):
+                raise ValueError("watermark_removal phải là một object JSON")
+            detect = watermark.get("detect")
+            if isinstance(detect, dict) and "detector_cmd" in detect:
+                detect = dict(detect)
+                detect["external_cmd"] = detect.pop("detector_cmd")
+                watermark = {**watermark, "detect": detect}
+            # Partial update: keep mask/boxes/bands/detector knobs the dialog does not edit.
+            existing = current.get("watermark_removal") or {}
+            merged = {**existing, **watermark}
+            if isinstance(existing.get("detect"), dict) and isinstance(watermark.get("detect"), dict):
+                merged["detect"] = {**existing["detect"], **watermark["detect"]}
+            updates["watermark_removal"] = merged
+
+        current.update(updates)
+        manifest.config = JobConfig.model_validate(current)
+        pipeline.save_manifest(root, manifest)
+        result = self.status(job_id)
+        completed = {stage["stage"] for stage in result["stages"] if stage["status"] == "ready"}
+        warnings = []
+        if "content_agent" in updates and completed.intersection({"research", "outline", "script"}):
+            warnings.append("Bộ tạo nội dung mới chỉ áp dụng khi chạy lại các bước nghiên cứu/kịch bản.")
+        if {"tts_provider", "tts_voice"}.intersection(updates) and "tts" in completed:
+            warnings.append("Giọng đọc mới chỉ áp dụng khi chạy lại bước tạo giọng.")
+        if "watermark_removal" in updates and "watermark" in completed:
+            warnings.append("Thiết lập xoá watermark mới chỉ áp dụng khi chạy lại bước xoá watermark.")
+        result["config_warnings"] = warnings
+        return result
 
     def probe_detector(self, job_id: str) -> dict:
         """Run the external watermark detector on one frame to validate config."""
@@ -1409,6 +1653,7 @@ class JobsService:
         """
         from . import batch_queue
 
+        self._ensure_open()
         urls = batch_queue.parse_batch_input(str(payload.get("links") or ""))
         confirm_rights = bool(payload.get("confirm_rights"))
         if process is None and not confirm_rights:
@@ -1479,6 +1724,7 @@ class JobsService:
         return process
 
     def start_run(self, job_id: str, *, until: str | None = None) -> dict:
+        self._ensure_open()
         root = self._require_job(job_id)
         if until is None:
             # The first run stops at the script for review; a run only advances
@@ -1639,6 +1885,7 @@ class JobsService:
         Idempotent: a job already queued or actively indexing is left in place.
         Refuses when the job has no source video or is being deleted.
         """
+        self._ensure_open()
         root = self._require_job(job_id)
         if not pipeline.load_manifest(root).config.source_video:
             raise RuntimeError("job chưa có video nguồn để lập chỉ mục")
@@ -1720,6 +1967,8 @@ class JobsService:
         while True:
             job_id = self._index_queue.get()
             try:
+                if job_id is None:
+                    return
                 self._run_index_job(job_id)
             except Exception:
                 # The worker thread must survive any single job's failure.
@@ -1875,6 +2124,110 @@ class JobsService:
             raise RuntimeError("Chờ pipeline hoàn tất trước khi sửa ảnh bìa.")
         return render_thumbnail_variants(root, headline=headline, channel_name=channel_name)
 
+    def auto_generate_thumbnails(self, job_id: str) -> dict:
+        """Zero-typing cover art: AGY writes three punchy headlines from the
+        script (rule-based fallback when the AGY pool is offline), the channel
+        name comes from branding, and the source channel's residual watermark
+        bands are always covered (force_cover) before the new branding is drawn.
+
+        Like :meth:`edit_thumbnail` this only stages variants; the user still
+        picks one via :meth:`select_thumbnail`, which resets export approval.
+        """
+        from .thumbnail_editor import render_thumbnail_variants
+
+        root = self._require_job(job_id)
+        if self._is_running(job_id):
+            raise RuntimeError("Chờ pipeline hoàn tất trước khi tạo ảnh bìa.")
+        manifest = pipeline.load_manifest(root)
+        channel_name = branding.load_settings(self.jobs_root)["name"]
+        movie_title = (manifest.config.movie_title or job_id or "").strip()
+        headlines = self._auto_thumbnail_headlines(root, movie_title)
+        return render_thumbnail_variants(
+            root,
+            headline=headlines[0],
+            channel_name=channel_name,
+            headlines=headlines,
+            force_cover=True,
+        )
+
+    def _auto_thumbnail_headlines(self, root, movie_title: str) -> list[str]:
+        """Three legible headlines for the auto thumbnails.
+
+        Tries the AGY pool first; on any AGY failure (offline pool, quota, bad
+        output) it falls back to rule-based templates so the feature always
+        produces three cards. Every headline is trimmed to a guaranteed-fit
+        string, so rendering never raises on an over-long AGY line.
+        """
+        from .agy_agent import run_agy_json
+        from .content_agent import ContentAgentError
+
+        fallback = self._fallback_thumbnail_headlines(movie_title)
+        script = self._read_json(root, "script.json")
+        thesis = ""
+        if isinstance(script, dict):
+            sections = script.get("sections")
+            if isinstance(sections, list) and sections and isinstance(sections[0], dict):
+                thesis = str(sections[0].get("title") or "")[:160]
+        schema = {
+            "type": "object",
+            "properties": {"headlines": {"type": "array", "items": {"type": "string"}}},
+            "required": ["headlines"],
+            "additionalProperties": False,
+        }
+        prompt = (
+            "Bạn viết tiêu đề ảnh bìa YouTube tiếng Việt cho video review phim "
+            f"'{movie_title or 'phim này'}'. Trả về đúng 3 tiêu đề giật gân, IN HOA, "
+            "mỗi tiêu đề tối đa 38 ký tự để không tràn khung: câu 1 gợi tò mò, "
+            "câu 2 tiết lộ cú twist sốc, câu 3 nhấn kịch tính sinh tử. "
+            f"Bối cảnh mở đầu: '{thesis}'. Không bịa tình tiết, không dùng dấu ngoặc kép. "
+            "Trả JSON đúng schema."
+        )
+        try:
+            result = run_agy_json(stage="thumbnail", prompt=prompt, schema=schema)
+        except ContentAgentError:
+            return fallback
+        raw = result.get("headlines") if isinstance(result, dict) else None
+        headlines: list[str] = []
+        if isinstance(raw, list):
+            for item in raw:
+                text = self._fit_thumbnail_headline(str(item or ""))
+                if text and text not in headlines:
+                    headlines.append(text)
+        while len(headlines) < 3:
+            headlines.append(fallback[len(headlines)])
+        return headlines[:3]
+
+    @staticmethod
+    def _fit_thumbnail_headline(text: str) -> str:
+        """Trim ``text`` (dropping trailing words) to a headline that renders
+        within the safe area; returns "" when nothing legible remains."""
+        from .thumbnail_editor import headline_fits
+
+        words = " ".join(str(text or "").split()).split(" ") if text else []
+        while words:
+            candidate = " ".join(words)
+            if headline_fits(candidate):
+                return candidate
+            words.pop()
+        return ""
+
+    @staticmethod
+    def _fallback_thumbnail_headlines(movie_title: str) -> list[str]:
+        """Rule-based headlines used when the AGY pool is unavailable."""
+        title = (movie_title or "").strip().upper() or "PHIM NÀY"
+        templates = [
+            f"{title}: SỰ THẬT KINH HOÀNG",
+            f"BÍ MẬT ĐẰNG SAU {title}",
+            f"CÁI KẾT BẤT NGỜ CỦA {title}",
+        ]
+        headlines: list[str] = []
+        for template in templates:
+            text = JobsService._fit_thumbnail_headline(template)
+            if not text:
+                text = JobsService._fit_thumbnail_headline(title) or "PHIM NÀY"
+            headlines.append(text)
+        return headlines
+
     def select_thumbnail(self, job_id: str, candidate: str) -> dict:
         root = self._require_job(job_id)
         if self._is_running(job_id):
@@ -1957,6 +2310,127 @@ class JobsService:
             http_request=http_request,
         )
 
+    def install_package(self, package: str, *, runner=None) -> dict:
+        """Start a background ``pip install`` for a whitelisted package (1-click TTS setup).
+
+        Security: only keys of ``_INSTALLABLE_PACKAGES`` are accepted (arbitrary input
+        can never reach pip), the command runs with ``shell=False`` via
+        ``sys.executable -m pip``, and the route stays behind the dashboard bearer token
+        on a localhost bind. ``runner`` is injectable so tests never touch real pip.
+        """
+        package = (package or "").strip().lower()
+        allowed_packages = (*_INSTALLABLE_PACKAGES, "propainter")
+        if package not in allowed_packages:
+            allowed = ", ".join(sorted(allowed_packages))
+            raise ValueError(f"Gói không được phép cài (chỉ {allowed}): {package!r}")
+        with self._lock:
+            current = self._installs.get(package)
+            if current and current.get("status") == "running":
+                return dict(current)
+            self._installs[package] = {"package": package, "status": "running",
+                                       "detail": f"Đang cài {package}…"}
+        run = runner or (lambda selected: propainter_setup.install() if selected == "propainter" else self._pip_install(selected))
+        threading.Thread(target=self._run_install, args=(package, run),
+                         name=f"mrf-install-{package}", daemon=True).start()
+        with self._lock:
+            return dict(self._installs[package])
+
+    def _run_install(self, package: str, run) -> None:
+        try:
+            run(package)
+            state = {"package": package, "status": "done", "detail": f"Đã cài {package} thành công."}
+        except Exception as exc:  # surface the failure detail to the polling UI
+            state = {"package": package, "status": "error",
+                     "detail": (str(exc) or "cài đặt thất bại")[:500]}
+        with self._lock:
+            self._installs[package] = state
+
+    @staticmethod
+    def _run_installer_command(args: list[str], *, timeout: int = 900) -> None:
+        """Run one installer command without a shell and return a bounded error."""
+        try:
+            proc = pipeline.subprocess.run(
+                args, capture_output=True, text=True, shell=False, timeout=timeout,
+            )
+        except pipeline.subprocess.TimeoutExpired as exc:
+            raise RuntimeError(f"Cài đặt quá thời gian ({timeout} giây): {args[0]}") from exc
+        except OSError as exc:
+            raise RuntimeError(f"Không thể chạy {args[0]}: {exc}") from exc
+        if proc.returncode != 0:
+            detail = (proc.stderr or proc.stdout or "installer failed").strip()[-1000:]
+            raise RuntimeError(detail)
+
+    @staticmethod
+    def _pip_install(package: str) -> None:
+        """Install a whitelisted package, isolating VieNeu from Windows 3.14+.
+
+        VieNeu's compiled dependency may not publish a matching wheel for a newly
+        released CPython. Prefer a Python 3.12 venv there rather than attempting a
+        fragile local C++ build. Paths are discovered/configurable, never machine-
+        specific; other packages and supported Python versions retain legacy pip.
+        """
+        package = (package or "").strip().lower()
+        if package not in _INSTALLABLE_PACKAGES:
+            raise ValueError(f"Gói không được phép: {package!r}")
+        isolate = package == "vieneu" and os.name == "nt" and sys.version_info >= (3, 14)
+        if not isolate:
+            JobsService._run_installer_command([
+                sys.executable, "-m", "pip", "install", "--disable-pip-version-check", package,
+            ])
+            return
+
+        env_dir = tts_providers.vieneu_env_dir()
+        env_python = tts_providers.vieneu_env_python(env_dir)
+        env_dir.parent.mkdir(parents=True, exist_ok=True)
+        uv = shutil.which("uv")
+        if not env_python.is_file():
+            if uv:
+                JobsService._run_installer_command([
+                    uv, "venv", str(env_dir), "--python", "3.12", "--no-project",
+                ])
+            else:
+                py = shutil.which("py")
+                if not py:
+                    raise RuntimeError(
+                        "Python 3.14 chưa có wheel VieNeu phù hợp. Hãy cài uv hoặc Python 3.12, "
+                        f"rồi thử lại (có thể đặt {tts_providers.VIENEU_ENV_ENV})."
+                    )
+                JobsService._run_installer_command([
+                    py, "-3.12", "-m", "venv", str(env_dir),
+                ])
+        if not env_python.is_file():
+            raise RuntimeError("Không tạo được môi trường Python 3.12 riêng cho VieNeu-TTS.")
+        if uv:
+            command = [uv, "pip", "install", "--python", str(env_python), package]
+        else:
+            command = [str(env_python), "-m", "pip", "install", "--disable-pip-version-check", package]
+        JobsService._run_installer_command(command, timeout=1800)
+        JobsService._run_installer_command([
+            str(env_python), "-c", "import vieneu",
+        ], timeout=60)
+
+    def install_status(self, package: str) -> dict:
+        """Report install progress, including VieNeu's isolated environment."""
+        package = (package or "").strip().lower()
+        if package not in (*_INSTALLABLE_PACKAGES, "propainter"):
+            raise ValueError(f"Gói không được phép: {package!r}")
+        with self._lock:
+            state = self._installs.get(package)
+        if state:
+            return dict(state)
+        if package == "propainter":
+            status = "installed" if propainter_setup.is_ready() else "absent"
+            detail = "Đã sẵn sàng." if status == "installed" else "Chưa cài."
+            return {"package": package, "status": status, "detail": detail}
+        if package == "vieneu" and tts_providers.vieneu_available():
+            return {"package": package, "status": "installed", "detail": "Đã sẵn sàng."}
+        import importlib
+        try:
+            importlib.import_module(_INSTALLABLE_PACKAGES[package])
+            return {"package": package, "status": "installed", "detail": "Đã sẵn sàng."}
+        except Exception:
+            return {"package": package, "status": "absent", "detail": "Chưa cài."}
+
     def agy_pool_status(self) -> dict:
         from .agy_vision import pool_status
         return pool_status()
@@ -2011,6 +2485,40 @@ class JobsService:
             "message_vi": localization.localize_message(message),
         }
 
+    def scout_discover(self, topic: str = "all", source: str = "all", refresh: bool = False) -> dict:
+        candidates = content_scout.discover_hidden_gems(topic=topic, source=source, refresh=refresh)
+        return {"candidates": candidates, "total": len(candidates)}
+
+    def scout_enqueue(self, payload: dict) -> dict:
+        candidate_id = str(payload.get("candidate_id") or "")
+        data = content_scout.enqueue_gem_for_review(candidate_id)
+        if payload.get("auto_create"):
+            candidate = data["candidate"]
+            slug = re.sub(r"[^a-zA-Z0-9_-]+", "-", candidate["title"]).strip("-").lower()[:32]
+            job_id = f"scout-{slug}"
+            count = 1
+            unique_job_id = job_id
+            while (self.jobs_root / unique_job_id).exists():
+                count += 1
+                unique_job_id = f"{job_id}-{count}"
+            defaults = self.creator_library.active_channel_defaults() or {}
+            title = str(payload.get("movie_title") or candidate.get("vietnamese_title") or candidate.get("title") or "").strip()
+            create_payload = {
+                **defaults,
+                "job_id": unique_job_id,
+                "movie_title": title,
+                "content_agent": payload.get("content_agent") or "agy",
+                "copyright_bypass": payload.get("copyright_bypass") or defaults.get("copyright_bypass") or "balanced",
+                "tts_provider": payload.get("tts_provider") or defaults.get("tts_provider") or "edge",
+                "tts_voice": payload.get("tts_voice") if payload.get("tts_voice") is not None else defaults.get("tts_voice", ""),
+            }
+            if payload.get("watermark_enabled", True):
+                create_payload["watermark_detect"] = payload.get("watermark_detect") or "color"
+                create_payload["watermark_method"] = payload.get("watermark_method") or "propainter"
+            created = self.create_job(create_payload)
+            data["created_job"] = created
+        return data
+
 
 # --- HTTP layer --------------------------------------------------------------
 
@@ -2022,11 +2530,45 @@ class _Server(ThreadingHTTPServer):
     def __init__(self, address: tuple[str, int], service: JobsService, *, require_license: bool = False):
         self.service = service
         self.require_license = require_license
+        self._handler_slots = threading.BoundedSemaphore(_MAX_CONCURRENT_HANDLERS)
         super().__init__(address, MRFRequestHandler)
+
+    def process_request(self, request, client_address) -> None:
+        if not self._handler_slots.acquire(blocking=False):
+            try:
+                request.sendall(
+                    b"HTTP/1.1 503 Service Unavailable\r\n"
+                    b"Connection: close\r\nContent-Length: 0\r\n\r\n"
+                )
+            except OSError:
+                pass
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except Exception:
+            self._handler_slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address) -> None:
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._handler_slots.release()
+
+    def server_close(self) -> None:
+        try:
+            super().server_close()
+        finally:
+            self.service.close()
 
 
 class MRFRequestHandler(BaseHTTPRequestHandler):
     server_version = "MovieReviewFactory/0.2"
+
+    def setup(self) -> None:
+        super().setup()
+        self.connection.settimeout(_REQUEST_TIMEOUT_SECONDS)
 
     @property
     def service(self) -> JobsService:
@@ -2073,9 +2615,12 @@ class MRFRequestHandler(BaseHTTPRequestHandler):
             return {}
         if length > _MAX_BODY_BYTES:
             raise OverflowError(f"request body too large ({length} > {_MAX_BODY_BYTES})")
-        raw = self.rfile.read(length)
-        if not raw:
-            return {}
+        try:
+            raw = self.rfile.read(length)
+        except (socket.timeout, TimeoutError) as exc:
+            raise RequestTimeoutError("request body read timed out") from exc
+        if len(raw) != length:
+            raise ValueError("request body was incomplete")
         try:
             data = json.loads(raw.decode("utf-8"))
         except ValueError as exc:
@@ -2093,9 +2638,13 @@ class MRFRequestHandler(BaseHTTPRequestHandler):
         """Run a route handler, mapping domain exceptions to HTTP status codes."""
         try:
             handler()
+        except RequestTimeoutError as exc:
+            self._send_json(408, self._error_payload(exc))
         except ValueError as exc:
             self._send_json(400, self._error_payload(exc))
         except FileNotFoundError as exc:
+            self._send_json(404, self._error_payload(exc))
+        except KeyError as exc:
             self._send_json(404, self._error_payload(exc))
         except FileExistsError as exc:
             self._send_json(409, self._error_payload(exc))
@@ -2221,12 +2770,23 @@ class MRFRequestHandler(BaseHTTPRequestHandler):
             self._send_401()
             return
         parts = [unquote(p) for p in urlparse(self.path).path.split("/") if p]
-        if parts == ["api", "jobs"] or (len(parts) == 3 and parts[:2] == ["api", "jobs"]):
+        if (
+            parts == ["api", "jobs"]
+            or (len(parts) == 3 and parts[:2] == ["api", "jobs"])
+            or (len(parts) == 3 and parts[:2] == ["api", "channels"])
+            or (len(parts) == 5 and parts[:2] == ["api", "channels"] and parts[3] == "sfx")
+        ):
             self._dispatch(lambda: self._route_delete(parts))
             return
         self._send_json(404, {"error": "not found", "error_vi": "không tìm thấy"})
 
     def _route_delete(self, parts: list[str]) -> None:
+        if parts[:2] == ["api", "channels"] and len(parts) == 5 and parts[3] == "sfx":
+            self._send_json(200, self.service.delete_channel_sfx(parts[2], parts[4]))
+            return
+        if parts[:2] == ["api", "channels"]:
+            self._send_json(200, self.service.delete_channel(parts[2]))
+            return
         body = self._read_body()
         if len(parts) == 2:
             self._send_json(200, self.service.delete_jobs(body.get("job_ids"), str(body.get("confirm") or "")))
@@ -2262,14 +2822,36 @@ class MRFRequestHandler(BaseHTTPRequestHandler):
         if parts == ["brand", "logo.svg"]:
             self._serve_file(branding.ASSETS / "man-ke.svg")
             return
+        if parts == ["channels"]:
+            self._send_json(200, self.service.list_channels())
+            return
+        if len(parts) == 3 and parts[0] == "channels" and parts[2] == "logo":
+            self._serve_file(self.service.channel_logo_file(parts[1]))
+            return
+        if parts == ["channel-sfx"]:
+            self._send_json(200, self.service.active_channel_sfx())
+            return
+        if len(parts) == 5 and parts[0] == "channels" and parts[2] == "sfx" and parts[4] == "file":
+            self._serve_file(self.service.channel_sfx_file(parts[1], parts[3]))
+            return
         if parts == ["agy-pool"]:
             self._send_json(200, self.service.agy_pool_status())
             return
         if parts == ["tts", "test"]:
             self._send_json(200, self.service.check_tts_connection((query.get("provider") or [""])[0]))
             return
+        if parts == ["system", "install-status"]:
+            self._send_json(200, self.service.install_status((query.get("package") or [""])[0]))
+            return
         if parts == ["jobs"]:
             self._send_json(200, {"jobs": self.service.list_jobs()})
+            return
+        if parts == ["scout", "discover"]:
+            topic = (query.get("topic") or ["all"])[0]
+            source = (query.get("source") or ["all"])[0]
+            raw_refresh = (query.get("refresh") or ["0"])[0].lower()
+            refresh = raw_refresh in ("1", "true", "yes")
+            self._send_json(200, self.service.scout_discover(topic=topic, source=source, refresh=refresh))
             return
         if parts == ["batch"]:
             self._send_json(200, self.service.batch_status())
@@ -2391,6 +2973,9 @@ class MRFRequestHandler(BaseHTTPRequestHandler):
         if self._license_blocked():
             self._send_json(402, {"error": "license required", "error_vi": "cần kích hoạt license"})
             return
+        if parts == ["system", "install-package"]:
+            self._send_json(200, self.service.install_package(str(self._read_body().get("package") or "")))
+            return
         if parts == ["brand"]:
             name = self._read_body().get("name")
             self._send_json(200, branding.save_name(self.service.jobs_root, name))
@@ -2405,6 +2990,34 @@ class MRFRequestHandler(BaseHTTPRequestHandler):
             branding.save_logo(self.service.jobs_root, self.rfile.read(size))
             self._send_json(200, {"logo_url": "/api/brand/logo"})
             return
+        if parts == ["channels"]:
+            self._send_json(200, self.service.save_channel(self._read_body()))
+            return
+        if len(parts) == 3 and parts[0] == "channels" and parts[2] == "activate":
+            self._send_json(200, self.service.activate_channel(parts[1]))
+            return
+        if len(parts) == 3 and parts[0] == "channels" and parts[2] == "logo":
+            try:
+                size = int(self.headers.get("Content-Length") or "0")
+            except ValueError as exc:
+                raise ValueError("Content-Length không hợp lệ") from exc
+            if size <= 0 or size > 2_000_000:
+                raise ValueError("Logo PNG cần dung lượng 1 byte–2 MB.")
+            self._send_json(200, self.service.save_channel_logo(parts[1], self.rfile.read(size)))
+            return
+        if len(parts) == 3 and parts[0] == "channels" and parts[2] == "sfx":
+            self._send_json(200, self.service.save_channel_sfx(parts[1], self._read_body()))
+            return
+        if len(parts) == 5 and parts[0] == "channels" and parts[2] == "sfx" and parts[4] == "file":
+            try:
+                size = int(self.headers.get("Content-Length") or "0")
+            except ValueError as exc:
+                raise ValueError("Content-Length không hợp lệ") from exc
+            if size <= 0 or size > 3_000_000:
+                raise ValueError("Tệp SFX cần 1 byte–3 MB.")
+            ctype = self.headers.get("Content-Type") or ""
+            self._send_json(200, self.service.save_channel_sfx_file(parts[1], parts[3], ctype, self.rfile.read(size)))
+            return
         if parts == ["agy-pool", "probe"]:
             self._send_json(200, self.service.probe_agy())
             return
@@ -2414,8 +3027,14 @@ class MRFRequestHandler(BaseHTTPRequestHandler):
         if parts == ["jobs"]:
             self._send_json(201, self.service.create_job(self._read_body()))
             return
+        if len(parts) == 3 and parts[0] == "jobs" and parts[2] == "config":
+            self._send_json(200, self.service.update_job_config(parts[1], self._read_body()))
+            return
         if parts == ["batch"]:
             self._send_json(202, self.service.start_batch(self._read_body()))
+            return
+        if parts == ["scout", "enqueue"]:
+            self._send_json(200, self.service.scout_enqueue(self._read_body()))
             return
         if parts == ["batch", "stop"]:
             self._send_json(200, self.service.stop_batch())
@@ -2503,6 +3122,12 @@ class MRFRequestHandler(BaseHTTPRequestHandler):
         if len(parts) == 3 and parts[0] == "jobs" and parts[2] == "stop":
             self._send_json(202, self.service.stop_run(parts[1]))
             return
+        if len(parts) == 4 and parts[0] == "jobs" and parts[2] == "audio-mix" and parts[3] == "sfx":
+            self._send_json(200, self.service.add_audio_mix_sfx(parts[1], self._read_body()))
+            return
+        if len(parts) == 4 and parts[0] == "jobs" and parts[2] == "audio-mix" and parts[3] == "transitions":
+            self._send_json(200, self.service.place_transition_sfx(parts[1]))
+            return
         if len(parts) == 3 and parts[0] == "jobs" and parts[2] == "audio-mix":
             self._send_json(200, self.service.update_audio_mix(parts[1], self._read_body()))
             return
@@ -2526,6 +3151,9 @@ class MRFRequestHandler(BaseHTTPRequestHandler):
             return
         if len(parts) == 4 and parts[0] == "jobs" and parts[2] == "script" and parts[3] == "approve":
             self._send_json(200, self.service.approve_script(parts[1]))
+            return
+        if len(parts) == 4 and parts[0] == "jobs" and parts[2] == "thumbnails" and parts[3] == "auto":
+            self._send_json(200, self.service.auto_generate_thumbnails(parts[1]))
             return
         if len(parts) == 4 and parts[0] == "jobs" and parts[2] == "thumbnails" and parts[3] == "edit":
             body = self._read_body()
@@ -2602,7 +3230,13 @@ class MRFRequestHandler(BaseHTTPRequestHandler):
 def create_server(host: str = "127.0.0.1", port: int = 8765,
                   jobs_root: Path | str = "jobs", *, require_license: bool = False) -> _Server:
     """Build (but do not start) the local web server."""
-    return _Server((host, port), JobsService(Path(jobs_root)), require_license=require_license)
+    _require_safe_bind(host)
+    service = JobsService(Path(jobs_root))
+    try:
+        return _Server((host, port), service, require_license=require_license)
+    except Exception:
+        service.close()
+        raise
 
 
 def run_server(host: str = "127.0.0.1", port: int = 8765,
@@ -2625,7 +3259,9 @@ def run_server(host: str = "127.0.0.1", port: int = 8765,
     except KeyboardInterrupt:
         pass
     finally:
+        server.shutdown()
         server.server_close()
+        server.service.close()
 
 
 # --- single-page UI ----------------------------------------------------------
@@ -3197,7 +3833,9 @@ INDEX_HTML = """<!DOCTYPE html>
     </details>
     <button id="openCreateProject" class="primary toolbar-action" type="button" hidden>＋ Tạo project</button>
     <button id="openLibraryHub" class="toolbar-action" type="button">Thư viện</button>
+    <button id="openChannelSwitcher" class="toolbar-action" type="button">Kênh</button>
     <button id="openBrandSettings" class="toolbar-action" type="button">Thương hiệu</button>
+    <button id="openScoutHub" class="toolbar-action" type="button" hidden>Săn phim</button>
   </aside>
 
   <dialog id="createPanel" class="tool-dialog" aria-labelledby="createDialogTitle">
@@ -3275,8 +3913,9 @@ INDEX_HTML = """<!DOCTYPE html>
               <option value="edge" selected>Edge-TTS (miễn phí, mặc định)</option>
               <option value="fptai">FPT.AI Voice (cần MRF_FPTAI_API_KEY)</option>
               <option value="elevenlabs">ElevenLabs (cần MRF_ELEVENLABS_API_KEY)</option>
+              <option value="vieneu">VieNeu-TTS (miễn phí, offline 24kHz · cần: pip install vieneu)</option>
             </select>
-            <label>Voice ID / tên giọng (chỉ cho FPT.AI / ElevenLabs, tùy chọn)</label>
+            <label>Voice ID / tên giọng (FPT.AI / ElevenLabs / VieNeu, tùy chọn)</label>
             <input name="tts_voice" list="ttsVoiceHints" placeholder="vd: banmai (FPT.AI) hoặc 21m00Tcm4TlvDq8ikWAM (ElevenLabs)">
             <datalist id="ttsVoiceHints">
               <option value="banmai">FPT.AI · Ban Mai (nữ, miền Bắc)</option>
@@ -3291,19 +3930,29 @@ INDEX_HTML = """<!DOCTYPE html>
             <p class="muted">Bỏ trống để dùng giọng mặc định. API key đặt qua biến môi trường, không lưu vào project.</p>
             <div class="tts-check" style="margin-top:6px; display:flex; gap:8px; align-items:center; flex-wrap:wrap">
               <button id="ttsTestBtn" type="button">Kiểm tra kết nối</button>
+              <button id="ttsInstallBtn" type="button" class="accent-btn" hidden>⚡ Cài đặt tự động VieNeu-TTS</button>
               <span id="ttsTestMsg" class="muted" role="status"></span>
+              <span id="ttsInstallMsg" class="muted" role="status"></span>
             </div>
             <label>Che dải watermark phía trên (0–20% chiều cao)</label>
             <input name="brand_top_band" type="number" value="0" min="0" max="0.2" step="0.01">
             <label>Che dải tiêu đề cũ phía dưới (0–20% chiều cao)</label>
             <input name="brand_bottom_band" type="number" value="0" min="0" max="0.2" step="0.01">
-            <label>Tự động phát hiện &amp; xoá watermark chìm (ProPainter)</label>
+            <label>Tự động phát hiện &amp; xoá watermark chìm</label>
             <select name="watermark_detect">
               <option value="">Tắt</option>
               <option value="color">Ngưỡng màu (color)</option>
               <option value="temporal">Theo thời gian (temporal)</option>
               <option value="external">Detector ngoài (external)</option>
             </select>
+            <label>Cách xoá watermark</label>
+            <select name="watermark_method" class="wm-method"><option value="propainter">ProPainter</option></select>
+            <p class="muted wm-method-help"></p>
+            <div class="tts-check" style="margin-top:6px; display:flex; gap:8px; align-items:center; flex-wrap:wrap">
+              <button id="propainterInstallBtn" type="button" class="accent-btn">⚡ Tải ProPainter an toàn</button>
+              <span id="propainterInstallMsg" class="muted" role="status"></span>
+            </div>
+            <p class="muted">Nguồn và model được ghim checksum; ProPainter chỉ cấp phép phi thương mại, hãy bảo đảm quyền sử dụng.</p>
             <label>Lệnh detector ngoài (external) — để trống sẽ dùng MRF_MASK_DETECTOR_CMD</label>
             <input name="detector_cmd" placeholder="python detect.py --in VIDEO --out OUT">
           </details>
@@ -3351,6 +4000,81 @@ INDEX_HTML = """<!DOCTYPE html>
             </div>
             <button id="brandRenderBtn" type="button" disabled>Dựng lại video đang chọn</button>
           </section>
+        </div>
+      </div>
+    </div>
+  </dialog>
+
+  <dialog id="channelPanel" class="tool-dialog" aria-labelledby="channelDialogTitle">
+    <div class="dialog-shell">
+      <div class="dialog-header">
+        <div>
+          <h2 id="channelDialogTitle">Kênh (hồ sơ đa kênh)</h2>
+          <p>Lưu sẵn logo, giọng, intro/outro và mức né bản quyền cho từng kênh. Kích hoạt 1 chạm để đổi nhận diện cho các video dựng tiếp theo.</p>
+        </div>
+        <button id="closeChannelSwitcher" class="dialog-close" type="button" aria-label="Đóng">×</button>
+      </div>
+      <div class="dialog-body">
+        <div class="settings-row">
+          <div style="flex:1">
+            <label for="channelSelect">Kênh đã lưu</label>
+            <select id="channelSelect"></select>
+          </div>
+          <button id="activateChannelBtn" type="button">Kích hoạt</button>
+          <button id="newChannelBtn" type="button">＋ Kênh mới</button>
+        </div>
+        <div id="channelActiveNote" class="muted" role="status" style="margin:4px 0 10px"></div>
+        <div id="channelForm" class="create-form">
+          <input id="chId" type="hidden">
+          <label for="chName">Tên kênh</label>
+          <input id="chName" maxlength="40" placeholder="vd: Màn Kể" autocomplete="off">
+          <label for="chLogo">Logo PNG nền trong suốt (tối đa 2 MB) — tùy chọn</label>
+          <div class="settings-row">
+            <img id="chLogoPreview" alt="Logo kênh" style="width:40px;height:40px;object-fit:contain;border-radius:6px;background:#0d1017">
+            <input id="chLogo" type="file" accept="image/png,.png" style="flex:1">
+          </div>
+          <label for="chTtsProvider">Giọng đọc (TTS)</label>
+          <select id="chTtsProvider">
+            <option value="edge">Edge-TTS (miễn phí, mặc định)</option>
+            <option value="fptai">FPT.AI Voice</option>
+            <option value="elevenlabs">ElevenLabs</option>
+            <option value="vieneu">VieNeu-TTS (miễn phí, offline)</option>
+          </select>
+          <label for="chTtsVoice">Voice ID / tên giọng (tùy chọn)</label>
+          <input id="chTtsVoice" maxlength="120" placeholder="vd: banmai hoặc 21m00Tcm4TlvDq8ikWAM">
+          <label for="chAspect">Tỷ lệ khung hình</label>
+          <select id="chAspect"><option value="16:9">16:9</option><option value="9:16">9:16</option></select>
+          <label for="chLanguage">Ngôn ngữ</label>
+          <input id="chLanguage" maxlength="20" value="vi">
+          <div class="settings-row band-row">
+            <div><label for="chIntro">Intro (giây, 0–15)</label><input id="chIntro" type="number" min="0" max="15" step="0.5" value="0"></div>
+            <div><label for="chOutro">Outro (giây, 0–15)</label><input id="chOutro" type="number" min="0" max="15" step="0.5" value="0"></div>
+          </div>
+          <label for="chCopyright">Bảo vệ bản quyền (Bypass Content ID)</label>
+          <select id="chCopyright">
+            <option value="off">Tắt</option>
+            <option value="light">Nhẹ</option>
+            <option value="balanced">Cân bằng</option>
+            <option value="aggressive">Mạnh</option>
+          </select>
+          <div class="settings-row band-row">
+            <div><label for="chTopBand">Che dải trên (0–0,2)</label><input id="chTopBand" type="number" min="0" max="0.2" step="0.01" value="0"></div>
+            <div><label for="chBottomBand">Che dải dưới (0–0,2)</label><input id="chBottomBand" type="number" min="0" max="0.2" step="0.01" value="0"></div>
+          </div>
+          <label style="margin-top:8px">SFX chuyển cảnh (whoosh/boom…) — tối đa 8</label>
+          <div id="channelSfxList" class="muted" style="font-size:12px; margin:4px 0"></div>
+          <div class="settings-row" style="flex-wrap:wrap; gap:6px">
+            <input id="sfxLabel" maxlength="40" placeholder="Nhãn (vd: Whoosh)" style="flex:1; min-width:120px">
+            <input id="sfxRights" maxlength="300" placeholder="Ghi chú quyền (bắt buộc)" style="flex:1; min-width:140px">
+            <input id="sfxGain" type="number" min="-36" max="0" step="0.5" value="-8" title="dB" style="width:76px">
+            <input id="sfxFile" type="file" accept="audio/*,.mp3,.wav,.m4a,.ogg" style="flex:1; min-width:160px">
+            <button id="addSfxBtn" type="button">Thêm SFX</button>
+          </div>
+          <div class="row" style="margin-top:10px; gap:8px">
+            <button id="saveChannelBtn" class="primary" type="button">Lưu kênh</button>
+            <button id="deleteChannelBtn" type="button">Xoá kênh</button>
+          </div>
+          <div id="channelMsg" class="notice" role="status"></div>
         </div>
       </div>
     </div>
@@ -3415,6 +4139,77 @@ INDEX_HTML = """<!DOCTYPE html>
       </div>
     </div>
   </dialog>
+
+  <dialog id="scoutPanel" class="tool-dialog tool-dialog-wide" aria-labelledby="scoutDialogTitle">
+    <div class="dialog-shell">
+      <div class="dialog-header">
+        <div>
+          <h2 id="scoutDialogTitle">Tự động săn phim độc lạ</h2>
+          <p>Tự động thu thập và xếp hạng phim xưa độc lạ (1985–2008), đoản kịch thịnh hành Trung Quốc và phim ít người biết theo công thức đánh giá tiềm năng lan truyền.</p>
+        </div>
+        <button id="closeScoutHub" class="dialog-close" type="button" aria-label="Đóng">×</button>
+      </div>
+      <div class="dialog-body">
+        <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:12px; margin-bottom:14px">
+          <div style="display:flex; gap:12px; flex-wrap:wrap; align-items:flex-end">
+            <label style="min-width:180px">Chủ đề:
+              <select id="scoutTopicSelect">
+                <option value="all">Tất cả chủ đề</option>
+                <option value="horror">Kinh dị / Quái vật / Rùng rợn</option>
+                <option value="fantasy_mystery">Tiên hiệp / Huyền ảo / Bí ẩn</option>
+                <option value="ceo_romance">Tổng tài / Nghịch tập / Đoản kịch</option>
+                <option value="isekai_rebirth">Xuyên không / Trùng sinh</option>
+                <option value="cult_classic">Phim xưa lạ / B-Movie độc lạ</option>
+              </select>
+            </label>
+            <label style="min-width:180px">Nguồn dữ liệu:
+              <select id="scoutSourceSelect">
+                <option value="all">Tất cả 3 nguồn</option>
+                <option value="tmdb_douban">1. TMDb / Douban (Phim xưa được đánh giá cao)</option>
+                <option value="douyin_bilibili">2. Douyin / Bilibili (Đoản kịch thịnh hành)</option>
+                <option value="youtube_obscure">3. YouTube (Phim đầy đủ, ít lượt xem)</option>
+              </select>
+            </label>
+            <button id="scoutRefreshBtn" type="button" class="primary">Quét phim tiềm năng</button>
+          </div>
+          <div style="font-size:0.82rem; color:var(--text); background:var(--field-bg); padding:6px 12px; border-radius:6px; border:1px solid var(--line)">
+            Công thức: <code style="color:var(--accent); font-weight:700">(Độ kịch tính × Điểm đánh giá) / (Độ phủ Việt Nam × Rủi ro bản quyền)</code>
+          </div>
+        </div>
+        <div id="scoutLoading" class="muted" style="padding:16px; text-align:center" hidden>Đang quét nguồn dữ liệu và tính điểm tiềm năng lan truyền...</div>
+        <div id="scoutGrid" style="display:grid; grid-template-columns:repeat(auto-fill, minmax(320px, 1fr)); gap:16px; max-height:65vh; overflow-y:auto; padding-right:4px"></div>
+        <div id="scoutEmpty" class="muted card" style="text-align:center; padding:24px" hidden>Không tìm thấy phim phù hợp với bộ lọc hiện tại.</div>
+      </div>
+    </div>
+  </dialog>
+  <dialog id="scoutConfigDialog" class="tool-dialog" aria-labelledby="scoutConfigTitle">
+    <div class="dialog-shell"><div class="dialog-header"><div><h2 id="scoutConfigTitle">Cấu hình nhanh dự án</h2><p>Kiểm tra thiết lập trước khi khởi tạo.</p></div><button id="closeScoutConfig" class="dialog-close" type="button" aria-label="Đóng">×</button></div>
+      <div class="dialog-body"><form id="scoutConfigForm" class="create-form">
+        <label for="scoutMovieTitle">Tên phim</label><input id="scoutMovieTitle" maxlength="300" required>
+        <label class="checkbox-row"><input id="scoutWatermarkEnabled" type="checkbox" checked><span>Bật xoá watermark chìm</span></label>
+        <label for="scoutWatermarkDetect">Phương pháp nhận diện</label><select id="scoutWatermarkDetect"><option value="color">Theo màu sắc</option><option value="temporal">Theo thời gian</option></select>
+        <label for="scoutWatermarkMethod">Cách xoá watermark</label><select id="scoutWatermarkMethod" class="wm-method"><option value="propainter">ProPainter</option></select><p class="muted wm-method-help"></p>
+        <label for="scoutContentAgent">Bộ tạo nội dung</label><select id="scoutContentAgent"><option value="agy">Nhóm AGY</option><option value="claude">Claude Code</option><option value="scaffold">Mẫu thử</option></select>
+        <label for="scoutCopyright">Bảo vệ bản quyền</label><select id="scoutCopyright"><option value="balanced">Cân bằng (khuyên dùng)</option><option value="aggressive">Mạnh</option><option value="light">Nhẹ</option><option value="off">Tắt</option></select>
+        <label for="scoutTtsProvider">Giọng đọc</label><select id="scoutTtsProvider"><option value="edge">Edge</option><option value="vieneu">VieNeu</option><option value="fptai">FPT.AI</option><option value="elevenlabs">ElevenLabs</option></select>
+        <label for="scoutTtsVoice">Voice</label><input id="scoutTtsVoice" list="ttsVoiceSuggestions" maxlength="120" placeholder="Mặc định của provider"><datalist id="ttsVoiceSuggestions"><option value="banmai"><option value="vi-VN-HoaiMyNeural"><option value="vi-VN-NamMinhNeural"></datalist>
+        <div class="row" style="margin-top:14px"><button type="button" id="cancelScoutConfig">Huỷ</button><button class="primary" type="submit">🚀 Khởi tạo dự án</button></div><div id="scoutConfigMsg" class="notice" role="status"></div>
+      </form></div></div>
+  </dialog>
+  <dialog id="projectConfigDialog" class="tool-dialog" aria-labelledby="projectConfigTitle">
+    <div class="dialog-shell"><div class="dialog-header"><div><h2 id="projectConfigTitle">Thiết lập dự án trước khi chạy</h2></div><button id="closeProjectConfig" class="dialog-close" type="button" aria-label="Đóng">×</button></div>
+      <div class="dialog-body"><form id="projectConfigForm" class="create-form">
+        <label for="projectMovieTitle">Tên phim</label><input id="projectMovieTitle" maxlength="300">
+        <label class="checkbox-row"><input id="projectWatermarkEnabled" type="checkbox"><span>Bật xoá watermark chìm</span></label>
+        <label for="projectWatermarkDetect">Phương pháp</label><select id="projectWatermarkDetect"><option value="color">Color</option><option value="temporal">Temporal</option><option value="external">External</option></select>
+        <label for="projectWatermarkMethod">Cách xoá watermark</label><select id="projectWatermarkMethod" class="wm-method"><option value="propainter">ProPainter</option></select><p class="muted wm-method-help"></p>
+        <label for="projectContentAgent">Bộ tạo nội dung</label><select id="projectContentAgent"><option value="agy">AGY Pool</option><option value="claude">Claude Code</option><option value="scaffold">Mẫu thử</option></select>
+        <label for="projectCopyright">Bảo vệ bản quyền</label><select id="projectCopyright"><option value="balanced">Cân bằng</option><option value="aggressive">Mạnh</option><option value="light">Nhẹ</option><option value="off">Tắt</option></select>
+        <label for="projectTtsProvider">TTS provider</label><select id="projectTtsProvider"><option value="edge">Edge</option><option value="vieneu">VieNeu</option><option value="fptai">FPT.AI</option><option value="elevenlabs">ElevenLabs</option></select>
+        <label for="projectTtsVoice">Voice</label><input id="projectTtsVoice" maxlength="120">
+        <div class="row" style="margin-top:14px"><button type="button" id="cancelProjectConfig">Huỷ</button><button id="saveProjectConfig" class="primary" type="submit">Lưu thiết lập</button></div><div id="projectConfigMsg" class="notice" role="status"></div>
+      </form></div></div>
+  </dialog>
   <main>
     <div id="empty" class="card empty-state" role="status">
       <div class="empty-state-mark" aria-hidden="true">＋</div>
@@ -3422,11 +4217,12 @@ INDEX_HTML = """<!DOCTYPE html>
       <p>Chọn MP4 để tạo project mới. Mặc định đã đủ để bắt đầu; brief và tùy chọn dựng chỉ cần mở khi bạn muốn chỉnh sâu.</p>
       <div class="empty-actions">
         <button id="emptyCreateBtn" class="primary" type="button">Tạo project từ MP4</button>
-        <button id="emptyProjectsBtn" type="button" hidden>Mở project có sẵn</button>
+        <button id="emptyProjectsBtn" type="button">Mở project có sẵn</button>
+        <button id="emptyScoutBtn" type="button" class="accent-btn">Săn phim tự động</button>
       </div>
       <div class="empty-help">Sau khi tạo, project mở thẳng vào workspace và giữ toàn bộ tiến trình ở một nơi.</div>
-      <details id="batchPanel" open style="margin-top:14px; text-align:left; width:100%; max-width:640px">
-        <summary style="cursor:pointer; font-weight:600">Hàng đợi hàng loạt (chạy qua đêm)</summary>
+      <div id="batchPanel" class="card" style="margin-top:14px; text-align:left; width:100%; max-width:640px">
+        <h3 style="margin:0 0 6px 0; font-size:1.05rem">Hàng đợi hàng loạt (chạy qua đêm)</h3>
         <p class="muted">Dán nhiều link, mỗi dòng một link. Hệ thống tải và dựng tuần tự tới bước duyệt kịch bản cho từng video; lỗi một video sẽ bỏ qua và chạy tiếp. Xong vào từng project bấm duyệt.</p>
         <textarea id="batchLinks" rows="5" style="width:100%" placeholder="https://..."></textarea>
         <label class="row" style="gap:6px; align-items:center; margin-top:6px">
@@ -3438,7 +4234,7 @@ INDEX_HTML = """<!DOCTYPE html>
         </div>
         <div id="batchMsg" class="muted" role="status" style="margin-top:6px"></div>
         <div id="batchList" style="margin-top:6px"></div>
-      </details>
+      </div>
     </div>
     <div id="detail" style="display:none">
       <div class="card">
@@ -3453,11 +4249,38 @@ INDEX_HTML = """<!DOCTYPE html>
         </div>
         <div class="next-row"><div id="nextAction" class="action-note" role="status"></div><button id="reviewAction" type="button" hidden>Mở phần duyệt</button><a id="quickDownload" class="button-link" download="final.mp4" hidden>Tải MP4</a></div>
         <div class="notice">Chạy đến bước ảnh bìa. Duyệt kịch bản trước khi tạo giọng đọc; xuất bản là bước riêng.</div>
-        <div id="sourceRetryCard" hidden>
-          <label for="sourceRetry">Project chưa có video: chọn MP4 để import</label>
-          <input id="sourceRetry" type="file" accept=".mp4,video/mp4">
-          <button id="sourceRetryBtn" type="button">Import video</button>
-          <div id="sourceRetryMsg" class="notice" role="status"></div>
+        <div id="projectConfigCard" class="card" style="margin-top:10px">
+          <div class="row" style="justify-content:space-between;align-items:center"><div><h3 style="margin:0 0 6px">Cấu hình dự án tiền kỳ</h3><div id="projectConfigTags" class="row" style="gap:6px;flex-wrap:wrap"></div></div><button id="editProjectConfig" type="button">⚙️ Chỉnh sửa thiết lập</button></div>
+          <div id="projectConfigWarning" class="notice" role="status"></div>
+        </div>
+        <div id="sourceRetryCard" hidden class="card" style="margin-top:10px; border:1px dashed var(--accent)">
+          <h3 style="margin:0 0 6px 0; font-size:1.05rem">Project chưa có video nguồn</h3>
+          <p class="muted" style="margin-bottom:10px">Tải video tự động từ link YouTube/Web qua yt-dlp hoặc chọn file MP4 có sẵn trên máy tính.</p>
+          <div style="display:flex; flex-direction:column; gap:10px">
+            <div style="padding:10px; border:1px solid var(--line); border-radius:8px; background:var(--field-bg)">
+              <label style="font-weight:600; display:block; margin-bottom:4px">Cách 1: Tải video từ liên kết (yt-dlp)</label>
+              <div class="row" style="gap:8px">
+                <input id="sourceRetryUrl" type="url" placeholder="https://www.youtube.com/watch?v=..." style="flex:1">
+                <button id="sourceRetryUrlBtn" type="button" class="primary">Tải video ngay</button>
+              </div>
+              <label class="row" style="gap:6px; align-items:center; margin-top:6px; font-size:0.85rem">
+                <input id="sourceRetryRights" type="checkbox" checked style="width:auto"> Tôi có quyền sử dụng video này
+              </label>
+            </div>
+            <div style="padding:10px; border:1px solid var(--line); border-radius:8px; background:var(--field-bg)">
+              <label style="font-weight:600; display:block; margin-bottom:4px">Cách 2: Chọn file MP4 từ máy tính</label>
+              <div class="row" style="gap:8px; align-items:center">
+                <input id="sourceRetry" type="file" accept=".mp4,video/mp4" style="flex:1">
+                <button id="sourceRetryBtn" type="button">Import MP4</button>
+              </div>
+            </div>
+          </div>
+          <div id="sourceRetryFallbackSection" style="margin-top:10px; padding:10px; border:1px solid var(--line); border-radius:8px; background:var(--field-bg)" hidden>
+            <div style="font-weight:600; margin-bottom:4px; font-size:0.9rem; color:var(--text)">Không tìm thấy hoặc video bị lỗi?</div>
+            <div class="muted" style="font-size:0.83rem; margin-bottom:8px">Tìm kiếm video thay thế cho bộ phim này trên YouTube bằng 1 click:</div>
+            <a id="sourceRetrySearchFallbackBtn" class="button-link" target="_blank" rel="noopener noreferrer" style="display:inline-flex; align-items:center; gap:6px; font-weight:600; text-decoration:none">🔍 Tìm video thay thế trên YouTube</a>
+          </div>
+          <div id="sourceRetryMsg" class="notice" role="status" style="margin-top:8px"></div>
         </div>
         <div style="margin-top:10px" class="progress"><div id="progBar"></div></div>
         <div id="progText" class="muted" style="margin-top:6px"></div>
@@ -3623,12 +4446,18 @@ INDEX_HTML = """<!DOCTYPE html>
           </div>
         </div>
       </section>
-
-      </section>
       <section id="view-edit" class="workspace-view" role="tabpanel" aria-labelledby="tab-edit" hidden>
       <details class="card" id="audioPanel">
         <summary>Âm thanh</summary>
         <p class="muted">Mặc định chỉ dùng lời đọc. Nhạc và hiệu ứng phải có ghi chú quyền sử dụng; nhạc tự hạ khi có lời đọc. Không lấy tiếng phim nguồn.</p>
+        <div id="channelSfxPalette" hidden style="margin:6px 0 10px; padding:8px; border:1px solid var(--line, #333a48); border-radius:8px">
+          <label>SFX chuyển cảnh của kênh — chèn tại giây đang xem</label>
+          <div id="channelSfxButtons" class="row" style="flex-wrap:wrap; gap:6px; margin-top:6px"></div>
+          <div class="row" style="gap:6px; margin-top:6px">
+            <button id="autoTransitionSfxBtn" type="button">Tự rải theo cắt cảnh</button>
+          </div>
+          <div class="muted" style="font-size:12px; margin-top:4px">Bấm nút palette để chèn tại giây đang xem, hoặc “Tự rải theo cắt cảnh” để tự đặt tại các điểm chuyển cảnh (cần đã dựng video một lần; tối đa 16).</div>
+        </div>
         <label for="audioVoiceGain">Lời đọc (dB)</label>
         <input id="audioVoiceGain" type="number" min="-12" max="12" step="0.5" value="0">
         <label for="audioMusicPath">Tệp nhạc nền trên máy (để trống nếu không dùng)</label>
@@ -3686,17 +4515,18 @@ INDEX_HTML = """<!DOCTYPE html>
       <section id="view-review-content" class="workspace-view" hidden>
       <div class="card" id="thumbnailCard" style="display:none">
         <h2>Chọn ảnh bìa</h2>
-        <div class="muted">Chọn một trong các frame đã tạo. Ảnh được chọn sẽ trở thành <code>thumbnail.jpg</code>.</div>
-        <div id="thumbnailGrid" class="thumb-grid" style="margin-top:10px"></div>
+        <div class="muted">3 phương án được AGY tự thiết kế từ kịch bản, đã che watermark của kênh nguồn — không cần gõ chữ. Ảnh được chọn sẽ trở thành <code>thumbnail.jpg</code> và cần duyệt lại metadata &amp; gói xuất.</div>
+        <button id="thumbnailAutoBtn" type="button" style="margin-top:10px">✨ Tự động tạo 3 ảnh bìa với AGY</button>
+        <div id="thumbnailVariantGrid" class="thumb-grid" style="margin-top:10px"></div>
         <details id="thumbnailEditor" style="margin-top:12px">
-          <summary>Tạo ảnh bìa với chữ và thương hiệu</summary>
-          <p class="muted">Ba phương án trên ảnh có sẵn. Chữ nằm trong vùng an toàn; xem bản thu nhỏ trước khi chọn. Thay ảnh sẽ cần duyệt lại metadata và gói xuất.</p>
+          <summary>Chọn khung hình gốc hoặc tự nhập chữ (nâng cao)</summary>
+          <p class="muted">Chọn một khung hình gốc, hoặc tự nhập tiêu đề và tên kênh. Chữ nằm trong vùng an toàn; xem bản thu nhỏ trước khi chọn. Thay ảnh sẽ cần duyệt lại metadata và gói xuất.</p>
+          <div id="thumbnailGrid" class="thumb-grid" style="margin-top:10px"></div>
           <div class="filter-grid">
             <label for="thumbnailHeadline">Dòng chính (tối đa 64 ký tự)<input id="thumbnailHeadline" maxlength="64" placeholder="BEN 10: AI ĐANG ĐIỀU KHIỂN THỜI GIAN?"></label>
             <label for="thumbnailChannel">Tên kênh trên ảnh<input id="thumbnailChannel" maxlength="40"></label>
           </div>
-          <button id="thumbnailEditBtn" type="button">Tạo 3 phương án</button>
-          <div id="thumbnailVariantGrid" class="thumb-grid" style="margin-top:10px"></div>
+          <button id="thumbnailEditBtn" type="button">Tạo 3 phương án (thủ công)</button>
         </details>
         <div id="thumbnailMsg" class="notice" role="status"></div>
       </div>
@@ -3773,6 +4603,8 @@ INDEX_HTML = """<!DOCTYPE html>
 <script>
 const $ = (id) => document.getElementById(id);
 let current = null;
+let currentStatus = null;
+let pendingScoutGem = null;
 let poller = null;
 let editorLoaded = null;
 // Which review block matches the current next action: 'script' | 'metadata'
@@ -3815,7 +4647,10 @@ function setWorkspaceView(view) {
     tab.setAttribute('aria-selected', String(active));
     tab.tabIndex = active ? 0 : -1;
   }
-  for (const name of ['explore', 'edit', 'review', 'files']) $('view-' + name).hidden = name !== view;
+  for (const name of ['explore', 'edit', 'review', 'files']) {
+    const el = $('view-' + name);
+    if (el) el.hidden = name !== view;
+  }
   // The section preview <video> lives inside a collapsible panel on the "Biên
   // tập" tab. Leaving that tab hides the panel (and its native controls), so a
   // still-playing preview would keep emitting audio with no reachable pause
@@ -3929,6 +4764,98 @@ $('ttsTestBtn').onclick = async () => {
     msg.textContent = '✗ ' + error.message;
   }
 };
+// 1-click auto-install for the local VieNeu-TTS package (shown only when selected).
+(function setupTtsInstall() {
+  const select = document.querySelector('#createForm select[name="tts_provider"]');
+  const btn = $('ttsInstallBtn');
+  if (!select || !btn) return;
+  const msg = $('ttsInstallMsg');
+  const sync = () => { btn.hidden = select.value !== 'vieneu'; if (btn.hidden && msg) msg.textContent = ''; };
+  select.addEventListener('change', sync);
+  sync();
+  btn.onclick = async () => {
+    btn.disabled = true;
+    if (msg) msg.textContent = 'Đang cài VieNeu-TTS… Trên Windows/Python 3.14+, ứng dụng sẽ tự tạo môi trường Python 3.12 riêng để dùng wheel nhị phân (không biên dịch C++).';
+    try {
+      await api('POST', '/api/system/install-package', { package: 'vieneu' });
+      let done = false;
+      for (let i = 0; i < 80 && !done; i++) {
+        await new Promise(r => setTimeout(r, 3000));
+        const st = await api('GET', '/api/system/install-status?package=vieneu');
+        if (st.status === 'done' || st.status === 'installed') {
+          done = true;
+          if (msg) msg.textContent = '✓ Cài đặt thành công! VieNeu-TTS đã sẵn sàng.';
+          btn.hidden = true;
+        } else if (st.status === 'error') {
+          done = true;
+          if (msg) msg.textContent = '✗ ' + (st.detail || 'Cài đặt thất bại');
+        }
+      }
+      if (!done && msg) msg.textContent = 'Vẫn đang cài… bấm "Kiểm tra kết nối" sau ít phút.';
+    } catch (error) {
+      if (msg) msg.textContent = '✗ ' + error.message;
+    } finally {
+      btn.disabled = false;
+    }
+  };
+})();
+// Single source for the watermark method choices shown in every form.
+const WATERMARK_METHOD_INFO = [
+  {value: 'propainter', label: 'ProPainter (AI, cần GPU)', help: 'AI vẽ lại vùng watermark từ các khung hình lân cận. Sạch nhất nhưng rất nặng: cần GPU NVIDIA, máy chỉ có CPU có thể mất hàng chục giờ cho video 10 phút. Cần cài ProPainter.'},
+  {value: 'delogo', label: 'Delogo (FFmpeg, nhanh)', help: 'FFmpeg lấp vùng watermark bằng màu nội suy từ viền xung quanh. Vài phút trên máy yếu, không cần GPU. Hợp với logo nhỏ đứng yên; vùng lớn sẽ thành mảng nhoè. Mask theo từng khung được gộp thành một vùng cố định.'},
+  {value: 'blur', label: 'Làm mờ (FFmpeg, nhanh nhất)', help: 'FFmpeg phủ lớp làm mờ đúng theo hình mask. Nhanh nhất, không cần GPU. Không xoá hẳn mà che cho khó đọc; hợp với watermark chữ hoặc hình dạng phức tạp. Mask theo từng khung được gộp thành một vùng cố định.'},
+];
+function watermarkMethodInfo(value) { return WATERMARK_METHOD_INFO.find(item => item.value === value) || WATERMARK_METHOD_INFO[0]; }
+function syncWatermarkMethodHelp(select) {
+  const help = select.nextElementSibling;
+  if (help && help.classList.contains('wm-method-help')) help.textContent = watermarkMethodInfo(select.value).help;
+}
+function setWatermarkMethod(id, value) { const select = $(id); select.value = watermarkMethodInfo(value).value; syncWatermarkMethodHelp(select); }
+document.querySelectorAll('select.wm-method').forEach(select => {
+  select.replaceChildren(...WATERMARK_METHOD_INFO.map(info => new Option(info.label, info.value)));
+  select.addEventListener('change', () => syncWatermarkMethodHelp(select));
+  syncWatermarkMethodHelp(select);
+});
+(function setupProPainterInstall() {
+  const btn = $('propainterInstallBtn');
+  const msg = $('propainterInstallMsg');
+  if (!btn) return;
+  const refresh = async () => {
+    const st = await api('GET', '/api/system/install-status?package=propainter');
+    if (st.status === 'installed' || st.status === 'done') {
+      btn.hidden = true;
+      if (msg) msg.textContent = '✓ ProPainter đã sẵn sàng.';
+      return true;
+    }
+    return false;
+  };
+  refresh().catch(() => {});
+  btn.onclick = async () => {
+    btn.disabled = true;
+    if (msg) msg.textContent = 'Đang tải bản ProPainter đã ghim và kiểm tra checksum model…';
+    try {
+      await api('POST', '/api/system/install-package', { package: 'propainter' });
+      let done = false;
+      for (let i = 0; i < 240 && !done; i++) {
+        await new Promise(r => setTimeout(r, 3000));
+        const st = await api('GET', '/api/system/install-status?package=propainter');
+        if (st.status === 'done' || st.status === 'installed') {
+          done = true;
+          btn.hidden = true;
+          if (msg) msg.textContent = '✓ ProPainter đã cài và sẵn sàng xoá watermark.';
+        } else if (st.status === 'error') {
+          done = true;
+          if (msg) msg.textContent = '✗ ' + (st.detail || 'Cài đặt thất bại');
+        }
+      }
+      if (!done && msg) msg.textContent = 'Vẫn đang cài ProPainter; bạn có thể tiếp tục chườ trong màn hình này.';
+    } catch (error) {
+      if (msg) msg.textContent = '✗ ' + error.message;
+    } finally {
+      btn.disabled = false;
+    }
+  };
+})();
 $('saveBrandName').onclick = async () => {
   try {
     const brand = await api('POST', '/api/brand', {name: $('brandName').value});
@@ -4814,6 +5741,18 @@ async function renderThumbnails() {
     variantGrid.appendChild(item);
   }
 }
+$('thumbnailAutoBtn').onclick = async () => {
+  if (!current) return;
+  const button = $('thumbnailAutoBtn');
+  button.disabled = true;
+  $('thumbnailMsg').textContent = 'AGY đang tạo 3 ảnh bìa (tự đặt tiêu đề và che watermark kênh nguồn)…';
+  try {
+    await api('POST', '/api/jobs/' + encodeURIComponent(current) + '/thumbnails/auto', {});
+    await renderThumbnails();
+    $('thumbnailMsg').textContent = 'Đã tạo 3 ảnh bìa tự động. Chọn 1 ảnh để lưu (sẽ cần duyệt lại metadata & gói xuất).';
+  } catch (error) { $('thumbnailMsg').textContent = error.message; }
+  finally { button.disabled = false; }
+};
 $('thumbnailEditBtn').onclick = async () => {
   if (!current) return;
   const button = $('thumbnailEditBtn');
@@ -4953,7 +5892,11 @@ async function loadJobs() {
     const available = new Set(jobs.filter(job => !job.running && !job.uploading).map(job => job.job_id));
     for (const id of selectedProjects) if (!available.has(id)) selectedProjects.delete(id);
     const el = $('jobList');
-    $('emptyProjectsBtn').hidden = !jobs.length;
+    if ($('emptyProjectsBtn')) {
+      $('emptyProjectsBtn').hidden = false;
+      $('emptyProjectsBtn').disabled = !jobs.length;
+      $('emptyProjectsBtn').title = jobs.length ? '' : 'Chưa có project nào';
+    }
     $('projectSummaryLabel').textContent = current || (jobs.length ? 'Chọn project' : 'Chưa có project');
     if (!jobs.length) {
       el.textContent = 'Chưa có project.';
@@ -5026,6 +5969,7 @@ function selectJob(id) {
   setWorkspaceView('explore');
   closeToolDialog('createPanel');
   closeToolDialog('libraryPanel');
+  closeToolDialog('scoutPanel');
   $('projectPanel').open = false;
   $('projectSummaryLabel').textContent = id;
   current = id;
@@ -5033,6 +5977,7 @@ function selectJob(id) {
   $('detail').style.display = '';
   $('projectPanel').hidden = false;
   $('openCreateProject').hidden = false;
+  if ($('openScoutHub')) $('openScoutHub').hidden = false;
   $('video').removeAttribute('src');
   delete $('video').dataset.src;
   $('video').load();
@@ -5071,6 +6016,7 @@ async function loadAudioMix() {
     $('audioEffectGain').value = effect.gain_db ?? -12;
     $('audioMsg').textContent = otherAudioEffects.length
       ? 'Các hiệu ứng còn lại được giữ nguyên khi lưu.' : '';
+    loadChannelSfxPalette();
   } catch (error) { $('audioMsg').textContent = error.message; }
 }
 $('audioSaveBtn').onclick = async () => {
@@ -5152,6 +6098,9 @@ function openToolDialog(id) {
     if (other !== dialog) other.close();
   });
   dialog.showModal();
+  if (id === 'createPanel') prefillCreateFromChannel();
+  if (id === 'channelPanel') loadChannels();
+  if (id === 'scoutPanel') { if (!_scoutLoaded) loadScoutGems(); }
 }
 
 function closeToolDialog(id) {
@@ -5162,11 +6111,243 @@ function closeToolDialog(id) {
 $('openCreateProject').onclick = () => openToolDialog('createPanel');
 $('openBrandSettings').onclick = () => openToolDialog('brandPanel');
 $('openLibraryHub').onclick = () => openToolDialog('libraryPanel');
+if ($('openScoutHub')) $('openScoutHub').onclick = () => openToolDialog('scoutPanel');
 $('closeCreateProject').onclick = () => closeToolDialog('createPanel');
 $('closeBrandSettings').onclick = () => closeToolDialog('brandPanel');
 $('closeLibraryHub').onclick = () => closeToolDialog('libraryPanel');
-$('emptyCreateBtn').onclick = () => openToolDialog('createPanel');
-$('emptyProjectsBtn').onclick = () => { $('projectPanel').hidden = false; $('projectPanel').open = true; };
+if ($('closeScoutHub')) $('closeScoutHub').onclick = () => closeToolDialog('scoutPanel');
+{ const b = $('emptyCreateBtn'); if (b) b.onclick = () => openToolDialog('createPanel'); }
+{ const b = $('emptyProjectsBtn'); if (b) b.onclick = () => { $('projectPanel').hidden = false; $('projectPanel').open = true; }; }
+if ($('emptyScoutBtn')) $('emptyScoutBtn').onclick = () => openToolDialog('scoutPanel');
+
+// -- multi-channel profile switcher -----------------------------------------
+{ const b = $('openChannelSwitcher'); if (b) b.onclick = () => openToolDialog('channelPanel'); }
+{ const b = $('closeChannelSwitcher'); if (b) b.onclick = () => closeToolDialog('channelPanel'); }
+let _channels = [];
+function _channelSlug(name) {
+  const base = (name || '').normalize('NFKD').replace(/[\\u0300-\\u036f]/g, '')
+    .replace(/[đĐ]/g, 'd').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
+  return (base || 'kenh') + '-' + Date.now().toString(36);
+}
+function _chSet(id, val) { const el = $(id); if (el != null) el.value = (val == null ? '' : val); }
+function fillChannelForm(ch) {
+  $('chId').value = (ch && ch.id) || '';
+  _chSet('chName', ch && ch.name);
+  _chSet('chTtsProvider', (ch && ch.tts_provider) || 'edge');
+  _chSet('chTtsVoice', ch && ch.tts_voice);
+  _chSet('chAspect', (ch && ch.aspect_ratio) || '16:9');
+  _chSet('chLanguage', (ch && ch.language) || 'vi');
+  _chSet('chIntro', ch ? ch.intro_seconds : 0);
+  _chSet('chOutro', ch ? ch.outro_seconds : 0);
+  _chSet('chCopyright', (ch && ch.copyright_bypass) || 'off');
+  _chSet('chTopBand', ch ? ch.brand_top_band : 0);
+  _chSet('chBottomBand', ch ? ch.brand_bottom_band : 0);
+  $('chLogoPreview').src = (ch && ch.id && ch.has_logo)
+    ? ('/api/channels/' + encodeURIComponent(ch.id) + '/logo?v=' + Date.now())
+    : '/api/brand/logo.svg';
+  $('chLogo').value = '';
+  renderChannelSfx(ch);
+}
+async function loadChannels(selectId) {
+  try {
+    const data = await api('GET', '/api/channels');
+    _channels = data.channels || [];
+    const sel = $('channelSelect');
+    sel.innerHTML = '';
+    _channels.forEach((ch) => {
+      const opt = document.createElement('option');
+      opt.value = ch.id;
+      opt.textContent = ch.name + (ch.id === data.active ? ' • đang dùng' : '');
+      sel.appendChild(opt);
+    });
+    const pick = selectId || data.active || (_channels[0] && _channels[0].id) || '';
+    if (pick) sel.value = pick;
+    const chosen = _channels.find((c) => c.id === sel.value);
+    fillChannelForm(chosen || null);
+    const activeCh = _channels.find((c) => c.id === data.active);
+    $('channelActiveNote').textContent = activeCh
+      ? ('Kênh đang dùng: ' + activeCh.name)
+      : 'Chưa có kênh nào được kích hoạt.';
+    $('channelMsg').textContent = '';
+  } catch (error) { $('channelMsg').textContent = error.message; }
+}
+$('channelSelect').onchange = () => {
+  const chosen = _channels.find((c) => c.id === $('channelSelect').value);
+  if (chosen) fillChannelForm(chosen);
+};
+$('newChannelBtn').onclick = () => {
+  fillChannelForm(null);
+  $('chName').focus();
+  $('channelMsg').textContent = 'Điền thông tin rồi bấm “Lưu kênh”.';
+};
+function _channelPayload() {
+  const id = $('chId').value || _channelSlug($('chName').value);
+  return {
+    id: id,
+    name: $('chName').value,
+    tts_provider: $('chTtsProvider').value,
+    tts_voice: $('chTtsVoice').value.trim(),
+    aspect_ratio: $('chAspect').value,
+    language: $('chLanguage').value.trim() || 'vi',
+    intro_seconds: Number($('chIntro').value) || 0,
+    outro_seconds: Number($('chOutro').value) || 0,
+    copyright_bypass: $('chCopyright').value,
+    brand_top_band: Number($('chTopBand').value) || 0,
+    brand_bottom_band: Number($('chBottomBand').value) || 0,
+  };
+}
+$('saveChannelBtn').onclick = async () => {
+  $('channelMsg').textContent = 'Đang lưu…';
+  try {
+    const saved = await api('POST', '/api/channels', _channelPayload());
+    const file = $('chLogo').files[0];
+    if (file) {
+      if (file.type !== 'image/png' || file.size > 2000000) throw new Error('Logo phải là PNG ≤ 2 MB.');
+      const headers = { 'Content-Type': 'image/png' };
+      if (_tok) headers.Authorization = 'Bearer ' + _tok;
+      const res = await fetch('/api/channels/' + encodeURIComponent(saved.id) + '/logo', { method: 'POST', headers: headers, body: file });
+      const out = await res.json();
+      if (!res.ok) throw new Error(out.error_vi || out.error);
+    }
+    $('channelMsg').textContent = 'Đã lưu kênh.';
+    await loadChannels(saved.id);
+    loadBrand().catch(() => {});
+  } catch (error) { $('channelMsg').textContent = error.message; }
+};
+$('activateChannelBtn').onclick = async () => {
+  const id = $('channelSelect').value;
+  if (!id) return;
+  $('channelMsg').textContent = 'Đang kích hoạt…';
+  try {
+    await api('POST', '/api/channels/' + encodeURIComponent(id) + '/activate');
+    $('channelMsg').textContent = 'Đã kích hoạt kênh cho các video dựng tiếp theo.';
+    await loadChannels(id);
+    loadBrand().catch(() => {});
+  } catch (error) { $('channelMsg').textContent = error.message; }
+};
+$('deleteChannelBtn').onclick = async () => {
+  const id = $('channelSelect').value;
+  if (!id) return;
+  if (!confirm('Xoá kênh này?')) return;
+  try {
+    await api('DELETE', '/api/channels/' + encodeURIComponent(id));
+    $('channelMsg').textContent = 'Đã xoá kênh.';
+    await loadChannels();
+  } catch (error) { $('channelMsg').textContent = error.message; }
+};
+async function prefillCreateFromChannel() {
+  try {
+    const data = await api('GET', '/api/channels');
+    const active = (data.channels || []).find((c) => c.id === data.active);
+    if (!active) return;
+    const form = $('createForm');
+    const put = (name, val) => {
+      const el = form.querySelector('[name="' + name + '"]');
+      if (el != null && val != null && val !== '') el.value = val;
+    };
+    put('language', active.language);
+    put('aspect_ratio', active.aspect_ratio);
+    put('tts_provider', active.tts_provider);
+    put('tts_voice', active.tts_voice);
+    put('copyright_bypass', active.copyright_bypass);
+    put('brand_top_band', active.brand_top_band);
+    put('brand_bottom_band', active.brand_bottom_band);
+  } catch (error) { /* best-effort prefill */ }
+}
+function renderChannelSfx(ch) {
+  const holder = $('channelSfxList');
+  if (!holder) return;
+  if (!ch || !ch.id) { holder.textContent = 'Lưu kênh trước để thêm SFX.'; return; }
+  const items = ch.sfx || [];
+  if (!items.length) { holder.textContent = 'Chưa có SFX.'; return; }
+  holder.innerHTML = '';
+  items.forEach((s) => {
+    const row = document.createElement('div');
+    row.className = 'row';
+    row.style.cssText = 'gap:6px; align-items:center; margin:2px 0';
+    const name = document.createElement('span');
+    name.style.flex = '1';
+    name.textContent = s.label + (s.has_file ? '' : ' (chưa có tệp)') + ' · ' + (s.gain_db ?? -8) + 'dB';
+    const del = document.createElement('button');
+    del.type = 'button';
+    del.textContent = 'Xoá';
+    del.onclick = () => deleteChannelSfx(ch.id, s.slug);
+    row.appendChild(name);
+    row.appendChild(del);
+    holder.appendChild(row);
+  });
+}
+$('addSfxBtn').onclick = async () => {
+  const id = $('chId').value;
+  if (!id) { $('channelMsg').textContent = 'Lưu kênh trước khi thêm SFX.'; return; }
+  const label = $('sfxLabel').value.trim();
+  const rights = $('sfxRights').value.trim();
+  const file = $('sfxFile').files[0];
+  if (!label || !rights) { $('channelMsg').textContent = 'Nhập nhãn và ghi chú quyền cho SFX.'; return; }
+  if (!file) { $('channelMsg').textContent = 'Chọn tệp âm thanh SFX.'; return; }
+  if (file.size > 3000000) { $('channelMsg').textContent = 'Tệp SFX ≤ 3 MB.'; return; }
+  const slug = _channelSlug(label);
+  $('channelMsg').textContent = 'Đang thêm SFX…';
+  try {
+    await api('POST', '/api/channels/' + encodeURIComponent(id) + '/sfx',
+      { slug: slug, label: label, rights_note: rights, gain_db: Number($('sfxGain').value) || -8 });
+    const headers = { 'Content-Type': file.type || 'audio/mpeg' };
+    if (_tok) headers.Authorization = 'Bearer ' + _tok;
+    const res = await fetch('/api/channels/' + encodeURIComponent(id) + '/sfx/' + encodeURIComponent(slug) + '/file',
+      { method: 'POST', headers: headers, body: file });
+    const out = await res.json();
+    if (!res.ok) throw new Error(out.error_vi || out.error);
+    $('sfxLabel').value = ''; $('sfxRights').value = ''; $('sfxFile').value = '';
+    $('channelMsg').textContent = 'Đã thêm SFX “' + label + '”.';
+    await loadChannels(id);
+  } catch (error) { $('channelMsg').textContent = error.message; }
+};
+async function deleteChannelSfx(id, slug) {
+  try {
+    await api('DELETE', '/api/channels/' + encodeURIComponent(id) + '/sfx/' + encodeURIComponent(slug));
+    await loadChannels(id);
+  } catch (error) { $('channelMsg').textContent = error.message; }
+}
+async function loadChannelSfxPalette() {
+  const wrap = $('channelSfxPalette');
+  const holder = $('channelSfxButtons');
+  if (!wrap || !holder) return;
+  try {
+    const data = await api('GET', '/api/channel-sfx');
+    const items = data.sfx || [];
+    holder.innerHTML = '';
+    if (!items.length) { wrap.hidden = true; return; }
+    items.forEach((sfx) => {
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.textContent = '+ ' + sfx.label;
+      btn.onclick = () => insertChannelSfx(sfx.slug, sfx.label);
+      holder.appendChild(btn);
+    });
+    wrap.hidden = false;
+  } catch (error) { wrap.hidden = true; }
+}
+async function insertChannelSfx(slug, label) {
+  if (!current) return;
+  const video = $('video');
+  const at = (video && isFinite(video.currentTime)) ? Math.max(0, video.currentTime) : 0;
+  try {
+    await api('POST', '/api/jobs/' + encodeURIComponent(current) + '/audio-mix/sfx',
+      { slug: slug, at_seconds: at });
+    $('audioMsg').textContent = 'Đã chèn “' + label + '” tại ' + at.toFixed(1) + 's. Chạy tiếp để dựng lại.';
+    await loadAudioMix();
+  } catch (error) { $('audioMsg').textContent = error.message; }
+}
+async function autoPlaceTransitionSfx() {
+  if (!current) return;
+  $('audioMsg').textContent = 'Đang tự rải SFX theo cắt cảnh…';
+  try {
+    const result = await api('POST', '/api/jobs/' + encodeURIComponent(current) + '/audio-mix/transitions');
+    $('audioMsg').textContent = 'Đã tự rải ' + (result.placed || 0) + ' SFX tại các điểm chuyển cảnh. Chạy tiếp để dựng lại.';
+    await loadAudioMix();
+  } catch (error) { $('audioMsg').textContent = error.message; }
+}
+if ($('autoTransitionSfxBtn')) $('autoTransitionSfxBtn').onclick = autoPlaceTransitionSfx;
 
 const projectPanel = $('projectPanel');
 document.addEventListener('pointerdown', (event) => {
@@ -5200,7 +6381,9 @@ async function loadStatus() {
   try { s = await api('GET', '/api/jobs/' + encodeURIComponent(current)); }
   catch (e) { $('progText').textContent = 'Lỗi: ' + e.message; return; }
 
+  currentStatus = s;
   $('jobTitle').textContent = 'Job: ' + s.job_id;
+  renderProjectConfig(s);
   const total = s.stages.length;
   const ready = s.counts.ready || 0;
   $('progBar').style.width = Math.round(ready * 100 / total) + '%';
@@ -5238,6 +6421,9 @@ async function loadStatus() {
   if (document.activeElement !== $('brandTopBand')) $('brandTopBand').value = s.brand_top_band ?? 0;
   if (document.activeElement !== $('brandBottomBand')) $('brandBottomBand').value = s.brand_bottom_band ?? 0;
   $('sourceRetryCard').hidden = !!s.has_source_video;
+  if (!s.has_source_video) {
+    updateSourceRetryFallback();
+  }
   const scriptStage = s.stages.find(stage => stage.stage === 'script');
   const renderStage = s.stages.find(stage => stage.stage === 'render');
   const qaStage = s.stages.find(stage => stage.stage === 'qa');
@@ -5562,6 +6748,60 @@ $('sourceRetryBtn').onclick = async () => {
   finally { $('sourceRetryBtn').disabled = false; }
 };
 
+function updateSourceRetryFallback(customQuery) {
+  const fallbackSec = $('sourceRetryFallbackSection');
+  const fallbackBtn = $('sourceRetrySearchFallbackBtn');
+  if (!fallbackSec || !fallbackBtn) return;
+  let query = customQuery;
+  if (!query) {
+    const cfg = (currentStatus && currentStatus.config) || {};
+    query = cfg.movie_title || (currentStatus && currentStatus.title) || '';
+  }
+  if (query) {
+    const cleanQuery = query.replace(/\\s*\\(\\d{4}\\)\\s*$/, '').trim();
+    const ytUrl = 'https://www.youtube.com/results?search_query=' + encodeURIComponent(cleanQuery + ' full movie');
+    fallbackBtn.href = ytUrl;
+    fallbackBtn.textContent = '🔍 Tìm "' + cleanQuery + '" trên YouTube';
+    fallbackSec.hidden = false;
+  } else {
+    fallbackSec.hidden = true;
+  }
+}
+
+if ($('sourceRetryUrlBtn')) {
+  $('sourceRetryUrlBtn').onclick = async () => {
+    if (!current) return;
+    const url = $('sourceRetryUrl') ? $('sourceRetryUrl').value.trim() : '';
+    if (!url) {
+      alert('Vui lòng nhập liên kết video nguồn (YouTube / Web).');
+      return;
+    }
+    const rights = $('sourceRetryRights') ? $('sourceRetryRights').checked : false;
+    if (!rights) {
+      alert('Vui lòng tích xác nhận quyền sử dụng video.');
+      return;
+    }
+    const btn = $('sourceRetryUrlBtn');
+    const msg = $('sourceRetryMsg');
+    btn.disabled = true;
+    if (msg) msg.textContent = 'Đang kết nối và tải video qua yt-dlp… Quá trình có thể mất vài phút.';
+    try {
+      await api('POST', '/api/jobs/' + encodeURIComponent(current) + '/download-link', {
+        url: url,
+        confirm_rights: true
+      });
+      if (msg) msg.textContent = 'Đã tải và nạp video thành công!';
+      await loadStatus();
+      await loadJobs();
+    } catch (err) {
+      if (msg) msg.textContent = 'Lỗi tải video: ' + err.message + '. Bạn có thể tìm video thay thế trên YouTube bên dưới.';
+      updateSourceRetryFallback();
+    } finally {
+      btn.disabled = false;
+    }
+  };
+}
+
 function openDeleteDialog(ids, single) {
   const dialog = $('deleteDialog');
   const phrase = single ? ids[0] : 'XOA ' + ids.length;
@@ -5604,6 +6844,7 @@ $('deleteForm').onsubmit = async event => {
       $('sourceVideo').removeAttribute('src'); $('sourceVideo').load();
       $('video').removeAttribute('src'); delete $('video').dataset.src; $('video').load();
       $('detail').style.display = 'none'; $('empty').style.display = ''; $('projectPanel').hidden = true; $('openCreateProject').hidden = true;
+      if ($('openScoutHub')) $('openScoutHub').hidden = true;
       $('projectPanel').open = false;
       $('projectSummaryLabel').textContent = 'Chọn project';
     }
@@ -5795,7 +7036,7 @@ $('batchStartBtn').onclick = async () => {
 $('batchStopBtn').onclick = async () => {
   try { renderBatch(await api('POST', '/api/batch/stop', {})); } catch (e) { $('batchMsg').textContent = e.message; }
 };
-$('batchPanel').addEventListener('toggle', () => { if ($('batchPanel').open) loadBatch(); });
+loadBatch();
 $('handoffBtn').onclick = async () => {
   const button = $('handoffBtn');
   button.disabled = true;
@@ -6037,6 +7278,204 @@ $('saveRightsBtn').onclick = async () => {
 };
 loadCreatorBriefs().catch(error => { $('briefTemplateMsg').textContent = error.message; });
 loadCreatorSeries().catch(error => { $('seriesMsg').textContent = error.message; });
+
+// --- Content Scout Engine (Săn phim tự động) ---
+let _scoutLoaded = false;
+function escapeScoutHtml(str) {
+  return String(str || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+function getScoutSourceBadge(gem) {
+  if (gem.source === 'youtube_obscure' || (gem.source_url && (gem.source_url.includes('youtube.com') || gem.source_url.includes('youtu.be')) && gem.source !== 'tmdb_douban')) {
+    return 'YouTube';
+  }
+  if (gem.source === 'douyin_bilibili' || (gem.source_url && gem.source_url.includes('bilibili.com'))) {
+    return 'Bilibili';
+  }
+  if (gem.source === 'tmdb_douban') {
+    return (['CN', 'HK', 'TW'].includes(gem.country)) ? 'Douban' : 'TMDb';
+  }
+  if (gem.source === 'tmdb') return 'TMDb';
+  if (gem.source === 'douban') return 'Douban';
+  if (gem.source === 'youtube') return 'YouTube';
+  if (gem.source === 'bilibili') return 'Bilibili';
+  return gem.source || 'TMDb';
+}
+
+function getScoutThumbnail(gem) {
+  if (gem.thumbnail) return gem.thumbnail;
+  const ytMatch = String(gem.source_url || '').match(/(?:v=|youtu\\.be\\/|embed\\/)([a-zA-Z0-9_-]{11})/);
+  if (ytMatch && ytMatch[1]) {
+    return 'https://i.ytimg.com/vi/' + ytMatch[1] + '/hqdefault.jpg';
+  }
+  return '';
+}
+
+async function loadScoutGems(forceRefresh) {
+  const topic = $('scoutTopicSelect') ? $('scoutTopicSelect').value : 'all';
+  const source = $('scoutSourceSelect') ? $('scoutSourceSelect').value : 'all';
+  const grid = $('scoutGrid');
+  const loading = $('scoutLoading');
+  const empty = $('scoutEmpty');
+  if (!grid) return;
+  if (loading) loading.hidden = false;
+  if (empty) empty.hidden = true;
+  grid.innerHTML = '';
+  try {
+    const refreshQuery = forceRefresh ? '&refresh=1' : '';
+    const res = await api('GET', '/api/scout/discover?topic=' + encodeURIComponent(topic) + '&source=' + encodeURIComponent(source) + refreshQuery);
+    const candidates = res.candidates || [];
+    if (loading) loading.hidden = true;
+    if (candidates.length === 0) {
+      if (empty) empty.hidden = false;
+      return;
+    }
+    for (const gem of candidates) {
+      const card = document.createElement('div');
+      card.className = 'card scout-card';
+      card.style.cssText = 'display:flex; flex-direction:column; justify-content:space-between; border:1px solid var(--line); border-radius:8px; padding:16px; background:var(--panel); color:var(--text)';
+
+      const sourceBadge = getScoutSourceBadge(gem);
+      const scoreFormatted = Number(gem.viral_score).toLocaleString();
+      const posterUrl = getScoutThumbnail(gem);
+      const isLive = gem.is_live !== false;
+      const healthText = isLive ? 'Sống' : 'Cần kiểm tra';
+      const healthColor = isLive ? '#059669' : '#d97706';
+      const healthBg = isLive ? 'rgba(16,185,129,0.15)' : 'rgba(245,158,11,0.15)';
+      const healthIcon = isLive ? '🟢' : '⚠️';
+      const durationText = gem.duration_minutes ? (gem.duration_minutes + ' phút') : 'Chưa rõ';
+      const fallbackUrl = gem.fallback_url || ('https://www.youtube.com/results?search_query=' + encodeURIComponent((gem.title || '') + ' full movie'));
+
+      card.innerHTML = `
+        <div>
+          ${posterUrl ? `
+          <div class="scout-poster-box" style="position:relative; width:100%; height:150px; border-radius:6px; overflow:hidden; background:var(--field-bg); margin-bottom:10px; display:flex; align-items:center; justify-content:center">
+            <img referrerpolicy="no-referrer" src="${escapeScoutHtml(posterUrl)}" alt="${escapeScoutHtml(gem.vietnamese_title)}" style="width:100%; height:100%; object-fit:cover" onerror="this.style.display='none'; if(this.nextElementSibling) this.nextElementSibling.style.display='flex'">
+            <div class="scout-poster-placeholder" style="display:none; width:100%; height:100%; align-items:center; justify-content:center; font-size:2rem; color:var(--text-muted); background:var(--field-bg)">🎬</div>
+          </div>
+          ` : `
+          <div class="scout-poster-box" style="position:relative; width:100%; height:100px; border-radius:6px; overflow:hidden; background:var(--field-bg); margin-bottom:10px; display:flex; align-items:center; justify-content:center; font-size:1.8rem; color:var(--text-muted)">🎬</div>
+          `}
+          <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:6px; margin-bottom:8px">
+            <div style="display:flex; align-items:center; gap:6px; flex-wrap:wrap">
+              <span class="badge scout-source-badge" style="font-size:0.75rem; font-weight:700; text-transform:uppercase; padding:2px 8px; border-radius:12px; background:rgba(59,130,246,0.18); color:var(--accent, #3b82f6)">${escapeScoutHtml(sourceBadge)}</span>
+              <span class="badge scout-duration-badge" style="font-size:0.75rem; font-weight:600; padding:2px 8px; border-radius:12px; background:var(--field-bg); border:1px solid var(--line); color:var(--text-muted)">⏱️ ${escapeScoutHtml(durationText)}</span>
+              <span class="badge scout-health-badge" style="font-size:0.75rem; font-weight:700; padding:2px 8px; border-radius:12px; background:${healthBg}; color:${healthColor}">${healthIcon} ${healthText}</span>
+            </div>
+            <span class="badge scout-viral-badge" style="font-size:0.85rem; font-weight:800; color:#d97706; background:rgba(245,158,11,0.15); padding:2px 8px; border-radius:12px">🔥 Tiềm năng lan truyền: ${scoreFormatted}</span>
+          </div>
+          <h3 style="margin:4px 0 2px 0; font-size:1.05rem; line-height:1.3; color:var(--text)">${escapeScoutHtml(gem.vietnamese_title)}</h3>
+          <div style="font-size:0.8rem; font-weight:600; color:var(--text-muted); margin-bottom:8px">${gem.release_year} · ${escapeScoutHtml(gem.country)} · ★ ${gem.rating}/10 (${gem.vote_count.toLocaleString()} lượt bình chọn)</div>
+          ${gem.vietnamese_summary ? `<div style="font-size:0.83rem; line-height:1.4; color:var(--text-dim, var(--text)); margin-bottom:12px">${escapeScoutHtml(gem.vietnamese_summary)}</div>` : ''}
+          <div style="display:flex; flex-wrap:wrap; gap:6px; margin-bottom:12px">
+            <span style="font-size:0.75rem; font-weight:600; padding:2px 6px; border-radius:4px; background:rgba(16,185,129,0.15); color:#059669">Điểm kịch tính: ${gem.story_twist_index}</span>
+            <span style="font-size:0.75rem; font-weight:600; padding:2px 6px; border-radius:4px; background:rgba(99,102,241,0.15); color:#6366f1">Độ phủ VN: ${gem.popularity_index}</span>
+            <span style="font-size:0.75rem; font-weight:600; padding:2px 6px; border-radius:4px; background:rgba(234,179,8,0.15); color:#d97706">Bản quyền: ${gem.copyright_risk}</span>
+          </div>
+          <div style="font-size:0.78rem; font-style:italic; color:var(--text-muted); margin-bottom:14px">💡 ${escapeScoutHtml(gem.reasoning)}</div>
+        </div>
+        <div style="display:flex; gap:8px; flex-wrap:wrap; border-top:1px solid var(--line); padding-top:12px; margin-top:8px">
+          <button type="button" class="primary scout-enqueue-btn" style="flex:1">Dựng review phim này</button>
+          <a href="${escapeScoutHtml(gem.source_url)}" target="_blank" rel="noopener noreferrer" class="button-link" style="padding:4px 10px; font-size:0.85rem; text-decoration:none; display:inline-flex; align-items:center" title="Mở liên kết gốc trong tab mới">Mở link ↗</a>
+          <a href="${escapeScoutHtml(fallbackUrl)}" target="_blank" rel="noopener noreferrer" class="button-link scout-fallback-btn" style="padding:4px 10px; font-size:0.85rem; text-decoration:none; display:inline-flex; align-items:center; gap:4px" title="Tìm phim thay thế trên YouTube">🔍 Tìm YouTube</a>
+          <button type="button" class="scout-copy-btn" title="Chép link gốc">Chép link</button>
+        </div>
+      `;
+      card.querySelector('.scout-enqueue-btn').onclick = () => enqueueScoutGem(gem);
+      card.querySelector('.scout-copy-btn').onclick = async () => {
+        try {
+          await navigator.clipboard.writeText(gem.source_url);
+          alert('Đã chép link nguồn: ' + gem.source_url);
+        } catch (_) {
+          prompt('Link nguồn:', gem.source_url);
+        }
+      };
+      grid.appendChild(card);
+    }
+    _scoutLoaded = true;
+  } catch (err) {
+    if (loading) loading.hidden = true;
+    showError(err);
+  }
+}
+function enqueueScoutGem(gem) {
+  pendingScoutGem = gem;
+  $('scoutMovieTitle').value = gem.vietnamese_title || gem.title || '';
+  $('scoutWatermarkEnabled').checked = true;
+  $('scoutWatermarkDetect').value = 'color';
+  setWatermarkMethod('scoutWatermarkMethod', 'propainter');
+  $('scoutContentAgent').value = 'agy';
+  $('scoutCopyright').value = 'balanced';
+  $('scoutConfigMsg').textContent = '';
+  $('scoutConfigDialog').showModal();
+}
+$('closeScoutConfig').onclick = $('cancelScoutConfig').onclick = () => $('scoutConfigDialog').close();
+$('scoutConfigForm').onsubmit = async event => {
+  event.preventDefault();
+  if (!pendingScoutGem) return;
+  const submit = event.submitter;
+  if (submit) submit.disabled = true;
+  try {
+    const gem = pendingScoutGem;
+    const res = await api('POST', '/api/scout/enqueue', {
+      candidate_id: gem.id, auto_create: true, movie_title: $('scoutMovieTitle').value.trim(),
+      watermark_enabled: $('scoutWatermarkEnabled').checked, watermark_detect: $('scoutWatermarkDetect').value,
+      watermark_method: $('scoutWatermarkMethod').value,
+      content_agent: $('scoutContentAgent').value, copyright_bypass: $('scoutCopyright').value,
+      tts_provider: $('scoutTtsProvider').value, tts_voice: $('scoutTtsVoice').value.trim(),
+    });
+    $('scoutConfigDialog').close(); closeToolDialog('scoutPanel'); await loadJobs();
+    if (res.created_job && res.created_job.job_id) {
+      current = res.created_job.job_id; await selectJob(current);
+      if ($('sourceRetryUrl') && gem.source_url) $('sourceRetryUrl').value = gem.source_url;
+      updateSourceRetryFallback(gem.title || gem.vietnamese_title);
+      setWorkspaceView('explore');
+    }
+  } catch (err) { $('scoutConfigMsg').textContent = err.message; }
+  finally { if (submit) submit.disabled = false; }
+};
+
+function configTag(text) { const tag = document.createElement('span'); tag.className = 'badge ready'; tag.textContent = text; return tag; }
+function renderProjectConfig(status) {
+  const cfg = status.config || {};
+  const wm = cfg.watermark_removal || {};
+  const detect = wm.detect || {};
+  const tags = $('projectConfigTags'); tags.replaceChildren(
+    configTag('🎬 Phim: ' + (cfg.movie_title || 'chưa đặt')),
+    configTag('🤖 Kịch bản: ' + (cfg.content_agent || 'scaffold')),
+    configTag('🛡️ Bản quyền: ' + (cfg.copyright_bypass || 'off')),
+    configTag('🎙️ Giọng: ' + (cfg.tts_provider || 'edge') + ' (' + (cfg.tts_voice || 'mặc định') + ')'),
+    configTag('🧼 Xoá watermark: ' + (wm.enabled ? 'Bật (' + watermarkMethodInfo(wm.method).label + ' · ' + (detect.method || 'color') + ')' : 'Tắt'))
+  );
+  $('editProjectConfig').disabled = !!status.running;
+}
+$('editProjectConfig').onclick = () => {
+  const cfg = (currentStatus && currentStatus.config) || {}; const wm = cfg.watermark_removal || {}; const detect = wm.detect || {};
+  $('projectMovieTitle').value = cfg.movie_title || ''; $('projectContentAgent').value = cfg.content_agent || 'scaffold';
+  $('projectCopyright').value = cfg.copyright_bypass || 'off'; $('projectTtsProvider').value = cfg.tts_provider || 'edge';
+  $('projectTtsVoice').value = cfg.tts_voice || ''; $('projectWatermarkEnabled').checked = !!wm.enabled; $('projectWatermarkDetect').value = detect.method || 'color';
+  setWatermarkMethod('projectWatermarkMethod', wm.method);
+  $('projectConfigMsg').textContent = ''; $('projectConfigDialog').showModal();
+};
+$('closeProjectConfig').onclick = $('cancelProjectConfig').onclick = () => $('projectConfigDialog').close();
+$('projectConfigForm').onsubmit = async event => {
+  event.preventDefault(); const save = $('saveProjectConfig'); save.disabled = true;
+  try {
+    const result = await api('POST', '/api/jobs/' + encodeURIComponent(current) + '/config', {
+      movie_title: $('projectMovieTitle').value.trim(), content_agent: $('projectContentAgent').value,
+      copyright_bypass: $('projectCopyright').value, tts_provider: $('projectTtsProvider').value,
+      tts_voice: $('projectTtsVoice').value.trim(), watermark_removal: {
+        enabled: $('projectWatermarkEnabled').checked, method: $('projectWatermarkMethod').value,
+        detect: {method: $('projectWatermarkDetect').value}
+      }
+    });
+    $('projectConfigDialog').close(); currentStatus = result; renderProjectConfig(result);
+    $('projectConfigWarning').textContent = (result.config_warnings || []).join(' '); await loadStatus();
+  } catch (err) { $('projectConfigMsg').textContent = err.message; }
+  finally { save.disabled = false; }
+};
+if ($('scoutRefreshBtn')) $('scoutRefreshBtn').onclick = () => loadScoutGems(true);
+if ($('scoutTopicSelect')) $('scoutTopicSelect').onchange = () => loadScoutGems(false);
+if ($('scoutSourceSelect')) $('scoutSourceSelect').onchange = () => loadScoutGems(false);
 
 loadJobs();
 loadSavedSearches().catch(() => {});

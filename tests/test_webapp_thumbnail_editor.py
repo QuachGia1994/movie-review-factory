@@ -5,6 +5,8 @@ from pathlib import Path
 
 from PIL import Image
 
+import movie_review_factory.agy_agent as agy_agent
+from movie_review_factory.content_agent import ContentAgentError
 from movie_review_factory.models import JobConfig
 from movie_review_factory.pipeline import create_job, load_manifest, save_manifest
 from movie_review_factory.webapp import JobsService, create_server
@@ -67,3 +69,34 @@ def test_http_edit_thumbnail_then_select_one_variant(tmp_path: Path) -> None:
         server.shutdown()
         server.server_close()
         thread.join(timeout=5)
+
+
+def test_auto_generate_uses_agy_headlines_and_covers_watermark(tmp_path: Path, monkeypatch) -> None:
+    root = _ready_job(tmp_path)
+    original = (root / "thumbnail.jpg").read_bytes()
+    seen = {}
+
+    def fake_run(*, stage, prompt, schema):
+        seen["stage"] = stage
+        return {"headlines": ["CÂU KỊCH TÍNH", "CÚ TWIST SỐC", "SINH TỬ CUỐI CÙNG"]}
+
+    monkeypatch.setattr(agy_agent, "run_agy_json", fake_run)
+    result = JobsService(tmp_path).auto_generate_thumbnails("review")
+    assert seen["stage"] == "thumbnail"
+    assert [v["headline"] for v in result["variants"]] == ["CÂU KỊCH TÍNH", "CÚ TWIST SỐC", "SINH TỬ CUỐI CÙNG"]
+    # Selection stays manual: the approved thumbnail.jpg must be untouched.
+    assert (root / "thumbnail.jpg").read_bytes() == original
+    with Image.open(root / result["variants"][0]["file"]) as canvas:
+        assert max(canvas.convert("RGB").getpixel((1240, 8))) <= 8  # watermark band covered
+
+
+def test_auto_generate_falls_back_to_templates_when_agy_offline(tmp_path: Path, monkeypatch) -> None:
+    root = _ready_job(tmp_path)
+
+    def fake_run(*, stage, prompt, schema):
+        raise ContentAgentError("AGY pool offline")
+
+    monkeypatch.setattr(agy_agent, "run_agy_json", fake_run)
+    result = JobsService(tmp_path).auto_generate_thumbnails("review")
+    assert len(result["variants"]) == 3
+    assert all(v["headline"] for v in result["variants"])

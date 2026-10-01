@@ -7,11 +7,16 @@ import os
 import re
 import threading
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 
-from .models import CreativeBrief, JobManifest
+from pydantic import ValidationError
+
+from . import branding
+from .models import ChannelProfile, ChannelSfx, CreativeBrief, JobManifest
 
 _SAFE_ID = re.compile(r"^[A-Za-z0-9._-]+$")
+_CHANNEL_SFX_MAX = 8
 
 
 def _job_id(value: str) -> str:
@@ -26,6 +31,10 @@ def _name(value: str, field: str) -> str:
     return value.strip()
 
 
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
 class CreatorLibrary:
     """Store editable series, brief templates, and rights notes beside a jobs directory."""
 
@@ -36,12 +45,16 @@ class CreatorLibrary:
 
     def _load(self) -> dict:
         if not self.path.exists():
-            return {"series": {}, "briefs": {}, "assets": {}}
+            return {"series": {}, "briefs": {}, "assets": {}, "channels": {}, "active_channel": None}
         data = json.loads(self.path.read_text(encoding="utf-8"))
-        if not isinstance(data, dict) or not all(
-            isinstance(data.get(key), dict) for key in ("series", "briefs", "assets")
-        ):
+        if not isinstance(data, dict):
             raise ValueError("invalid creator library")
+        # Older libraries predate "channels"; default missing keys so they still load.
+        for key in ("series", "briefs", "assets", "channels"):
+            data.setdefault(key, {})
+            if not isinstance(data[key], dict):
+                raise ValueError("invalid creator library")
+        data.setdefault("active_channel", None)
         return data
 
     def _save(self, data: dict) -> None:
@@ -181,3 +194,193 @@ class CreatorLibrary:
                     "series": series_titles.get(child.name, []),
                 })
         return results
+
+    # -- channel profiles (multi-channel switcher) ---------------------------
+
+    _CHANNEL_DEFAULT_FIELDS = (
+        "language", "aspect_ratio", "tts_provider", "tts_voice",
+        "intro_seconds", "outro_seconds", "brand_top_band",
+        "brand_bottom_band", "copyright_bypass",
+    )
+
+    def list_channels(self) -> dict:
+        with self._lock:
+            data = self._load()
+        channels = sorted(data["channels"].values(), key=lambda item: item["name"].casefold())
+        return {"channels": channels, "active": data.get("active_channel")}
+
+    def get_channel(self, profile_id: str) -> dict:
+        with self._lock:
+            record = self._load()["channels"].get(_job_id(profile_id))
+        if record is None:
+            raise KeyError(profile_id)
+        return dict(record)
+
+    def save_channel(self, profile_id: str, profile: ChannelProfile | dict) -> dict:
+        """Create or update a channel profile; activate it when none is active yet."""
+        profile_id = _job_id(profile_id)
+        try:
+            model = ChannelProfile.model_validate(profile)
+        except ValidationError as exc:
+            detail = exc.errors()[0].get("msg", "hồ sơ kênh không hợp lệ")
+            raise ValueError(f"hồ sơ kênh không hợp lệ: {detail}") from exc
+        with self._lock:
+            data = self._load()
+            existing = data["channels"].get(profile_id, {})
+            record = {
+                "id": profile_id,
+                **model.model_dump(),
+                "has_logo": bool(existing.get("has_logo", False)),
+                "sfx": list(existing.get("sfx", [])),
+                "updated_at": _now(),
+            }
+            data["channels"][profile_id] = record
+            if data.get("active_channel") is None:
+                data["active_channel"] = profile_id
+            active = data.get("active_channel")
+            self._save(data)
+        if active == profile_id:
+            branding.save_name(self.jobs_root, model.name)
+        return dict(record)
+
+    def set_channel_logo(self, profile_id: str, data_bytes: bytes) -> dict:
+        profile_id = _job_id(profile_id)
+        with self._lock:
+            if profile_id not in self._load()["channels"]:
+                raise KeyError(profile_id)
+        branding.save_channel_logo(self.jobs_root, profile_id, data_bytes)
+        with self._lock:
+            data = self._load()
+            record = data["channels"].get(profile_id)
+            if record is None:
+                raise KeyError(profile_id)
+            record["has_logo"] = True
+            record["updated_at"] = _now()
+            active = data.get("active_channel")
+            self._save(data)
+        if active == profile_id:
+            branding.activate_channel(self.jobs_root, record["name"], profile_id)
+        return dict(record)
+
+    def activate_channel(self, profile_id: str) -> dict:
+        """1-click switch: point the shared brand identity at this profile."""
+        profile_id = _job_id(profile_id)
+        with self._lock:
+            data = self._load()
+            record = data["channels"].get(profile_id)
+            if record is None:
+                raise KeyError(profile_id)
+            data["active_channel"] = profile_id
+            self._save(data)
+        branding.activate_channel(self.jobs_root, record["name"], profile_id)
+        return {"active": profile_id, "channel": dict(record)}
+
+    def delete_channel(self, profile_id: str) -> None:
+        profile_id = _job_id(profile_id)
+        with self._lock:
+            data = self._load()
+            if profile_id not in data["channels"]:
+                raise KeyError(profile_id)
+            if data.get("active_channel") == profile_id:
+                raise ValueError("không thể xoá kênh đang kích hoạt")
+            del data["channels"][profile_id]
+            self._save(data)
+        branding.delete_channel_assets(self.jobs_root, profile_id)
+
+    def active_channel_defaults(self) -> dict | None:
+        """Job-creation defaults for the active profile (identity name excluded)."""
+        with self._lock:
+            data = self._load()
+            active = data.get("active_channel")
+            record = data["channels"].get(active) if active else None
+        if record is None:
+            return None
+        return {key: record[key] for key in self._CHANNEL_DEFAULT_FIELDS if key in record}
+
+    # -- transition SFX palette (reuses audio_mix effects) -------------------
+
+    def save_channel_sfx(self, profile_id: str, sfx: ChannelSfx | dict) -> dict:
+        """Upsert one transition-SFX entry's metadata (audio file uploaded separately)."""
+        profile_id = _job_id(profile_id)
+        try:
+            model = ChannelSfx.model_validate(sfx)
+        except ValidationError as exc:
+            detail = exc.errors()[0].get("msg", "SFX không hợp lệ")
+            raise ValueError(f"SFX không hợp lệ: {detail}") from exc
+        with self._lock:
+            data = self._load()
+            record = data["channels"].get(profile_id)
+            if record is None:
+                raise KeyError(profile_id)
+            items = record.setdefault("sfx", [])
+            prev = next((s for s in items if s.get("slug") == model.slug), None)
+            if prev is None and len(items) >= _CHANNEL_SFX_MAX:
+                raise ValueError(f"tối đa {_CHANNEL_SFX_MAX} SFX mỗi kênh")
+            entry = {**model.model_dump(), "has_file": bool(prev and prev.get("has_file"))}
+            record["sfx"] = [s for s in items if s.get("slug") != model.slug] + [entry]
+            record["updated_at"] = _now()
+            self._save(data)
+        return dict(entry)
+
+    def set_channel_sfx_file(self, profile_id: str, slug: str, content_type: str, data_bytes: bytes) -> dict:
+        profile_id = _job_id(profile_id)
+        with self._lock:
+            record = self._load()["channels"].get(profile_id)
+            if record is None:
+                raise KeyError(profile_id)
+            if not any(s.get("slug") == slug for s in record.get("sfx", [])):
+                raise KeyError(slug)
+        branding.save_channel_sfx_file(self.jobs_root, profile_id, slug, content_type, data_bytes)
+        with self._lock:
+            data = self._load()
+            record = data["channels"].get(profile_id)
+            entry = next((s for s in record.get("sfx", []) if s.get("slug") == slug), None)
+            if entry is None:
+                raise KeyError(slug)
+            entry["has_file"] = True
+            record["updated_at"] = _now()
+            self._save(data)
+        return dict(entry)
+
+    def delete_channel_sfx(self, profile_id: str, slug: str) -> dict:
+        profile_id = _job_id(profile_id)
+        with self._lock:
+            data = self._load()
+            record = data["channels"].get(profile_id)
+            if record is None:
+                raise KeyError(profile_id)
+            record["sfx"] = [s for s in record.get("sfx", []) if s.get("slug") != slug]
+            record["updated_at"] = _now()
+            self._save(data)
+        branding.delete_channel_sfx_file(self.jobs_root, profile_id, slug)
+        return self.get_channel(profile_id)
+
+    def active_channel_sfx(self) -> dict:
+        """The active channel's playable SFX palette (only entries with an uploaded file)."""
+        with self._lock:
+            data = self._load()
+            active = data.get("active_channel")
+            record = data["channels"].get(active) if active else None
+        if record is None:
+            return {"channel": None, "sfx": []}
+        palette = [
+            {"slug": s["slug"], "label": s["label"], "gain_db": s.get("gain_db", -8)}
+            for s in record.get("sfx", []) if s.get("has_file")
+        ]
+        return {"channel": record["name"], "sfx": palette}
+
+    def resolve_active_sfx(self, slug: str) -> tuple[Path, dict]:
+        """Resolve an active-channel SFX slug to its stored file path + metadata."""
+        with self._lock:
+            data = self._load()
+            active = data.get("active_channel")
+            record = data["channels"].get(active) if active else None
+        if record is None:
+            raise KeyError("no active channel")
+        meta = next((s for s in record.get("sfx", []) if s.get("slug") == slug), None)
+        if meta is None:
+            raise KeyError(slug)
+        path = branding.channel_sfx_path(self.jobs_root, active, slug)
+        if path is None:
+            raise FileNotFoundError(f"SFX chưa có tệp: {slug}")
+        return path, meta

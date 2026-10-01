@@ -4,6 +4,7 @@ from __future__ import annotations
 import io
 import json
 import re
+import shutil
 from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageFont
@@ -46,7 +47,8 @@ def logo_path(jobs_root: Path) -> Path:
     return custom if custom.is_file() else ASSETS / "man-ke.png"
 
 
-def save_logo(jobs_root: Path, data: bytes) -> Path:
+def _store_png(folder: Path, data: bytes) -> Path:
+    """Validate a transparent PNG and store it atomically as ``folder/logo.png``."""
     if len(data) > 2_000_000 or not data.startswith(b"\x89PNG\r\n\x1a\n"):
         raise ValueError("Logo phải là PNG hợp lệ, tối đa 2 MB.")
     try:
@@ -59,7 +61,6 @@ def save_logo(jobs_root: Path, data: bytes) -> Path:
             if image.getchannel("A").getextrema()[0] == 255:
                 raise ValueError("Logo PNG cần nền trong suốt.")
             image.thumbnail((1024, 1024), Image.Resampling.LANCZOS)
-            folder = _brand_dir(jobs_root)
             folder.mkdir(parents=True, exist_ok=True)
             temporary = folder / "logo.png.tmp"
             image.save(temporary, format="PNG", optimize=True)
@@ -67,6 +68,98 @@ def save_logo(jobs_root: Path, data: bytes) -> Path:
             return folder / "logo.png"
     except (OSError, SyntaxError) as exc:
         raise ValueError("Logo PNG không đọc được.") from exc
+
+
+def save_logo(jobs_root: Path, data: bytes) -> Path:
+    return _store_png(_brand_dir(jobs_root), data)
+
+
+# -- multi-channel profiles: per-profile logos + activation ------------------
+
+def _channels_dir(jobs_root: Path) -> Path:
+    return _brand_dir(jobs_root) / "channels"
+
+
+def channel_logo_path(jobs_root: Path, profile_id: str) -> Path | None:
+    """Return a channel profile's own logo file, or None when it has none."""
+    candidate = _channels_dir(jobs_root) / profile_id / "logo.png"
+    return candidate if candidate.is_file() else None
+
+
+def save_channel_logo(jobs_root: Path, profile_id: str, data: bytes) -> Path:
+    return _store_png(_channels_dir(jobs_root) / profile_id, data)
+
+
+def delete_channel_assets(jobs_root: Path, profile_id: str) -> None:
+    shutil.rmtree(_channels_dir(jobs_root) / profile_id, ignore_errors=True)
+
+
+def activate_channel(jobs_root: Path, name: str, profile_id: str) -> dict:
+    """Materialise a channel profile into the shared brand identity (name + logo).
+
+    Copies the profile's own logo onto the active ``logo.png`` (or clears it so the
+    bundled default applies) and saves the name. Every render/thumbnail stage reads
+    the identity from here, so switching channels needs no pipeline changes.
+    """
+    result = save_name(jobs_root, name)
+    source = channel_logo_path(jobs_root, profile_id)
+    dest = _brand_dir(jobs_root) / "logo.png"
+    if source is not None:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source, dest)
+    else:
+        dest.unlink(missing_ok=True)
+    return result
+
+
+# -- per-channel transition SFX files ----------------------------------------
+
+# Upload Content-Type -> storage extension; FFmpeg probes the real format at render, unknown types are rejected.
+_SFX_CONTENT_EXT = {
+    "audio/mpeg": ".mp3", "audio/mp3": ".mp3",
+    "audio/wav": ".wav", "audio/x-wav": ".wav", "audio/wave": ".wav",
+    "audio/mp4": ".m4a", "audio/aac": ".m4a", "audio/x-m4a": ".m4a",
+    "audio/ogg": ".ogg", "application/ogg": ".ogg", "audio/webm": ".webm",
+}
+
+
+def _sfx_dir(jobs_root: Path, profile_id: str) -> Path:
+    return _channels_dir(jobs_root) / profile_id / "sfx"
+
+
+def channel_sfx_path(jobs_root: Path, profile_id: str, slug: str) -> Path | None:
+    """Return the stored audio file for a channel SFX slug, or None if absent."""
+    folder = _sfx_dir(jobs_root, profile_id)
+    if not folder.is_dir():
+        return None
+    for item in sorted(folder.glob(slug + ".*")):
+        if item.is_file():
+            return item
+    return None
+
+
+def save_channel_sfx_file(jobs_root: Path, profile_id: str, slug: str, content_type: str, data: bytes) -> Path:
+    ext = _SFX_CONTENT_EXT.get((content_type or "").split(";")[0].strip().lower())
+    if ext is None:
+        raise ValueError("Định dạng âm thanh không hỗ trợ (dùng mp3/wav/m4a/ogg).")
+    if len(data) <= 0 or len(data) > 3_000_000:
+        raise ValueError("Tệp SFX cần 1 byte–3 MB.")
+    folder = _sfx_dir(jobs_root, profile_id)
+    folder.mkdir(parents=True, exist_ok=True)
+    for item in folder.glob(slug + ".*"):  # replace any prior file for this slug
+        item.unlink(missing_ok=True)
+    target = folder / (slug + ext)
+    temporary = folder / (slug + ext + ".tmp")
+    temporary.write_bytes(data)
+    temporary.replace(target)
+    return target
+
+
+def delete_channel_sfx_file(jobs_root: Path, profile_id: str, slug: str) -> None:
+    folder = _sfx_dir(jobs_root, profile_id)
+    if folder.is_dir():
+        for item in folder.glob(slug + ".*"):
+            item.unlink(missing_ok=True)
 
 
 def chapter_titles(sections: list[str], combined_title: str) -> list[str]:

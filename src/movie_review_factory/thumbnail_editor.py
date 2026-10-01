@@ -47,6 +47,24 @@ def _fit_headline(headline: str) -> tuple[ImageFont.FreeTypeFont, list[str]]:
     raise ValueError("headline cannot fit legibly within two lines")
 
 
+def headline_fits(headline: str) -> bool:
+    """True when ``headline`` lays out within the two-line safe area.
+
+    A non-raising wrapper around :func:`_fit_headline` so callers that generate
+    headlines automatically (the AGY auto-thumbnail flow) can trim to a
+    guaranteed-legible string instead of letting :func:`render_thumbnail_variants`
+    raise on an over-long line.
+    """
+    text = " ".join((headline or "").split())
+    if not text or len(text) > 64:
+        return False
+    try:
+        _fit_headline(text)
+    except ValueError:
+        return False
+    return True
+
+
 def _draw_variant(source: Path, headline: str, channel: str, layout: str, top_band: float = 0.0, bottom_band: float = 0.0) -> tuple[Image.Image, list[dict]]:
     with Image.open(source) as original:
         base = original.convert("RGB").resize((1280, 720), Image.Resampling.LANCZOS)
@@ -95,21 +113,42 @@ def _draw_variant(source: Path, headline: str, channel: str, layout: str, top_ba
     return Image.alpha_composite(base.convert("RGBA"), canvas).convert("RGB"), layers
 
 
-def render_thumbnail_variants(job_root: Path, *, headline: str, channel_name: str) -> dict:
+def render_thumbnail_variants(
+    job_root: Path,
+    *,
+    headline: str,
+    channel_name: str,
+    headlines: list[str] | None = None,
+    force_cover: bool = False,
+) -> dict:
     """Prepare editable overlays on three existing candidate images; selection remains manual.
 
     This does not modify thumbnail.jpg, metadata, script, approvals, or publication state.
     The caller must invalidate metadata/export approval if a chosen variant replaces the
     approved selected thumbnail.
+
+    ``headlines`` (exactly three) prints a different headline on each variant
+    instead of repeating ``headline`` on all three - used by the AGY
+    auto-thumbnail flow. ``force_cover`` raises the brand band floors
+    (top >= 0.10, bottom >= 0.14) so a source channel's residual watermark is
+    always painted over even when the job never configured brand bands.
     """
     root = Path(job_root)
     headline = " ".join(headline.split())
     channel_name = " ".join(channel_name.split())
-    if not headline or len(headline) > 64:
-        raise ValueError("headline must be between 1 and 64 characters")
+    if headlines is None:
+        variant_headlines = [headline, headline, headline]
+    else:
+        variant_headlines = [" ".join(str(text).split()) for text in headlines]
+        if len(variant_headlines) != 3:
+            raise ValueError("headlines must provide exactly three entries")
+        headline = variant_headlines[0]
     if not channel_name or len(channel_name) > 40:
         raise ValueError("channel_name must be between 1 and 40 characters")
-    _fit_headline(headline)
+    for text in variant_headlines:
+        if not text or len(text) > 64:
+            raise ValueError("headline must be between 1 and 64 characters")
+        _fit_headline(text)
     records = json.loads((root / "thumbnails.json").read_text(encoding="utf-8"))["candidates"]
     if len(records) < 3:
         raise ValueError("at least three thumbnail candidates are required")
@@ -133,24 +172,30 @@ def render_thumbnail_variants(job_root: Path, *, headline: str, channel_name: st
             bottom_band = float(job_cfg.get("brand_bottom_band") or 0)
         except (ValueError, OSError, TypeError):
             top_band = bottom_band = 0.0
+    if force_cover:
+        # Auto flow always covers a source's residual band watermark; the manual flow keeps the job's own bands.
+        top_band = max(top_band, 0.10)
+        bottom_band = max(bottom_band, 0.14)
 
     variants = []
     with tempfile.TemporaryDirectory(prefix=".thumbnail-edits-", dir=root) as directory:
         staged = Path(directory)
         for i, (source_name, layout) in enumerate(zip(source_names, _LAYOUTS), start=1):
+            variant_headline = variant_headlines[i - 1]
             revision = hashlib.sha256(
-                (headline + "\0" + channel_name).encode("utf-8")
+                (variant_headline + "\0" + channel_name).encode("utf-8")
                 + (root / source_name).read_bytes()
             ).hexdigest()[:12]
             full_name = f"thumbnail-edit-{i}-{revision}.jpg"
             preview_name = f"thumbnail-edit-{i}-{revision}-small.jpg"
-            image, layers = _draw_variant(root / source_name, headline, channel_name, layout, top_band, bottom_band)
+            image, layers = _draw_variant(root / source_name, variant_headline, channel_name, layout, top_band, bottom_band)
             image.save(staged / full_name, quality=92, subsampling=0)
             image.resize((320, 180), Image.Resampling.LANCZOS).save(staged / preview_name, quality=90)
             variants.append({
                 "index": i,
                 "source_file": source_name,
                 "layout": layout,
+                "headline": variant_headline,
                 "file": full_name,
                 "preview_file": preview_name,
                 "layers": layers,

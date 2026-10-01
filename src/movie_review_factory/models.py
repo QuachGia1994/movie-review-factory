@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated, Literal, get_args
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 StageStatus = Literal["pending", "running", "ready", "failed", "skipped", "cancelled"]
 ContentAgentMode = Literal["scaffold", "claude", "agy"]
@@ -87,6 +88,64 @@ class JobConfig(BaseModel):
     # 'banmai' or an ElevenLabs voice id). Empty falls back to MRF_TTS_VOICE then a
     # per-provider default. Ignored by the edge provider. Not a secret.
     tts_voice: str = Field(default="", max_length=120)
+
+
+class ChannelProfile(BaseModel):
+    """A reusable channel identity + job-creation defaults for multi-channel studios.
+
+    The identity (``name`` plus a per-profile logo) is materialised into the shared
+    brand directory when the profile is activated; the remaining fields prefill a
+    new job's :class:`JobConfig` and never mutate existing jobs. Field constraints
+    mirror :class:`JobConfig` so an activated profile always yields a valid job.
+    """
+
+    name: str = Field(min_length=1, max_length=40)
+    language: str = Field(default="vi", max_length=20)
+    aspect_ratio: Literal["16:9", "9:16"] = "16:9"
+    tts_provider: str = Field(default="edge", max_length=30)
+    tts_voice: str = Field(default="", max_length=120)
+    intro_seconds: float = Field(default=0, ge=0, le=15)
+    outro_seconds: float = Field(default=0, ge=0, le=15)
+    brand_top_band: float = Field(default=0, ge=0, le=0.2)
+    brand_bottom_band: float = Field(default=0, ge=0, le=0.2)
+    copyright_bypass: str = Field(default="off", max_length=30)
+
+    @field_validator("name")
+    @classmethod
+    def _clean_name(cls, value: str) -> str:
+        text = str(value).strip()
+        if not text or len(text) > 40 or any(ord(c) < 32 or ord(c) == 127 for c in text):
+            raise ValueError("Tên kênh cần 1–40 ký tự và không chứa ký tự điều khiển.")
+        return text
+
+
+class ChannelSfx(BaseModel):
+    """One reusable transition sound effect (whoosh/boom) belonging to a channel.
+
+    The audio file is stored beside the channel and referenced by ``slug``; each
+    insertion becomes an ``audio_mix`` effect at the operator-chosen timestamp.
+    """
+
+    slug: str = Field(min_length=1, max_length=64)
+    label: str = Field(min_length=1, max_length=40)
+    gain_db: float = Field(default=-8, ge=-36, le=0)
+    rights_note: str = Field(min_length=1, max_length=300)
+
+    @field_validator("slug")
+    @classmethod
+    def _safe_slug(cls, value: str) -> str:
+        text = str(value).strip()
+        if not re.fullmatch(r"[A-Za-z0-9._-]+", text):
+            raise ValueError("slug SFX chỉ gồm chữ, số, dấu chấm, gạch ngang, gạch dưới.")
+        return text
+
+    @field_validator("label", "rights_note")
+    @classmethod
+    def _clean_text(cls, value: str) -> str:
+        text = " ".join(str(value).split())
+        if not text:
+            raise ValueError("giá trị không được rỗng")
+        return text
 
 
 class Artifact(BaseModel):

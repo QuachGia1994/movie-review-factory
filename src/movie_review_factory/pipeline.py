@@ -292,6 +292,34 @@ def _source_video(root: Path, cfg: JobConfig) -> Path:
     return Path(cfg.source_video)
 
 
+def transition_cut_offsets(clip_durations: list[float]) -> list[float]:
+    """Body-relative timeline offset of each internal scene cut (excludes t=0).
+
+    Audio-mix effects live in the narration-length body that render concatenates
+    between the optional intro/outro cards, so a cut's ``at_seconds`` is measured
+    from the body's zero (no intro offset). The cut after clip *i* sits at the
+    cumulative sum of clip durations up to and including *i*; the final clip has
+    no trailing cut, so the last duration is excluded.
+    """
+    offsets: list[float] = []
+    cursor = 0.0
+    for duration in list(clip_durations)[:-1]:
+        cursor += max(0.0, float(duration))
+        offsets.append(round(cursor, 3))
+    return offsets
+
+
+def select_evenly(items: list, budget: int) -> list:
+    """Pick up to ``budget`` items spread evenly across ``items`` (order kept)."""
+    if budget <= 0 or not items:
+        return []
+    if len(items) <= budget:
+        return list(items)
+    step = (len(items) - 1) / (budget - 1) if budget > 1 else 0.0
+    picked = sorted({round(i * step) for i in range(budget)})
+    return [items[i] for i in picked]
+
+
 def _band_or_box_mask(root: Path, cfg: JobConfig) -> Path | None:
     """Generate a rectangular mask from boxes or top/bottom bands.
 
@@ -2389,6 +2417,21 @@ def _tts(root: Path, manifest: JobManifest) -> tuple[list[Artifact], str]:
         synthesize = narration_alignment.synthesize_with_boundaries
         engine = "edge-tts"
         timing_mode = "tts_word_boundary"
+    elif provider == "vieneu":
+        # VieNeu-TTS: free offline voice, no API key; needs the optional `vieneu` package + ffprobe for chunk timing.
+        if not ffprobe:
+            raise SkipStage("ffprobe not on PATH - required to time non-edge TTS providers")
+        if not tts_providers.vieneu_available():
+            raise SkipStage(tts_providers.VIENEU_INSTALL_HINT)
+        voice = tts_providers.resolve_voice(provider, cfg=cfg)
+        prosody = {}
+        communicate_factory = None
+        no_audio_error = type("_NoAudioReceived", (Exception,), {})
+        synthesize = tts_providers.build_synthesize(
+            provider, ffprobe_bin=ffprobe or "ffprobe", ffmpeg_bin=ffmpeg or "ffmpeg",
+        )
+        engine = provider
+        timing_mode = "estimated_word_timing"
     else:
         # FPT.AI / ElevenLabs: audio-only providers. Keys come from env (never the
         # manifest); ffprobe is required to estimate word timing from chunk duration.

@@ -115,3 +115,36 @@ def test_rejects_candidate_path_traversal(tmp_path: Path) -> None:
     (tmp_path / "thumbnails.json").write_text(json.dumps(data), encoding="utf-8")
     with pytest.raises(ValueError, match="candidate"):
         render_thumbnail_variants(tmp_path, headline="BEN 10", channel_name="Màn Kể")
+
+
+def test_force_cover_paints_watermark_bands_over_every_variant(tmp_path: Path) -> None:
+    _candidates(tmp_path)
+    manifest = render_thumbnail_variants(
+        tmp_path, headline="BEN 10 BÍ ẨN", channel_name="Màn Kể", force_cover=True
+    )
+    for variant in manifest["variants"]:
+        with Image.open(tmp_path / variant["file"]) as canvas:
+            rgb = canvas.convert("RGB")
+            # Top (>=72px) and bottom (>=100px) bands are black at a right-edge corner clear of the plates.
+            assert max(rgb.getpixel((1240, 8))) <= 8
+            assert max(rgb.getpixel((1240, 712))) <= 8
+
+
+def test_without_force_cover_leaves_source_corner_untouched(tmp_path: Path) -> None:
+    _candidates(tmp_path)
+    manifest = render_thumbnail_variants(tmp_path, headline="BEN 10 BÍ ẨN", channel_name="Màn Kể")
+    with Image.open(tmp_path / manifest["variants"][0]["file"]) as canvas:
+        # No manifest bands + no force_cover => corner keeps the (non-black) source colour.
+        assert max(canvas.convert("RGB").getpixel((1240, 8))) > 30
+
+
+def test_headlines_list_prints_a_distinct_headline_per_variant(tmp_path: Path) -> None:
+    _candidates(tmp_path)
+    manifest = render_thumbnail_variants(
+        tmp_path,
+        headline="CÂU MỘT",
+        channel_name="Màn Kể",
+        headlines=["CÂU MỘT", "CÂU HAI", "CÂU BA"],
+    )
+    assert [v["headline"] for v in manifest["variants"]] == ["CÂU MỘT", "CÂU HAI", "CÂU BA"]
+    assert manifest["headline"] == "CÂU MỘT"

@@ -137,14 +137,96 @@ def test_elevenlabs_default_fetcher_posts_to_voice_url(tmp_path: Path):
     assert part.read_bytes() == b"AUDIO"
 
 
-def test_fptai_default_fetcher_polls_async_url(tmp_path: Path):
+def test_elevenlabs_retries_503_then_succeeds(tmp_path: Path):
+    responses = iter([(503, b"busy"), (200, b"AUDIO")])
+    sleeps = []
+
+    synth = tts_providers.build_synthesize(
+        "elevenlabs", api_key="secret",
+        http_request=lambda *_args, **_kwargs: next(responses),
+        probe_duration=lambda _p: 1.0, sleep=sleeps.append,
+    )
+    part = tmp_path / "p.mp3"
+    synth("Hello", "VOICEID", part, None)
+    assert part.read_bytes() == b"AUDIO"
+    assert sleeps == [0.5]
+
+
+def test_elevenlabs_429_honors_retry_after(tmp_path: Path):
+    responses = iter([(429, b"limited", {"Retry-After": "2.5"}), (200, b"AUDIO")])
+    sleeps = []
+    synth = tts_providers.build_synthesize(
+        "elevenlabs", api_key="secret",
+        http_request=lambda *_args, **_kwargs: next(responses),
+        probe_duration=lambda _p: 1.0, sleep=sleeps.append,
+    )
+    synth("Hello", "VOICEID", tmp_path / "p.mp3", None)
+    assert sleeps == [2.5]
+
+
+def test_elevenlabs_retries_timeout_then_succeeds(tmp_path: Path):
+    calls = 0
+
+    def fake_request(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise TimeoutError("slow")
+        return 200, b"AUDIO"
+
+    synth = tts_providers.build_synthesize(
+        "elevenlabs", api_key="secret", http_request=fake_request,
+        probe_duration=lambda _p: 1.0, sleep=lambda _seconds: None,
+    )
+    synth("Hello", "VOICEID", tmp_path / "p.mp3", None)
+    assert calls == 2
+
+
+def test_elevenlabs_401_fails_without_retry(tmp_path: Path):
+    calls = 0
+
+    def fake_request(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        return 401, b"unauthorized"
+
+    synth = tts_providers.build_synthesize(
+        "elevenlabs", api_key="bad", http_request=fake_request,
+        probe_duration=lambda _p: 1.0,
+        sleep=lambda _seconds: pytest.fail("must not retry"),
+    )
+    with pytest.raises(tts_providers.TTSProviderError, match="HTTP 401"):
+        synth("Hello", "VOICEID", tmp_path / "p.mp3", None)
+    assert calls == 1
+
+
+def test_elevenlabs_exhausted_retries_raises(tmp_path: Path):
+    calls = 0
+
+    def fake_request(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        return 503, b"busy"
+
+    synth = tts_providers.build_synthesize(
+        "elevenlabs", api_key="secret", http_request=fake_request,
+        probe_duration=lambda _p: 1.0, sleep=lambda _seconds: None,
+    )
+    with pytest.raises(tts_providers.TTSProviderError, match="HTTP 503"):
+        synth("Hello", "VOICEID", tmp_path / "p.mp3", None)
+    assert calls == 3
+
+
+def test_fptai_default_fetcher_polls_404_without_reposting(tmp_path: Path):
     responses = iter([
-        (200, b'{"async": "https://fpt.example/audio.mp3", "error": 0}'),  # POST
-        (404, b""),          # first poll: not ready yet
-        (200, b"FPTAUDIO"),  # second poll: ready
+        (200, b'{"async": "https://fpt.example/audio.mp3", "error": 0}'),
+        (404, b""),
+        (200, b"FPTAUDIO"),
     ])
+    methods = []
 
     def fake_request(url, *, method="GET", headers=None, data=None, timeout=60.0):
+        methods.append(method)
         return next(responses)
 
     synth = tts_providers.build_synthesize(
@@ -154,6 +236,28 @@ def test_fptai_default_fetcher_polls_async_url(tmp_path: Path):
     part = tmp_path / "p.mp3"
     synth("Xin chào", "banmai", part, None)
     assert part.read_bytes() == b"FPTAUDIO"
+    assert methods == ["POST", "GET", "GET"]
+
+
+def test_fptai_poll_401_fails_fast_without_reposting(tmp_path: Path):
+    responses = iter([
+        (200, b'{"async": "https://fpt.example/audio.mp3", "error": 0}'),
+        (401, b"unauthorized"),
+    ])
+    methods = []
+
+    def fake_request(url, *, method="GET", headers=None, data=None, timeout=60.0):
+        methods.append(method)
+        return next(responses)
+
+    synth = tts_providers.build_synthesize(
+        "fptai", api_key="k", http_request=fake_request,
+        probe_duration=lambda _p: 1.0,
+        sleep=lambda _seconds: pytest.fail("401 must fail fast"),
+    )
+    with pytest.raises(tts_providers.TTSProviderError, match="HTTP 401"):
+        synth("Xin chào", "banmai", tmp_path / "p.mp3", None)
+    assert methods == ["POST", "GET"]
 
 
 def test_provider_integrates_with_synthesize_chunked_single_chunk(tmp_path: Path):
@@ -229,3 +333,80 @@ def test_check_provider_fptai_present_key_is_ok_without_network():
     result = tts_providers.check_provider("fptai", api_key="k", http_request=fake_request)
     assert result["ok"] is True
     assert calls == []  # FPT.AI presence check must not hit the network
+
+
+def test_resolve_provider_accepts_vieneu(monkeypatch):
+    monkeypatch.setenv(tts_providers.PROVIDER_ENV, "vieneu")
+    assert tts_providers.resolve_provider() == "vieneu"
+    assert "vieneu" in tts_providers.SUPPORTED_PROVIDERS
+    # VieNeu is local/offline, not a network provider that needs an API key.
+    assert "vieneu" not in tts_providers.NETWORK_PROVIDERS
+    assert "vieneu" in tts_providers.LOCAL_PROVIDERS
+
+
+def test_vieneu_synthesize_needs_no_key_and_estimates_boundaries(tmp_path: Path):
+    def fake_engine(text, voice):
+        assert voice == ""  # no default voice configured -> engine default
+        return b"MP3:" + text.encode("utf-8")
+
+    synth = tts_providers.build_synthesize(
+        "vieneu", synthesize_audio=fake_engine, probe_duration=lambda _p: 2.0,
+    )
+    part = tmp_path / "part.mp3"
+    boundaries = synth("Ben chạy nhanh", "", part, None)
+    assert part.read_bytes().startswith(b"MP3:")
+    assert [b["text"] for b in boundaries] == ["Ben", "chạy", "nhanh"]
+
+
+def test_vieneu_integrates_with_synthesize_chunked_single_chunk(tmp_path: Path):
+    synth = tts_providers.build_synthesize(
+        "vieneu", synthesize_audio=lambda text, _v: b"VIENEU:" + text.encode("utf-8"),
+        probe_duration=lambda _p: 1.5,
+    )
+    out = tmp_path / "narration.mp3"
+    boundaries = synthesize_chunked(
+        "Xin chào các bạn", "", out, synthesize=synth,
+        communicate_factory=None, no_audio_error=RuntimeError,
+        probe_duration=lambda _p: 1.5,
+        concat_audio=lambda *_: pytest.fail("single chunk must not remux"),
+    )
+    assert out.read_bytes().startswith(b"VIENEU:")
+    assert boundaries and all("offset" in b for b in boundaries)
+
+
+def test_vieneu_available_uses_injected_importer():
+    assert tts_providers.vieneu_available(import_module=lambda name: object()) is True
+
+    def boom(name):
+        raise ImportError(name)
+
+    assert tts_providers.vieneu_available(
+        import_module=boom, isolated_check=lambda: False,
+    ) is False
+
+
+def test_check_provider_vieneu_available_needs_no_key(monkeypatch):
+    monkeypatch.setattr(tts_providers, "vieneu_available", lambda: True)
+    result = tts_providers.check_provider("vieneu")
+    assert result["provider"] == "vieneu"
+    assert result["ok"] is True
+    assert "không cần API key" in result["detail"]
+
+
+def test_check_provider_vieneu_missing_package_reports_install_hint(monkeypatch):
+    monkeypatch.setattr(tts_providers, "vieneu_available", lambda: False)
+    result = tts_providers.check_provider("vieneu")
+    assert result["ok"] is False
+    assert "pip install vieneu" in result["detail"]
+
+
+def test_vieneu_infer_kwargs_routes_preset_default_and_clone(tmp_path: Path):
+    # empty -> model default voice
+    assert tts_providers._vieneu_infer_kwargs("") == {}
+    assert tts_providers._vieneu_infer_kwargs("   ") == {}
+    # a plain name -> preset voice
+    assert tts_providers._vieneu_infer_kwargs("Mai Anh") == {"voice": "Mai Anh"}
+    # an existing audio file -> zero-shot clone reference
+    ref = tmp_path / "ref.wav"
+    ref.write_bytes(b"RIFF0000WAVE")
+    assert tts_providers._vieneu_infer_kwargs(str(ref)) == {"ref_audio": str(ref)}

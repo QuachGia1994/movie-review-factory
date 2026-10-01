@@ -1197,6 +1197,37 @@ def test_cli_init_job_enables_external_watermark_detect(tmp_path: Path) -> None:
     assert wm.detect.external_cmd == "python detect.py --in {video} --out {out}"
 
 
+def test_cli_init_job_sets_cheap_watermark_method(tmp_path: Path) -> None:
+    root = tmp_path / "wm-blur"
+    result = runner.invoke(app, ["init-job", str(root), "--watermark-detect", "color", "--watermark-method", "blur"])
+    assert result.exit_code == 0, result.output
+    wm = pipeline.load_manifest(root).config.watermark_removal
+    assert wm.enabled is True
+    assert wm.method == "blur"
+
+
+def test_cli_init_job_rejects_unknown_watermark_method(tmp_path: Path) -> None:
+    result = runner.invoke(app, ["init-job", str(tmp_path / "wm-bad"), "--watermark-method", "magic"])
+    assert result.exit_code != 0
+
+
+def test_cli_status_prints_unicode_on_legacy_console(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import io
+
+    root = tmp_path / "wm-status"
+    assert runner.invoke(app, ["init-job", str(root)]).exit_code == 0
+    raw = io.BytesIO()
+    legacy = io.TextIOWrapper(raw, encoding="cp1252", errors="strict")
+    monkeypatch.setattr("sys.stdout", legacy)
+    app(["status", str(root)], standalone_mode=False)
+    legacy.flush()
+    assert legacy.encoding.lower().replace("-", "") == "utf8"
+    print("Xo\u00e1 watermark \u2014 ok")
+    legacy.flush()
+    assert "Xo\u00e1 watermark \u2014 ok".encode("utf-8") in raw.getvalue()
+    assert b"wm-status" in raw.getvalue()
+
+
 def test_cli_init_job_watermark_detect_defaults_off(tmp_path: Path) -> None:
     root = tmp_path / "wm-off"
     assert runner.invoke(app, ["init-job", str(root)]).exit_code == 0
@@ -1843,7 +1874,7 @@ def test_dashboard_root_layout_dialog_tools_and_project_switcher_are_wired() -> 
     assert "dialog.showModal()" in html
     assert "document.addEventListener('pointerdown'" in html
     assert 'id="emptyCreateBtn"' in html
-    assert 'id="emptyProjectsBtn"' in html
+    assert 'id="emptyScoutBtn"' in html
     assert "$('createPanel').open = true" not in html
     assert 'id="midrollStatus"' in html
     assert 'insertion.location_label' in html
