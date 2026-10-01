@@ -97,8 +97,7 @@ watermark_removal=WatermarkRemoval(
 | `temporal` | a fixed overlay over moving content | FFmpeg |
 | `external` | a smart detector (Florence-2 / SAM) you already have | `MRF_MASK_DETECTOR_CMD` or `external_cmd` (`{video}`/`{out}` placeholders) |
 
-`color`/`temporal` extract every frame with FFmpeg, so a machine without FFmpeg
-(or without the external detector) **skips** the stage rather than failing.
+`color`/`temporal` decode frames through an FFmpeg pipe and process them incrementally; they do not materialize a full-resolution frame scratch directory on disk. A machine without FFmpeg (or without the external detector) **skips** the stage rather than failing.
 
 ### External detector: Florence-2 sample
 

@@ -29,7 +29,7 @@ import subprocess
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Sequence
+from typing import Iterable, Iterator
 
 from PIL import Image, ImageChops, ImageFilter
 
@@ -82,7 +82,7 @@ def color_mask(
 
 
 def temporal_static_mask(
-    frames: Sequence[Image.Image],
+    frames: Iterable[Image.Image],
     threshold: int = 12,
     dilation: int = 0,
 ) -> Image.Image:
@@ -91,14 +91,18 @@ def temporal_static_mask(
     Note: this also catches genuinely static *background* regions, so it works
     best when the watermark sits over moving content.
     """
-    if not frames:
-        raise MaskDetectorError("no frames to analyse")
-    luminance = [frame.convert("L") for frame in frames]
-    darkest = brightest = luminance[0]
-    for frame in luminance[1:]:
-        darkest = ImageChops.darker(darkest, frame)
-        brightest = ImageChops.lighter(brightest, frame)
-    span = ImageChops.difference(brightest, darkest)  # per-pixel range across frames
+    iterator = iter(frames)
+    try:
+        first = next(iterator).convert("L")
+    except StopIteration as exc:
+        raise MaskDetectorError("no frames to analyse") from exc
+    darkest = first
+    brightest = first.copy()
+    for frame in iterator:
+        luminance = frame.convert("L")
+        darkest = ImageChops.darker(darkest, luminance)
+        brightest = ImageChops.lighter(brightest, luminance)
+    span = ImageChops.difference(brightest, darkest)
     mask = span.point(lambda v: 255 if v <= threshold else 0)
     return _dilate(mask, dilation)
 
@@ -115,6 +119,94 @@ def _write_mask(mask: Image.Image, path: Path) -> Path:
     mask.save(temporary, format="PNG")
     temporary.replace(path)
     return path
+
+
+def _read_ppm_token(stream) -> bytes | None:
+    token = bytearray()
+    while True:
+        byte = stream.read(1)
+        if not byte:
+            return bytes(token) if token else None
+        if byte == b"#" and not token:
+            while byte not in (b"", b"\n"):
+                byte = stream.read(1)
+            continue
+        if byte.isspace():
+            if token:
+                return bytes(token)
+            continue
+        token.extend(byte)
+
+
+def _stream_video_frames(
+    video: Path,
+    *,
+    fps: float | None = None,
+    ffmpeg: str | None = None,
+) -> Iterator[Image.Image]:
+    ffmpeg = ffmpeg or shutil.which("ffmpeg")
+    if not ffmpeg:
+        raise MaskDetectorUnavailable("ffmpeg not on PATH - install FFmpeg to detect watermark masks")
+    command = [
+        ffmpeg, "-nostdin", "-hide_banner", "-loglevel", "error",
+        "-i", str(video),
+    ]
+    if fps and fps > 0:
+        command += ["-vf", f"fps={fps}"]
+    command += ["-an", "-sn", "-f", "image2pipe", "-vcodec", "ppm", "-"]
+    try:
+        proc = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    except OSError as exc:
+        raise MaskDetectorUnavailable(f"cannot launch ffmpeg: {exc}") from exc
+    assert proc.stdout is not None
+    assert proc.stderr is not None
+    emitted = 0
+    try:
+        while True:
+            magic = _read_ppm_token(proc.stdout)
+            if magic is None:
+                break
+            if magic != b"P6":
+                raise MaskDetectorError(f"unexpected ffmpeg frame format: {magic!r}")
+            width_raw = _read_ppm_token(proc.stdout)
+            height_raw = _read_ppm_token(proc.stdout)
+            max_value_raw = _read_ppm_token(proc.stdout)
+            try:
+                width = int(width_raw or b"")
+                height = int(height_raw or b"")
+                max_value = int(max_value_raw or b"")
+            except ValueError as exc:
+                raise MaskDetectorError("invalid PPM header from ffmpeg") from exc
+            if width <= 0 or height <= 0 or max_value != 255:
+                raise MaskDetectorError(
+                    f"unsupported PPM frame from ffmpeg: {width}x{height}, max={max_value}"
+                )
+            expected = width * height * 3
+            payload = proc.stdout.read(expected)
+            if len(payload) != expected:
+                raise MaskDetectorError(
+                    f"truncated ffmpeg frame: expected {expected} bytes, got {len(payload)}"
+                )
+            emitted += 1
+            yield Image.frombytes("RGB", (width, height), payload)
+        returncode = proc.wait()
+        if returncode != 0:
+            tail = proc.stderr.read().decode("utf-8", errors="replace").strip()[-500:]
+            raise MaskDetectorError(f"ffmpeg frame stream failed: {tail or f'exit {returncode}'}")
+        if emitted == 0:
+            raise MaskDetectorError("ffmpeg produced no frames")
+    finally:
+        try:
+            proc.stdout.close()
+        except Exception:
+            pass
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+        try:
+            proc.stderr.close()
+        except Exception:
+            pass
 
 
 def extract_frames(
@@ -134,7 +226,7 @@ def extract_frames(
         raise MaskDetectorUnavailable("ffmpeg not on PATH - install FFmpeg to detect watermark masks")
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    command = [ffmpeg, "-y", "-i", str(video)]
+    command = [ffmpeg, "-y", "-nostdin", "-hide_banner", "-loglevel", "error", "-i", str(video)]
     if fps and fps > 0:
         command += ["-vf", f"fps={fps}"]
     command += ["-start_number", "0", str(out_dir / FRAME_PATTERN)]
@@ -143,7 +235,9 @@ def extract_frames(
     except OSError as exc:
         raise MaskDetectorUnavailable(f"cannot launch ffmpeg: {exc}") from exc
     if proc.returncode != 0:
-        raise MaskDetectorError(f"ffmpeg frame extraction failed: {(proc.stderr or '').strip()[-300:]}")
+        for frame in out_dir.glob("*.png"):
+            frame.unlink(missing_ok=True)
+        raise MaskDetectorError(f"ffmpeg frame extraction failed: {(proc.stderr or '').strip()[-500:]}")
     frames = sorted(out_dir.glob("*.png"))
     if not frames:
         raise MaskDetectorError(f"ffmpeg produced no frames under {out_dir}")
@@ -197,33 +291,55 @@ def generate_frame_masks(
     video, out_dir = Path(video), Path(out_dir)
     if not video.is_file():
         raise MaskDetectorError(f"source video not found: {video}")
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    if settings.method == "external":
-        return _run_external(video, out_dir, settings)
-    if settings.method not in ("color", "temporal"):
+    if settings.method not in ("color", "temporal", "external"):
         raise MaskDetectorError(f"unknown mask detection method: {settings.method!r}")
 
-    work_dir = Path(work_dir) if work_dir else out_dir.parent / f"{out_dir.name}.frames"
-    frame_paths = extract_frames(video, work_dir, fps=settings.fps)
+    if out_dir.exists():
+        shutil.rmtree(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
     try:
+        if settings.method == "external":
+            return _run_external(video, out_dir, settings)
         if settings.method == "color":
-            for index, frame_path in enumerate(frame_paths):
-                with Image.open(frame_path) as frame:
-                    mask = color_mask(frame, settings.target_rgb, settings.tolerance, settings.dilation)
-                _write_mask(mask, out_dir / _mask_name(index))
-        else:  # temporal -> one static mask replicated per frame
-            frames = []
-            for frame_path in frame_paths:
-                with Image.open(frame_path) as frame:
-                    frames.append(frame.convert("L"))
-            static = temporal_static_mask(frames, settings.threshold, settings.dilation)
-            for index in range(len(frame_paths)):
-                _write_mask(static, out_dir / _mask_name(index))
-    finally:
-        shutil.rmtree(work_dir, ignore_errors=True)
+            frames = _stream_video_frames(video, fps=settings.fps)
+            try:
+                for index, frame in enumerate(frames):
+                    try:
+                        mask = color_mask(frame, settings.target_rgb, settings.tolerance, settings.dilation)
+                        _write_mask(mask, out_dir / _mask_name(index))
+                    finally:
+                        frame.close()
+            finally:
+                frames.close()
+        else:
+            frame_count = 0
+            frames = _stream_video_frames(video, fps=settings.fps)
+
+            def counted_frames() -> Iterator[Image.Image]:
+                nonlocal frame_count
+                for frame in frames:
+                    frame_count += 1
+                    try:
+                        yield frame
+                    finally:
+                        frame.close()
+
+            try:
+                static = temporal_static_mask(counted_frames(), settings.threshold, settings.dilation)
+            finally:
+                frames.close()
+            try:
+                first_mask = _write_mask(static, out_dir / _mask_name(0))
+                for index in range(1, frame_count):
+                    shutil.copyfile(first_mask, out_dir / _mask_name(index))
+            finally:
+                static.close()
+    except Exception:
+        shutil.rmtree(out_dir, ignore_errors=True)
+        raise
 
     if not sorted(out_dir.glob("*.png")):
+        shutil.rmtree(out_dir, ignore_errors=True)
         raise MaskDetectorError("no masks were produced")
     return out_dir
 

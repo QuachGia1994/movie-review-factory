@@ -5,6 +5,7 @@ faked, so no ffmpeg/GPU/model is required.
 """
 from __future__ import annotations
 
+import io
 import types
 from pathlib import Path
 
@@ -55,6 +56,71 @@ def test_build_external_command_expands_placeholders(tmp_path: Path) -> None:
     assert str(tmp_path) in " ".join(argv)
 
 
+class _FakePopen:
+    def __init__(self, stdout: bytes, stderr: bytes = b"", returncode: int = 0) -> None:
+        self.stdout = io.BytesIO(stdout)
+        self.stderr = io.BytesIO(stderr)
+        self._final_returncode = returncode
+        self.returncode: int | None = None
+
+    def wait(self) -> int:
+        self.returncode = self._final_returncode
+        return self.returncode
+
+    def poll(self) -> int | None:
+        return self.returncode
+
+    def kill(self) -> None:
+        self.returncode = -9
+
+
+def test_stream_video_frames_reads_ppm_sequence(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    video = tmp_path / "in.mp4"
+    video.write_bytes(b"video")
+    ppm = (
+        b"P6\n2 1\n255\n" + bytes([255, 0, 0, 0, 255, 0])
+        + b"P6\n1 1\n255\n" + bytes([0, 0, 255])
+    )
+    fake = _FakePopen(ppm)
+    monkeypatch.setattr(md.subprocess, "Popen", lambda *args, **kwargs: fake)
+
+    frames = list(md._stream_video_frames(video, ffmpeg="ffmpeg"))
+    try:
+        assert [frame.size for frame in frames] == [(2, 1), (1, 1)]
+        assert frames[0].getpixel((0, 0)) == (255, 0, 0)
+        assert frames[1].getpixel((0, 0)) == (0, 0, 255)
+    finally:
+        for frame in frames:
+            frame.close()
+
+
+def test_stream_video_frames_surfaces_ffmpeg_error(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    video = tmp_path / "in.mp4"
+    video.write_bytes(b"video")
+    fake = _FakePopen(b"", b"No space left on device\n", returncode=1)
+    monkeypatch.setattr(md.subprocess, "Popen", lambda *args, **kwargs: fake)
+
+    with pytest.raises(md.MaskDetectorError, match="No space left on device"):
+        list(md._stream_video_frames(video, ffmpeg="ffmpeg"))
+
+
+def test_extract_frames_removes_partial_pngs_on_failure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    video = tmp_path / "in.mp4"
+    video.write_bytes(b"video")
+    out_dir = tmp_path / "frames"
+
+    def fake_run(cmd, **kwargs):
+        target = Path(cmd[-1]).parent
+        target.mkdir(parents=True, exist_ok=True)
+        (target / "00000.png").write_bytes(b"partial")
+        return types.SimpleNamespace(returncode=1, stdout="", stderr="No space left on device")
+
+    monkeypatch.setattr(md.subprocess, "run", fake_run)
+    with pytest.raises(md.MaskDetectorError, match="No space left on device"):
+        md.extract_frames(video, out_dir, ffmpeg="ffmpeg")
+    assert not list(out_dir.glob("*.png"))
+
+
 # --- orchestration (faked FFmpeg) -------------------------------------------
 
 def test_generate_frame_masks_color_writes_numbered_folder(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -62,17 +128,11 @@ def test_generate_frame_masks_color_writes_numbered_folder(tmp_path: Path, monke
     video.write_bytes(b"video")
     out_dir = tmp_path / "masks"
 
-    def fake_extract(video, out_dir, **kwargs):
-        out_dir = Path(out_dir)
-        out_dir.mkdir(parents=True, exist_ok=True)
-        paths = []
-        for index in range(3):
-            frame = out_dir / f"{index:05d}.png"
-            Image.new("RGB", (4, 4), (255, 255, 255)).save(frame)
-            paths.append(frame)
-        return paths
+    def fake_stream(video, **kwargs):
+        for _ in range(3):
+            yield Image.new("RGB", (4, 4), (255, 255, 255))
 
-    monkeypatch.setattr(md, "extract_frames", fake_extract)
+    monkeypatch.setattr(md, "_stream_video_frames", fake_stream)
     result = md.generate_frame_masks(video, out_dir, md.DetectSettings(method="color"))
 
     assert result == out_dir
@@ -80,6 +140,42 @@ def test_generate_frame_masks_color_writes_numbered_folder(tmp_path: Path, monke
     assert names == ["00000.png", "00001.png", "00002.png"]
     # white frames -> fully white masks
     assert _pixel(out_dir / "00000.png", (0, 0)) == 255
+    assert not (tmp_path / "masks.frames").exists()
+
+
+def test_generate_frame_masks_temporal_streams_and_writes_matching_count(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    video = tmp_path / "in.mp4"
+    video.write_bytes(b"video")
+    out_dir = tmp_path / "masks"
+
+    def fake_stream(video, **kwargs):
+        yield Image.new("RGB", (4, 4), (100, 100, 100))
+        yield Image.new("RGB", (4, 4), (110, 110, 110))
+        yield Image.new("RGB", (4, 4), (105, 105, 105))
+
+    monkeypatch.setattr(md, "_stream_video_frames", fake_stream)
+    result = md.generate_frame_masks(video, out_dir, md.DetectSettings(method="temporal"))
+
+    assert result == out_dir
+    assert [p.name for p in sorted(out_dir.glob("*.png"))] == ["00000.png", "00001.png", "00002.png"]
+    assert not (tmp_path / "masks.frames").exists()
+
+
+def test_generate_frame_masks_removes_partial_masks_when_stream_fails(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    video = tmp_path / "in.mp4"
+    video.write_bytes(b"video")
+    out_dir = tmp_path / "masks"
+
+    def failing_stream(video, **kwargs):
+        yield Image.new("RGB", (4, 4), (255, 255, 255))
+        raise md.MaskDetectorError("stream failed")
+
+    monkeypatch.setattr(md, "_stream_video_frames", failing_stream)
+    with pytest.raises(md.MaskDetectorError, match="stream failed"):
+        md.generate_frame_masks(video, out_dir, md.DetectSettings(method="color"))
+
+    assert not out_dir.exists()
+    assert not (tmp_path / "masks.frames").exists()
 
 
 def test_generate_frame_masks_rejects_unknown_method(tmp_path: Path) -> None:
