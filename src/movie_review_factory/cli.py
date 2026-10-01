@@ -1,9 +1,10 @@
+import sys
 from pathlib import Path
 from typing import Optional
 
 import typer
 
-from .models import JobConfig, WatermarkDetect, WatermarkRemoval
+from .models import WATERMARK_METHODS, JobConfig, WatermarkDetect, WatermarkRemoval
 from .pipeline import (
     approve_metadata,
     approve_script,
@@ -16,6 +17,14 @@ from .pipeline import (
 )
 
 app = typer.Typer(no_args_is_help=True)
+
+
+@app.callback()
+def _utf8_output() -> None:
+    # Windows pipes default to cp1252, which mangles Vietnamese text and "—".
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
 
 
 @app.command()
@@ -35,6 +44,12 @@ def init_job(
         "--watermark-detect",
         help="Auto-detect & remove a full-frame watermark: color, temporal, or external.",
     ),
+    watermark_method: str = typer.Option(
+        "propainter",
+        "--watermark-method",
+        help="Removal method for --watermark-detect: propainter (AI, needs GPU), "
+             "delogo (FFmpeg, fast), or blur (FFmpeg, fastest, hides only).",
+    ),
     detector_cmd: Optional[str] = typer.Option(
         None,
         "--detector-cmd",
@@ -42,13 +57,17 @@ def init_job(
              "falls back to MRF_MASK_DETECTOR_CMD when omitted.",
     ),
 ):
-    watermark_removal = WatermarkRemoval()
+    removal_method = watermark_method.strip().lower()
+    if removal_method not in WATERMARK_METHODS:
+        raise typer.BadParameter(f"watermark-method must be one of: {', '.join(WATERMARK_METHODS)}")
+    watermark_removal = WatermarkRemoval(method=removal_method)
     if watermark_detect is not None:
         method = watermark_detect.strip().lower()
         if method not in ("color", "temporal", "external"):
             raise typer.BadParameter("watermark-detect must be color, temporal, or external")
         watermark_removal = WatermarkRemoval(
             enabled=True,
+            method=removal_method,
             detect=WatermarkDetect(method=method, external_cmd=(detector_cmd or "").strip()),
         )
     config = JobConfig(

@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 from pathlib import Path
 
 
@@ -122,7 +123,8 @@ def clip_checks(plan: dict, render: dict) -> list[dict]:
 
 def provenance_checks(render: dict, source_video: str) -> list[dict]:
     rendered = str(render.get("source_video") or "")
-    canonical = lambda value: value.strip().replace("/", "\\").casefold()
+    # abspath: a CLI run records job-relative paths, the web app absolute ones.
+    canonical = lambda value: os.path.abspath(value.strip()).replace("/", "\\").casefold()
     ok = bool(rendered and source_video and canonical(rendered) == canonical(source_video))
     return [_check("render_source_provenance", {"expected": source_video, "rendered": rendered}, ok,
                    "" if ok else "The rendered source differs from the job source")]

@@ -326,15 +326,16 @@ def _resolve_watermark_mask(root: Path, cfg: JobConfig, src: Path) -> Path | Non
     return _band_or_box_mask(root, cfg)
 
 
-# --- watermark: optional full-frame watermark removal via ProPainter --------
+# --- watermark: optional watermark removal (ProPainter / delogo / blur) ----
 
 @register_stage("watermark")
 def _watermark(root: Path, manifest: JobManifest) -> tuple[list[Artifact], str]:
-    """Reconstruct a watermark-free source video with ProPainter (optional).
+    """Write a watermark-free ``source_clean.mp4`` (optional).
 
-    Self-skips unless ``watermark_removal.enabled`` is set, a mask/band/box is
-    configured, and ProPainter is installed (``MRF_PROPAINTER_DIR``), so a job
-    without the model still runs cleanly.
+    ``watermark_removal.method`` picks ProPainter (AI inpainting) or the
+    CPU-cheap FFmpeg ``delogo``/``blur``. Self-skips unless removal is enabled,
+    a mask/band/box is configured, and the chosen tool is installed, so a job
+    without it still runs cleanly.
     """
     cfg = manifest.config
     wm = cfg.watermark_removal
@@ -348,27 +349,43 @@ def _watermark(root: Path, manifest: JobManifest) -> tuple[list[Artifact], str]:
     mask = _resolve_watermark_mask(root, cfg, src)
     if mask is None:
         raise SkipStage("no watermark mask configured - set watermark_removal.mask, detect, boxes, or a band")
-    try:
-        pp_config = watermark_removal.resolve_config()
-    except watermark_removal.ProPainterUnavailable as exc:
-        raise SkipStage(str(exc))
     output = root / "source_clean.mp4"
-    watermark_removal.remove_watermark(src, mask, output, pp_config)
     per_frame = watermark_removal.frame_mask_paths(mask) if mask.is_dir() else []
     data = {
         "job_id": cfg.job_id,
+        "method": wm.method,
         "source_video": str(src),
         "clean_video": output.name,
         "mask": str(mask),
         "mask_kind": "per-frame" if mask.is_dir() else "static",
         "mask_frames": len(per_frame),
-        "propainter_home": str(pp_config.home),
     }
+    if wm.method == "propainter":
+        try:
+            pp_config = watermark_removal.resolve_config()
+        except watermark_removal.WatermarkToolUnavailable as exc:
+            raise SkipStage(str(exc))
+        watermark_removal.remove_watermark(src, mask, output, pp_config)
+        data["propainter_home"] = str(pp_config.home)
+        message = "removed full-frame watermark with ProPainter"
+    else:
+        static = watermark_removal.static_mask(mask, root / "watermark_mask_static.png")
+        coverage, _, mask_size = watermark_removal.mask_stats(static)
+        ingest = _read_json(root, "ingest.json")
+        frame_size = (int(ingest.get("width") or mask_size[0]), int(ingest.get("height") or mask_size[1]))
+        try:
+            watermark_removal.remove_watermark_ffmpeg(src, static, output, wm.method, frame_size)
+        except watermark_removal.WatermarkToolUnavailable as exc:
+            raise SkipStage(str(exc))
+        data["static_mask"] = str(static)
+        data["mask_coverage"] = round(coverage, 4)
+        verb = "removed watermark with FFmpeg delogo" if wm.method == "delogo" else "blurred watermark region with FFmpeg"
+        message = f"{verb}; mask covers {coverage:.0%} of the frame"
     artifacts = [
         Artifact(name="source_clean.mp4", path=output, status="ready"),
         _write_json(root, "watermark.json", data),
     ]
-    return artifacts, "removed full-frame watermark with ProPainter"
+    return artifacts, message
 
 
 # --- transcript: timed speech-to-text with faster-whisper -------------------
@@ -3481,7 +3498,8 @@ def _qa(root: Path, manifest: JobManifest) -> tuple[list[Artifact], str]:
         from . import editorial_qa
         for editorial in editorial_qa.inspect_job(
             root,
-            str(manifest.config.source_video or ""),
+            # Render reads source_clean.mp4 when the watermark stage made one.
+            str(_source_video(root, manifest.config)) if manifest.config.source_video else "",
             brand_top_band=manifest.config.brand_top_band,
             brand_bottom_band=manifest.config.brand_bottom_band,
         ):

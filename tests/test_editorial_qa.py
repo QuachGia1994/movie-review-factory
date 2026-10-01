@@ -63,6 +63,13 @@ def test_source_provenance_uses_windows_case_insensitive_paths():
                                          "D:/Video/Ben.mp4")[0]["passed"] is False
 
 
+def test_source_provenance_matches_relative_and_absolute_paths(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    absolute = str(tmp_path / "jobs" / "demo" / "source_clean.mp4")
+    assert editorial_qa.provenance_checks({"source_video": "jobs\\demo\\source_clean.mp4"},
+                                         absolute)[0]["passed"] is True
+
+
 def test_rendered_chapter_cuts_match_measured_voice_sections():
     alignment = {"section_bounds": [
         {"section_index": 1, "start_seconds": 0},

@@ -9,6 +9,9 @@ from pydantic import BaseModel, Field, model_validator
 StageStatus = Literal["pending", "running", "ready", "failed", "skipped", "cancelled"]
 ContentAgentMode = Literal["scaffold", "claude", "agy"]
 CONTENT_AGENT_MODES = get_args(ContentAgentMode)
+# docs/watermark-removal.md "Choosing a removal method" explains the tradeoffs.
+WatermarkMethod = Literal["propainter", "delogo", "blur"]
+WATERMARK_METHODS = get_args(WatermarkMethod)
 
 
 class CreativeBrief(BaseModel):
@@ -50,6 +53,7 @@ class WatermarkRemoval(BaseModel):
     """
 
     enabled: bool = False
+    method: WatermarkMethod = "propainter"
     mask: Path | None = None
     detect: WatermarkDetect | None = None
     top_band: float = Field(default=0, ge=0, le=0.5)
@@ -71,7 +75,7 @@ class JobConfig(BaseModel):
     # Optional branded intro/outro cards on the main render (0 = disabled).
     intro_seconds: float = Field(default=0, ge=0, le=15)
     outro_seconds: float = Field(default=0, ge=0, le=15)
-    # Optional full-frame watermark removal (ProPainter). Disabled by default.
+    # Optional full-frame watermark removal. Disabled by default.
     watermark_removal: WatermarkRemoval = Field(default_factory=WatermarkRemoval)
     # Optional Content ID bypass profile: 'off', 'light', 'balanced', 'aggressive'.
     copyright_bypass: str = Field(default="off", max_length=30)
