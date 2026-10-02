@@ -1,8 +1,7 @@
-"""Video transformation filters for review commentary and Content ID safety.
+"""Per-clip visual variety filters for review commentary footage.
 
 Provides deterministic FFmpeg filter fragments (horizontal flip, subtle zoom-crop,
-color balance, and tempo shift) to transform raw movie clips into original commentary
-footage and prevent automated Content ID false-positives.
+colour grade) applied to each clip in the commentary render.
 """
 from __future__ import annotations
 
@@ -13,16 +12,11 @@ MIN_ZOOM_RATIO = 0.01
 MAX_ZOOM_RATIO = 0.15
 DEFAULT_ZOOM_RATIO = 0.05
 
-# NOTE: tempo / micro-speed shifting is intentionally NOT a bypass knob. The
-# render concatenates clip video with a=0 and lays the independent TTS narration
-# as the master audio, and clip durations are already dictated by that narration
-# timing. Speeding the video (setpts) against a fixed-length voice-over - with no
-# matching audio atempo - would desync the two, so no speed factor is exposed
-# here and none is applied downstream in pipeline.py.
+# No speed knob: clip video is silent under fixed-length TTS narration, so a video-only tempo shift would desync them.
 
 
 @dataclass(frozen=True)
-class BypassProfile:
+class VarietyProfile:
     name: str = "off"
     hflip: bool = False
     zoom_ratio: float = 0.0
@@ -33,21 +27,21 @@ class BypassProfile:
         return self.hflip or self.zoom_ratio > 0.0 or self.color_grade
 
 
-PROFILES: dict[str, BypassProfile] = {
-    "off": BypassProfile(name="off"),
-    "light": BypassProfile(
+PROFILES: dict[str, VarietyProfile] = {
+    "off": VarietyProfile(name="off"),
+    "light": VarietyProfile(
         name="light",
         hflip=False,
         zoom_ratio=0.03,
         color_grade=True,
     ),
-    "balanced": BypassProfile(
+    "balanced": VarietyProfile(
         name="balanced",
         hflip=True,
         zoom_ratio=DEFAULT_ZOOM_RATIO,
         color_grade=True,
     ),
-    "aggressive": BypassProfile(
+    "aggressive": VarietyProfile(
         name="aggressive",
         hflip=True,
         zoom_ratio=0.08,
@@ -56,10 +50,10 @@ PROFILES: dict[str, BypassProfile] = {
 }
 
 
-def resolve_profile(value: str | dict[str, Any] | BypassProfile | None) -> BypassProfile:
+def resolve_profile(value: str | dict[str, Any] | VarietyProfile | None) -> VarietyProfile:
     if value is None:
         return PROFILES["off"]
-    if isinstance(value, BypassProfile):
+    if isinstance(value, VarietyProfile):
         return value
     if isinstance(value, str):
         normalized = value.strip().lower()
@@ -74,7 +68,7 @@ def resolve_profile(value: str | dict[str, Any] | BypassProfile | None) -> Bypas
         hflip = bool(value.get("hflip", base.hflip))
         zoom = float(value.get("zoom_ratio", base.zoom_ratio))
         color = bool(value.get("color_grade", base.color_grade))
-        return BypassProfile(
+        return VarietyProfile(
             name=base_name,
             hflip=hflip,
             zoom_ratio=max(0.0, min(MAX_ZOOM_RATIO, zoom)),
@@ -103,10 +97,10 @@ def color_grade_filter(
     return f"eq=contrast={contrast:.3f}:brightness={brightness:.3f}:saturation={saturation:.3f}"
 
 
-def build_clip_bypass_filters(
+def build_clip_variety_filters(
     width: int,
     height: int,
-    profile: BypassProfile | str | dict[str, Any] | None,
+    profile: VarietyProfile | str | dict[str, Any] | None,
 ) -> list[str]:
     prof = resolve_profile(profile)
     if not prof.is_active:

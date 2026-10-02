@@ -1032,7 +1032,7 @@ def test_http_missing_job_returns_404(tmp_path: Path) -> None:
         server.server_close()
 
 
-@pytest.mark.parametrize("disconnect", [BrokenPipeError, ConnectionResetError, ConnectionAbortedError])
+@pytest.mark.parametrize("disconnect", [BrokenPipeError, ConnectionResetError, ConnectionAbortedError, TimeoutError])
 def test_streaming_stops_cleanly_when_browser_closes_connection(
     tmp_path: Path, disconnect: type[OSError]
 ) -> None:
@@ -1048,6 +1048,7 @@ def test_streaming_stops_cleanly_when_browser_closes_connection(
     )
     webapp_mod.MRFRequestHandler._serve_file(handler, video)
     writer.write.assert_called_once()
+    assert handler.close_connection is True
 
 
 def test_http_artifact_supports_range(tmp_path: Path) -> None:
@@ -1576,11 +1577,11 @@ def test_import_can_retry_when_manifest_save_fails(tmp_path: Path, monkeypatch: 
     assert svc.import_video("retry", "source.mp4", 4, io.BytesIO(b"data"))["has_source_video"]
 
 
-def test_create_job_stores_copyright_bypass_setting(tmp_path: Path) -> None:
+def test_create_job_stores_visual_variety_setting(tmp_path: Path) -> None:
     svc = JobsService(tmp_path)
-    svc.create_job({"job_id": "bypass-test", "copyright_bypass": "balanced"})
-    manifest = pipeline.load_manifest(tmp_path / "bypass-test")
-    assert manifest.config.copyright_bypass == "balanced"
+    svc.create_job({"job_id": "variety-test", "visual_variety": "balanced"})
+    manifest = pipeline.load_manifest(tmp_path / "variety-test")
+    assert manifest.config.visual_variety == "balanced"
 
 
 def test_probe_link_and_download_link_video(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

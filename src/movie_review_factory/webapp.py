@@ -38,7 +38,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 
-from . import analytics, audio_mix, branding, cancellation, content_scout, copyright_bypass, creative_brief, editor_ops, hook_crafter, licensing, link_download, localization, mask_detection, midroll, pipeline, propainter_setup, semantic_search, tts_providers, versions
+from . import analytics, audio_mix, branding, cancellation, content_scout, creative_brief, editor_ops, hook_crafter, licensing, link_download, localization, mask_detection, midroll, narration_style, pipeline, propainter_setup, semantic_search, tts_providers, versions, visual_variety
 from .content_agent import _terminate_process_tree
 from .media_store import MediaStore
 from .creator_library import CreatorLibrary
@@ -1375,7 +1375,7 @@ class JobsService:
             brand_top_band=float(_with_default("brand_top_band", 0)),
             brand_bottom_band=float(_with_default("brand_bottom_band", 0)),
             watermark_removal=watermark_removal,
-            copyright_bypass=str(_with_default("copyright_bypass", "off")),
+            visual_variety=str(_with_default("visual_variety", "off")),
             tts_provider=str(_with_default("tts_provider", "edge")),
             tts_voice=str(_with_default("tts_voice", "")).strip(),
         )
@@ -1390,7 +1390,7 @@ class JobsService:
         if not isinstance(payload, dict):
             raise ValueError("cấu hình dự án phải là một object JSON")
         allowed = {
-            "movie_title", "content_agent", "copyright_bypass", "watermark_removal",
+            "movie_title", "content_agent", "visual_variety", "watermark_removal",
             "tts_provider", "tts_voice", "target_minutes", "aspect_ratio",
         }
         unknown = set(payload) - allowed
@@ -1407,8 +1407,8 @@ class JobsService:
             updates["movie_title"] = title or None
         if "content_agent" in updates and updates["content_agent"] not in CONTENT_AGENT_MODES:
             raise ValueError(f"content_agent phải là {' hoặc '.join(CONTENT_AGENT_MODES)}")
-        if "copyright_bypass" in updates and updates["copyright_bypass"] not in copyright_bypass.PROFILES:
-            raise ValueError("copyright_bypass phải là off, light, balanced, hoặc aggressive")
+        if "visual_variety" in updates and updates["visual_variety"] not in visual_variety.PROFILES:
+            raise ValueError("visual_variety phải là off, light, balanced, hoặc aggressive")
         if "tts_provider" in updates and updates["tts_provider"] not in tts_providers.SUPPORTED_PROVIDERS:
             raise ValueError("tts_provider không được hỗ trợ")
         if "tts_voice" in updates:
@@ -2144,7 +2144,7 @@ class JobsService:
         manifest = pipeline.load_manifest(root)
         channel_name = branding.load_settings(self.jobs_root)["name"]
         movie_title = (manifest.config.movie_title or job_id or "").strip()
-        headlines = self._auto_thumbnail_headlines(root, movie_title)
+        headlines = self._auto_thumbnail_headlines(root, movie_title, language=manifest.config.language)
         return render_thumbnail_variants(
             root,
             headline=headlines[0],
@@ -2153,7 +2153,7 @@ class JobsService:
             force_cover=True,
         )
 
-    def _auto_thumbnail_headlines(self, root, movie_title: str) -> list[str]:
+    def _auto_thumbnail_headlines(self, root, movie_title: str, language: str = "vi") -> list[str]:
         """Three legible headlines for the auto thumbnails.
 
         Tries the AGY pool first; on any AGY failure (offline pool, quota, bad
@@ -2164,7 +2164,7 @@ class JobsService:
         from .agy_agent import run_agy_json
         from .content_agent import ContentAgentError
 
-        fallback = self._fallback_thumbnail_headlines(movie_title)
+        fallback = self._fallback_thumbnail_headlines(movie_title, language)
         script = self._read_json(root, "script.json")
         thesis = ""
         if isinstance(script, dict):
@@ -2177,14 +2177,24 @@ class JobsService:
             "required": ["headlines"],
             "additionalProperties": False,
         }
-        prompt = (
-            "Bạn viết tiêu đề ảnh bìa YouTube tiếng Việt cho video review phim "
-            f"'{movie_title or 'phim này'}'. Trả về đúng 3 tiêu đề giật gân, IN HOA, "
-            "mỗi tiêu đề tối đa 38 ký tự để không tràn khung: câu 1 gợi tò mò, "
-            "câu 2 tiết lộ cú twist sốc, câu 3 nhấn kịch tính sinh tử. "
-            f"Bối cảnh mở đầu: '{thesis}'. Không bịa tình tiết, không dùng dấu ngoặc kép. "
-            "Trả JSON đúng schema."
-        )
+        if narration_style.is_vietnamese(language):
+            prompt = (
+                "Bạn viết tiêu đề ảnh bìa YouTube tiếng Việt cho video review phim "
+                f"'{movie_title or 'phim này'}'. Trả về đúng 3 tiêu đề giật gân, IN HOA, "
+                "mỗi tiêu đề tối đa 38 ký tự để không tràn khung: câu 1 gợi tò mò, "
+                "câu 2 tiết lộ cú twist sốc, câu 3 nhấn kịch tính sinh tử. "
+                f"Bối cảnh mở đầu: '{thesis}'. Không bịa tình tiết, không dùng dấu ngoặc kép. "
+                "Trả JSON đúng schema."
+            )
+        else:
+            prompt = (
+                f"Write YouTube thumbnail text in {narration_style.language_name(language)} for a movie "
+                f"recap of '{movie_title or 'this movie'}'. Return exactly 3 ALL-CAPS headlines, "
+                "each at most 4 words and 28 characters so it reads on a phone: 1 sparks curiosity, "
+                "2 teases the twist without spoiling it, 3 raises the stakes. "
+                f"Opening context: '{thesis}'. Do not invent plot points, no quotation marks, "
+                "no clickbait the video cannot pay off. Return JSON matching the schema."
+            )
         try:
             result = run_agy_json(stage="thumbnail", prompt=prompt, schema=schema)
         except ContentAgentError:
@@ -2215,19 +2225,29 @@ class JobsService:
         return ""
 
     @staticmethod
-    def _fallback_thumbnail_headlines(movie_title: str) -> list[str]:
+    def _fallback_thumbnail_headlines(movie_title: str, language: str = "vi") -> list[str]:
         """Rule-based headlines used when the AGY pool is unavailable."""
-        title = (movie_title or "").strip().upper() or "PHIM NÀY"
-        templates = [
-            f"{title}: SỰ THẬT KINH HOÀNG",
-            f"BÍ MẬT ĐẰNG SAU {title}",
-            f"CÁI KẾT BẤT NGỜ CỦA {title}",
-        ]
+        if narration_style.is_vietnamese(language):
+            default = "PHIM NÀY"
+            title = (movie_title or "").strip().upper() or default
+            templates = [
+                f"{title}: SỰ THẬT KINH HOÀNG",
+                f"BÍ MẬT ĐẰNG SAU {title}",
+                f"CÁI KẾT BẤT NGỜ CỦA {title}",
+            ]
+        else:
+            default = "THIS MOVIE"
+            title = (movie_title or "").strip().upper() or default
+            templates = [
+                f"{title}: THE DARK TRUTH",
+                f"THE SECRET BEHIND {title}",
+                f"{title} ENDING EXPLAINED",
+            ]
         headlines: list[str] = []
         for template in templates:
             text = JobsService._fit_thumbnail_headline(template)
             if not text:
-                text = JobsService._fit_thumbnail_headline(title) or "PHIM NÀY"
+                text = JobsService._fit_thumbnail_headline(title) or default
             headlines.append(text)
         return headlines
 
@@ -2281,13 +2301,24 @@ class JobsService:
         brand_name = branding.load_settings(self.jobs_root)["name"]
         previous = script["sections"][midpoint - 1]["title"]
         following = script["sections"][midpoint]["title"]
-        prompt = (
-            "Viết một lời thoại CTA bằng tiếng Việt, 25–40 từ, một hoặc hai câu, "
-            "hài hước tự nhiên theo chi tiết của phim. Nhắc bấm thích và đăng ký "
-            f"kênh {brand_name} để không bỏ lỡ phần tiếp theo. Chèn ở 50% video giữa "
-            f"'{previous}' và '{following}' của '{manifest.config.movie_title}'. "
-            "Không bịa sự kiện, không lặp nguyên văn thoại phim. Trả JSON đúng schema."
-        )
+        if narration_style.is_vietnamese(manifest.config.language):
+            prompt = (
+                "Viết một lời thoại CTA bằng tiếng Việt, 25–40 từ, một hoặc hai câu, "
+                "hài hước tự nhiên theo chi tiết của phim. Nhắc bấm thích và đăng ký "
+                f"kênh {brand_name} để không bỏ lỡ phần tiếp theo. Chèn ở 50% video giữa "
+                f"'{previous}' và '{following}' của '{manifest.config.movie_title}'. "
+                "Không bịa sự kiện, không lặp nguyên văn thoại phim. Trả JSON đúng schema."
+            )
+        else:
+            prompt = (
+                f"Write one spoken call-to-action line in "
+                f"{narration_style.language_name(manifest.config.language)}, 25-40 words, "
+                "one or two sentences, with light humor tied to a detail of the movie. Ask viewers "
+                f"to like and subscribe to {brand_name} so they don't miss what comes next. It plays "
+                f"at the 50% mark between '{previous}' and '{following}' of "
+                f"'{manifest.config.movie_title}'. Do not invent events or quote dialogue verbatim; "
+                "never say 'smash that like button'. Return JSON matching the schema."
+            )
         result = run_agy_json(stage="midroll", prompt=prompt, schema=schema)
         line = str(result.get("line") or "").strip()
         render = self._read_json(root, "render.json")
@@ -2511,7 +2542,7 @@ class JobsService:
                 "job_id": unique_job_id,
                 "movie_title": title,
                 "content_agent": payload.get("content_agent") or "agy",
-                "copyright_bypass": payload.get("copyright_bypass") or defaults.get("copyright_bypass") or "balanced",
+                "visual_variety": payload.get("visual_variety") or defaults.get("visual_variety") or "balanced",
                 "tts_provider": payload.get("tts_provider") or defaults.get("tts_provider") or "edge",
                 "tts_voice": payload.get("tts_voice") if payload.get("tts_voice") is not None else defaults.get("tts_voice", ""),
             }
@@ -2707,8 +2738,10 @@ class MRFRequestHandler(BaseHTTPRequestHandler):
                     break
                 try:
                     self.wfile.write(chunk)
-                except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
-                    return  # Browser stopped reading after a seek or navigation.
+                except (ConnectionError, TimeoutError):
+                    # Browser stopped reading (seek, navigation, paused buffer); the socket is unusable.
+                    self.close_connection = True
+                    return
                 remaining -= len(chunk)
 
     # -- auth ----------------------------------------------------------------
@@ -4033,8 +4066,8 @@ INDEX_HTML = """<!DOCTYPE html>
             <input name="target_minutes" type="number" value="10" min="1" max="60" step="0.5">
             <label>Tỷ lệ khung hình</label>
             <select name="aspect_ratio"><option>16:9</option><option>9:16</option></select>
-            <label>Bảo vệ bản quyền (Bypass Content ID)</label>
-            <select name="copyright_bypass">
+            <label>Biến đổi hình ảnh clip</label>
+            <select name="visual_variety">
               <option value="off">Tắt</option>
               <option value="light">Nhẹ (Zoom 3%, chỉnh màu)</option>
               <option value="balanced" selected>Cân bằng (Lật ngang, Zoom 5%, chỉnh màu)</option>
@@ -4142,7 +4175,7 @@ INDEX_HTML = """<!DOCTYPE html>
       <div class="dialog-header">
         <div>
           <h2 id="channelDialogTitle">Kênh (hồ sơ đa kênh)</h2>
-          <p>Lưu sẵn logo, giọng, intro/outro và mức né bản quyền cho từng kênh. Kích hoạt 1 chạm để đổi nhận diện cho các video dựng tiếp theo.</p>
+          <p>Lưu sẵn logo, giọng, intro/outro và mức biến đổi hình ảnh cho từng kênh. Kích hoạt 1 chạm để đổi nhận diện cho các video dựng tiếp theo.</p>
         </div>
         <button id="closeChannelSwitcher" class="dialog-close" type="button" aria-label="Đóng">×</button>
       </div>
@@ -4182,7 +4215,7 @@ INDEX_HTML = """<!DOCTYPE html>
             <div><label for="chIntro">Intro (giây, 0–15)</label><input id="chIntro" type="number" min="0" max="15" step="0.5" value="0"></div>
             <div><label for="chOutro">Outro (giây, 0–15)</label><input id="chOutro" type="number" min="0" max="15" step="0.5" value="0"></div>
           </div>
-          <label for="chCopyright">Bảo vệ bản quyền (Bypass Content ID)</label>
+          <label for="chCopyright">Biến đổi hình ảnh clip</label>
           <select id="chCopyright">
             <option value="off">Tắt</option>
             <option value="light">Nhẹ</option>
@@ -4322,7 +4355,7 @@ INDEX_HTML = """<!DOCTYPE html>
         <label for="scoutWatermarkDetect">Phương pháp nhận diện</label><select id="scoutWatermarkDetect"><option value="color">Theo màu sắc</option><option value="temporal">Theo thời gian</option></select>
         <label for="scoutWatermarkMethod">Cách xoá watermark</label><select id="scoutWatermarkMethod" class="wm-method"><option value="propainter">ProPainter</option></select><p class="muted wm-method-help"></p>
         <label for="scoutContentAgent">Bộ tạo nội dung</label><select id="scoutContentAgent"><option value="agy">Nhóm AGY</option><option value="claude">Claude Code</option><option value="scaffold">Mẫu thử</option></select>
-        <label for="scoutCopyright">Bảo vệ bản quyền</label><select id="scoutCopyright"><option value="balanced">Cân bằng (khuyên dùng)</option><option value="aggressive">Mạnh</option><option value="light">Nhẹ</option><option value="off">Tắt</option></select>
+        <label for="scoutCopyright">Biến đổi hình ảnh clip</label><select id="scoutCopyright"><option value="balanced">Cân bằng (khuyên dùng)</option><option value="aggressive">Mạnh</option><option value="light">Nhẹ</option><option value="off">Tắt</option></select>
         <label for="scoutTtsProvider">Giọng đọc</label><select id="scoutTtsProvider"><option value="edge">Edge</option><option value="vieneu">VieNeu</option><option value="fptai">FPT.AI</option><option value="elevenlabs">ElevenLabs</option></select>
         <label for="scoutTtsVoice">Voice</label><input id="scoutTtsVoice" list="ttsVoiceSuggestions" maxlength="120" placeholder="Mặc định của provider"><datalist id="ttsVoiceSuggestions"><option value="banmai"><option value="vi-VN-HoaiMyNeural"><option value="vi-VN-NamMinhNeural"></datalist>
         <div class="row" style="margin-top:14px"><button type="button" id="cancelScoutConfig">Huỷ</button><button class="primary" type="submit">🚀 Khởi tạo dự án</button></div><div id="scoutConfigMsg" class="notice" role="status"></div>
@@ -4336,7 +4369,7 @@ INDEX_HTML = """<!DOCTYPE html>
         <label for="projectWatermarkDetect">Phương pháp</label><select id="projectWatermarkDetect"><option value="color">Color</option><option value="temporal">Temporal</option><option value="external">External</option></select>
         <label for="projectWatermarkMethod">Cách xoá watermark</label><select id="projectWatermarkMethod" class="wm-method"><option value="propainter">ProPainter</option></select><p class="muted wm-method-help"></p>
         <label for="projectContentAgent">Bộ tạo nội dung</label><select id="projectContentAgent"><option value="agy">AGY Pool</option><option value="claude">Claude Code</option><option value="scaffold">Mẫu thử</option></select>
-        <label for="projectCopyright">Bảo vệ bản quyền</label><select id="projectCopyright"><option value="balanced">Cân bằng</option><option value="aggressive">Mạnh</option><option value="light">Nhẹ</option><option value="off">Tắt</option></select>
+        <label for="projectCopyright">Biến đổi hình ảnh clip</label><select id="projectCopyright"><option value="balanced">Cân bằng</option><option value="aggressive">Mạnh</option><option value="light">Nhẹ</option><option value="off">Tắt</option></select>
         <label for="projectTtsProvider">TTS provider</label><select id="projectTtsProvider"><option value="edge">Edge</option><option value="vieneu">VieNeu</option><option value="fptai">FPT.AI</option><option value="elevenlabs">ElevenLabs</option></select>
         <label for="projectTtsVoice">Voice</label><input id="projectTtsVoice" maxlength="120">
         <div class="row" style="margin-top:14px"><button type="button" id="cancelProjectConfig">Huỷ</button><button id="saveProjectConfig" class="primary" type="submit">Lưu thiết lập</button></div><div id="projectConfigMsg" class="notice" role="status"></div>
@@ -4577,6 +4610,7 @@ INDEX_HTML = """<!DOCTYPE html>
             <div id="mediaMsg" class="sr-only" aria-live="polite"></div>
           </div>
         </div>
+      </section>
       </section>
       <section id="view-edit" class="workspace-view" role="tabpanel" aria-labelledby="tab-edit" hidden>
       <details class="card" id="audioPanel">
@@ -6285,7 +6319,7 @@ function fillChannelForm(ch) {
   _chSet('chLanguage', (ch && ch.language) || 'vi');
   _chSet('chIntro', ch ? ch.intro_seconds : 0);
   _chSet('chOutro', ch ? ch.outro_seconds : 0);
-  _chSet('chCopyright', (ch && ch.copyright_bypass) || 'off');
+  _chSet('chCopyright', (ch && ch.visual_variety) || 'off');
   _chSet('chTopBand', ch ? ch.brand_top_band : 0);
   _chSet('chBottomBand', ch ? ch.brand_bottom_band : 0);
   $('chLogoPreview').src = (ch && ch.id && ch.has_logo)
@@ -6337,7 +6371,7 @@ function _channelPayload() {
     language: $('chLanguage').value.trim() || 'vi',
     intro_seconds: Number($('chIntro').value) || 0,
     outro_seconds: Number($('chOutro').value) || 0,
-    copyright_bypass: $('chCopyright').value,
+    visual_variety: $('chCopyright').value,
     brand_top_band: Number($('chTopBand').value) || 0,
     brand_bottom_band: Number($('chBottomBand').value) || 0,
   };
@@ -6395,7 +6429,7 @@ async function prefillCreateFromChannel() {
     put('aspect_ratio', active.aspect_ratio);
     put('tts_provider', active.tts_provider);
     put('tts_voice', active.tts_voice);
-    put('copyright_bypass', active.copyright_bypass);
+    put('visual_variety', active.visual_variety);
     put('brand_top_band', active.brand_top_band);
     put('brand_bottom_band', active.brand_bottom_band);
   } catch (error) { /* best-effort prefill */ }
@@ -7427,6 +7461,25 @@ loadCreatorSeries().catch(error => { $('seriesMsg').textContent = error.message;
 
 // --- Content Scout Engine (Săn phim tự động) ---
 let _scoutLoaded = false;
+// Curated and AGY-localized cards already carry a real Vietnamese film title.
+// Unlocalized live finds only have a generic genre label, so lead with the
+// real upload title (minus "| Full Movie | cast" noise) instead.
+function scoutIsUnlocalizedLive(gem) {
+  return /^(yt-live-|bili-)/.test(gem.id || '') && gem.localized !== 'agy';
+}
+function scoutDisplayTitle(gem) {
+  if (!scoutIsUnlocalizedLive(gem)) return gem.vietnamese_title || gem.title || '';
+  const raw = String(gem.title || '').replace(/\\s+/g, ' ').trim();
+  const head = raw.split(/\\s+[|｜]\\s+/)[0]
+    .replace(/\\s*[-–—:]?\\s*\\b(full(\\s+length)?\\s+(movie|film))\\b.*$/i, '').trim();
+  return head || raw || gem.vietnamese_title || '';
+}
+function scoutSourceExcerpt(gem) {
+  if (!scoutIsUnlocalizedLive(gem)) return '';
+  const text = String(gem.summary || '').replace(/\\s+/g, ' ').trim();
+  if (!text || text === String(gem.title || '').trim()) return '';
+  return text.length > 220 ? text.slice(0, 217).trimEnd() + '…' : text;
+}
 function escapeScoutHtml(str) {
   return String(str || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }
@@ -7490,12 +7543,15 @@ async function loadScoutGems(forceRefresh) {
       const healthIcon = isLive ? '🟢' : '⚠️';
       const durationText = gem.duration_minutes ? (gem.duration_minutes + ' phút') : 'Chưa rõ';
       const fallbackUrl = gem.fallback_url || ('https://www.youtube.com/results?search_query=' + encodeURIComponent((gem.title || '') + ' full movie'));
+      const displayTitle = scoutDisplayTitle(gem);
+      const hookLabel = scoutIsUnlocalizedLive(gem) && gem.vietnamese_title !== displayTitle ? gem.vietnamese_title : '';
+      const sourceExcerpt = scoutSourceExcerpt(gem);
 
       card.innerHTML = `
         <div>
           ${posterUrl ? `
           <div class="scout-poster-box" style="position:relative; width:100%; height:150px; border-radius:6px; overflow:hidden; background:var(--field-bg); margin-bottom:10px; display:flex; align-items:center; justify-content:center">
-            <img referrerpolicy="no-referrer" src="${escapeScoutHtml(posterUrl)}" alt="${escapeScoutHtml(gem.vietnamese_title)}" style="width:100%; height:100%; object-fit:cover" onerror="this.style.display='none'; if(this.nextElementSibling) this.nextElementSibling.style.display='flex'">
+            <img referrerpolicy="no-referrer" src="${escapeScoutHtml(posterUrl)}" alt="${escapeScoutHtml(displayTitle)}" style="width:100%; height:100%; object-fit:cover" onerror="this.style.display='none'; if(this.nextElementSibling) this.nextElementSibling.style.display='flex'">
             <div class="scout-poster-placeholder" style="display:none; width:100%; height:100%; align-items:center; justify-content:center; font-size:2rem; color:var(--text-muted); background:var(--field-bg)">🎬</div>
           </div>
           ` : `
@@ -7509,9 +7565,11 @@ async function loadScoutGems(forceRefresh) {
             </div>
             <span class="badge scout-viral-badge" style="font-size:0.85rem; font-weight:800; color:#d97706; background:rgba(245,158,11,0.15); padding:2px 8px; border-radius:12px">🔥 Tiềm năng lan truyền: ${scoreFormatted}</span>
           </div>
-          <h3 style="margin:4px 0 2px 0; font-size:1.05rem; line-height:1.3; color:var(--text)">${escapeScoutHtml(gem.vietnamese_title)}</h3>
+          <h3 class="scout-title" style="margin:4px 0 2px 0; font-size:1.05rem; line-height:1.3; color:var(--text)" title="${escapeScoutHtml(gem.title)}">${escapeScoutHtml(displayTitle)}</h3>
+          ${hookLabel ? `<div class="scout-hook" style="font-size:0.8rem; font-weight:700; color:var(--accent, #d97706); margin-bottom:2px">${escapeScoutHtml(hookLabel)}</div>` : ''}
           <div style="font-size:0.8rem; font-weight:600; color:var(--text-muted); margin-bottom:8px">${gem.release_year} · ${escapeScoutHtml(gem.country)} · ★ ${gem.rating}/10 (${gem.vote_count.toLocaleString()} lượt bình chọn)</div>
           ${gem.vietnamese_summary ? `<div style="font-size:0.83rem; line-height:1.4; color:var(--text-dim, var(--text)); margin-bottom:12px">${escapeScoutHtml(gem.vietnamese_summary)}</div>` : ''}
+          ${sourceExcerpt ? `<div class="scout-source-excerpt" style="font-size:0.8rem; line-height:1.4; color:var(--text-muted); margin-bottom:12px"><strong>Mô tả gốc:</strong> ${escapeScoutHtml(sourceExcerpt)}</div>` : ''}
           <div style="display:flex; flex-wrap:wrap; gap:6px; margin-bottom:12px">
             <span style="font-size:0.75rem; font-weight:600; padding:2px 6px; border-radius:4px; background:rgba(16,185,129,0.15); color:#059669">Điểm kịch tính: ${gem.story_twist_index}</span>
             <span style="font-size:0.75rem; font-weight:600; padding:2px 6px; border-radius:4px; background:rgba(99,102,241,0.15); color:#6366f1">Độ phủ VN: ${gem.popularity_index}</span>
@@ -7545,7 +7603,7 @@ async function loadScoutGems(forceRefresh) {
 }
 function enqueueScoutGem(gem) {
   pendingScoutGem = gem;
-  $('scoutMovieTitle').value = gem.vietnamese_title || gem.title || '';
+  $('scoutMovieTitle').value = scoutDisplayTitle(gem);
   $('scoutWatermarkEnabled').checked = true;
   $('scoutWatermarkDetect').value = 'color';
   setWatermarkMethod('scoutWatermarkMethod', 'propainter');
@@ -7566,7 +7624,7 @@ $('scoutConfigForm').onsubmit = async event => {
       candidate_id: gem.id, auto_create: true, movie_title: $('scoutMovieTitle').value.trim(),
       watermark_enabled: $('scoutWatermarkEnabled').checked, watermark_detect: $('scoutWatermarkDetect').value,
       watermark_method: $('scoutWatermarkMethod').value,
-      content_agent: $('scoutContentAgent').value, copyright_bypass: $('scoutCopyright').value,
+      content_agent: $('scoutContentAgent').value, visual_variety: $('scoutCopyright').value,
       tts_provider: $('scoutTtsProvider').value, tts_voice: $('scoutTtsVoice').value.trim(),
     });
     $('scoutConfigDialog').close(); closeToolDialog('scoutPanel'); await loadJobs();
@@ -7588,7 +7646,7 @@ function renderProjectConfig(status) {
   const tags = $('projectConfigTags'); tags.replaceChildren(
     configTag('🎬 Phim: ' + (cfg.movie_title || 'chưa đặt')),
     configTag('🤖 Kịch bản: ' + (cfg.content_agent || 'scaffold')),
-    configTag('🛡️ Bản quyền: ' + (cfg.copyright_bypass || 'off')),
+    configTag('🎞️ Biến đổi hình ảnh: ' + (cfg.visual_variety || 'off')),
     configTag('🎙️ Giọng: ' + (cfg.tts_provider || 'edge') + ' (' + (cfg.tts_voice || 'mặc định') + ')'),
     configTag('🧼 Xoá watermark: ' + (wm.enabled ? 'Bật (' + watermarkMethodInfo(wm.method).label + ' · ' + (detect.method || 'color') + ')' : 'Tắt'))
   );
@@ -7597,7 +7655,7 @@ function renderProjectConfig(status) {
 $('editProjectConfig').onclick = () => {
   const cfg = (currentStatus && currentStatus.config) || {}; const wm = cfg.watermark_removal || {}; const detect = wm.detect || {};
   $('projectMovieTitle').value = cfg.movie_title || ''; $('projectContentAgent').value = cfg.content_agent || 'scaffold';
-  $('projectCopyright').value = cfg.copyright_bypass || 'off'; $('projectTtsProvider').value = cfg.tts_provider || 'edge';
+  $('projectCopyright').value = cfg.visual_variety || 'off'; $('projectTtsProvider').value = cfg.tts_provider || 'edge';
   $('projectTtsVoice').value = cfg.tts_voice || ''; $('projectWatermarkEnabled').checked = !!wm.enabled; $('projectWatermarkDetect').value = detect.method || 'color';
   setWatermarkMethod('projectWatermarkMethod', wm.method);
   $('projectConfigMsg').textContent = ''; $('projectConfigDialog').showModal();
@@ -7608,7 +7666,7 @@ $('projectConfigForm').onsubmit = async event => {
   try {
     const result = await api('POST', '/api/jobs/' + encodeURIComponent(current) + '/config', {
       movie_title: $('projectMovieTitle').value.trim(), content_agent: $('projectContentAgent').value,
-      copyright_bypass: $('projectCopyright').value, tts_provider: $('projectTtsProvider').value,
+      visual_variety: $('projectCopyright').value, tts_provider: $('projectTtsProvider').value,
       tts_voice: $('projectTtsVoice').value.trim(), watermark_removal: {
         enabled: $('projectWatermarkEnabled').checked, method: $('projectWatermarkMethod').value,
         detect: {method: $('projectWatermarkDetect').value}

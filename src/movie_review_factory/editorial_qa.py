@@ -93,8 +93,14 @@ def clip_checks(plan: dict, render: dict) -> list[dict]:
         elif render:
             mismatch.append(position + 1)
         target = _number(clip.get("duration_seconds"))
-        if target is not None and target > (end - start) * 1.5 and target - (end - start) > 3:
-            loops.append({"clip": position + 1, "source_seconds": round(end - start, 2),
+        window = end - start
+        rendered = used[position] if position < len(used) and isinstance(used[position], dict) else {}
+        read = _number(rendered.get("read_seconds"))
+        if read is not None:
+            window = read
+            target = _number(rendered.get("duration_seconds"))
+        if target is not None and target > window * 1.5 and target - window > 3:
+            loops.append({"clip": position + 1, "source_seconds": round(window, 2),
                           "timeline_seconds": round(target, 2)})
         if end - start < 3:
             history.append((position + 1, start, end))

@@ -1481,14 +1481,14 @@ def test_render_ken_burns_adds_zoompan_when_enabled(
     assert "zoompan=" in filter_complex
 
 
-def test_render_copyright_bypass_adds_filters_when_enabled(
+def test_render_visual_variety_adds_filters_when_enabled(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _render_job(tmp_path)
     import movie_review_factory.pipeline as pipeline
 
     manifest = load_manifest(tmp_path)
-    manifest.config.copyright_bypass = "balanced"
+    manifest.config.visual_variety = "balanced"
     pipeline.save_manifest(tmp_path, manifest)
 
     monkeypatch.setattr(pipeline, "_probe_duration_seconds", lambda path: _render_duration(path, tmp_path))
@@ -1703,7 +1703,8 @@ def test_render_bookends_body_with_branded_intro_outro_cards(
     assert "asplit=2[aenc][aqa]" not in filter_complex
     map_indices = [i for i, tok in enumerate(command) if tok == "-map"]
     assert command[map_indices[0] + 1] == "[showv]"
-    assert command[map_indices[1] + 1] == "[showa]"
+    assert command[map_indices[1] + 1] == "[loudnorm]"
+    assert "[showa]loudnorm=" in filter_complex
     # Hard duration cap covers body + intro + outro.
     assert f"{7.0:.6f}" in command
     render = json.loads((tmp_path / "render.json").read_text(encoding="utf-8"))
@@ -1804,7 +1805,8 @@ def test_render_uses_authorized_music_mix_only_when_configured(
     # that consumed it via asplit was removed to fix the render OOM.
     assert "asplit=2[aenc][aqa]" not in filter_complex
     map_indices = [i for i, tok in enumerate(command) if tok == "-map"]
-    assert command[map_indices[1] + 1] == "[audio]"
+    assert command[map_indices[1] + 1] == "[loudnorm]"
+    assert "[audio]loudnorm=" in filter_complex
     assert "sidechaincompress" in filter_complex
     render = json.loads((tmp_path / "render.json").read_text(encoding="utf-8"))
     assert render["audio_mix"]["provenance"][0]["rights_note"] == "licensed by creator"
@@ -1837,12 +1839,80 @@ def test_render_loops_short_source_to_cover_clip_duration(
     pipeline._render(tmp_path, load_manifest(tmp_path))
 
     filter_complex = commands[0][commands[0].index("-filter_complex") + 1]
-    # 2s source at 25 fps = 50 frames; 14 extra loops -> 15 * 2s = 30s, trimmed exact.
-    assert "loop=loop=14:size=50:start=0" in filter_complex
+    # The 2s clip grows into the free rest of the 10s source; the shortfall loops: 250 frames, 2 extra loops -> 30s.
+    _ss = commands[0].index("-ss")
+    assert commands[0][_ss:_ss + 4] == ["-ss", "0.000000", "-t", "10.000000"]
+    assert "loop=loop=2:size=250:start=0" in filter_complex
     assert "trim=end=30.000000" in filter_complex
     doc = json.loads((tmp_path / "render.json").read_text(encoding="utf-8"))
     assert doc["clips"][0]["source_seconds"] == 2.0
+    assert doc["clips"][0]["read_seconds"] == 10.0
     assert doc["clips"][0]["duration_seconds"] == 30.0
+
+
+def test_extend_short_ranges_uses_free_neighbouring_footage_only() -> None:
+    from movie_review_factory.pipeline import _extend_short_ranges
+
+    ranges = [
+        {"index": 0, "start_seconds": 10.0, "end_seconds": 12.0, "duration_seconds": 6.0},
+        {"index": 1, "start_seconds": 14.0, "end_seconds": 20.0, "duration_seconds": 6.0},
+        {"index": 2, "start_seconds": 21.0, "end_seconds": 22.0, "duration_seconds": 4.0},
+    ]
+    _extend_short_ranges(ranges, 23.0)
+
+    # Clip 0 takes the 2s gap before clip 1, then 2s backwards.
+    assert (ranges[0]["read_start_seconds"], ranges[0]["read_seconds"]) == (8.0, 6.0)
+    # Clip 1 already fills its slot, so it keeps its planned range.
+    assert "read_seconds" not in ranges[1]
+    # Clip 2 gets 1s up to the source end and the 1s gap after clip 1.
+    assert (ranges[2]["read_start_seconds"], ranges[2]["read_seconds"]) == (20.0, 3.0)
+
+
+def test_render_normalizes_loudness_for_youtube(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _render_job(tmp_path)
+    import movie_review_factory.pipeline as pipeline
+
+    commands: list[list[str]] = []
+    monkeypatch.setattr(pipeline, "_probe_duration_seconds", lambda path: _render_duration(path, tmp_path))
+    monkeypatch.setattr(pipeline.shutil, "which", lambda name: f"/{name}")
+
+    def fake_run(command: list[str], **kwargs: object) -> object:
+        commands.append(command)
+        (tmp_path / "final.rendering.mp4").write_bytes(b"fake-mp4")
+        return object()
+
+    monkeypatch.setattr(pipeline.subprocess, "run", fake_run)
+    pipeline._render(tmp_path, load_manifest(tmp_path))
+
+    command = commands[0]
+    filter_complex = command[command.index("-filter_complex") + 1]
+    assert "[1:a:0]loudnorm=I=-14:TP=-1.5:LRA=11,aresample=48000[loudnorm]" in filter_complex
+    map_targets = [command[i + 1] for i, tok in enumerate(command) if tok == "-map"]
+    assert map_targets[1] == "[loudnorm]"
+
+
+def test_render_removes_stale_pre_midroll_video(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _render_job(tmp_path)
+    import movie_review_factory.pipeline as pipeline
+
+    (tmp_path / "final.pre-midroll.mp4").write_bytes(b"old-captions")
+    (tmp_path / "script.pre-midroll.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(pipeline, "_probe_duration_seconds", lambda path: _render_duration(path, tmp_path))
+    monkeypatch.setattr(pipeline.shutil, "which", lambda name: f"/{name}")
+
+    def fake_run(command: list[str], **kwargs: object) -> object:
+        (tmp_path / "final.rendering.mp4").write_bytes(b"fake-mp4")
+        return object()
+
+    monkeypatch.setattr(pipeline.subprocess, "run", fake_run)
+    pipeline._render(tmp_path, load_manifest(tmp_path))
+
+    assert not (tmp_path / "final.pre-midroll.mp4").exists()
+    assert (tmp_path / "script.pre-midroll.json").exists()
 
 
 def test_render_trims_long_source_to_exact_shot_duration(
@@ -3530,3 +3600,19 @@ def test_run_index_honours_cancellation(tmp_path: Path, monkeypatch) -> None:
         summary = pipeline.run_index(tmp_path)
 
     assert summary["cancelled"] is True
+
+
+def test_scene_memory_accepts_index_built_from_watermark_clean_source(tmp_path: Path) -> None:
+    import movie_review_factory.pipeline as pipeline
+
+    source = tmp_path / "source.mp4"
+    clean = tmp_path / "source_clean.mp4"
+    source.write_bytes(b"raw")
+    clean.write_bytes(b"clean")
+    cfg = JobConfig(job_id="clean-job", source_video=str(source), content_agent="agy")
+
+    for indexed in (clean, source):
+        summary = pipeline.index_scene_memory(tmp_path, cfg, {"source_video": str(indexed)}, [])
+        assert isinstance(summary, dict)
+    with pytest.raises(ValueError, match="different source video"):
+        pipeline.index_scene_memory(tmp_path, cfg, {"source_video": str(tmp_path / "other.mp4")}, [])

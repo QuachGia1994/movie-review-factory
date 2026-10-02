@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated, Literal, get_args
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import AliasChoices, BaseModel, Field, field_validator, model_validator
 
 StageStatus = Literal["pending", "running", "ready", "failed", "skipped", "cancelled"]
 ContentAgentMode = Literal["scaffold", "claude", "agy"]
@@ -13,6 +13,8 @@ CONTENT_AGENT_MODES = get_args(ContentAgentMode)
 # docs/watermark-removal.md "Choosing a removal method" explains the tradeoffs.
 WatermarkMethod = Literal["propainter", "delogo", "blur"]
 WATERMARK_METHODS = get_args(WatermarkMethod)
+# Manifests and channel profiles saved before the rename store this setting as "copyright_bypass".
+VISUAL_VARIETY_KEYS = AliasChoices("visual_variety", "copyright_bypass")
 
 
 class CreativeBrief(BaseModel):
@@ -78,8 +80,8 @@ class JobConfig(BaseModel):
     outro_seconds: float = Field(default=0, ge=0, le=15)
     # Optional full-frame watermark removal. Disabled by default.
     watermark_removal: WatermarkRemoval = Field(default_factory=WatermarkRemoval)
-    # Optional Content ID bypass profile: 'off', 'light', 'balanced', 'aggressive'.
-    copyright_bypass: str = Field(default="off", max_length=30)
+    # Per-clip visual variety profile: 'off', 'light', 'balanced', 'aggressive'.
+    visual_variety: str = Field(default="off", max_length=30, validation_alias=VISUAL_VARIETY_KEYS)
     # Optional TTS provider: 'edge' (default, free/offline), 'fptai', or 'elevenlabs'.
     # Provider API keys are read from env only (MRF_FPTAI_API_KEY /
     # MRF_ELEVENLABS_API_KEY) and are never persisted in the manifest.
@@ -108,7 +110,7 @@ class ChannelProfile(BaseModel):
     outro_seconds: float = Field(default=0, ge=0, le=15)
     brand_top_band: float = Field(default=0, ge=0, le=0.2)
     brand_bottom_band: float = Field(default=0, ge=0, le=0.2)
-    copyright_bypass: str = Field(default="off", max_length=30)
+    visual_variety: str = Field(default="off", max_length=30, validation_alias=VISUAL_VARIETY_KEYS)
 
     @field_validator("name")
     @classmethod

@@ -118,7 +118,7 @@ def test_create_job_prefills_unset_fields_from_active_channel(tmp_path):
     service = JobsService(jobs)
     service.save_channel({
         "id": "a", "name": "Kênh A", "tts_provider": "fptai", "tts_voice": "banmai",
-        "brand_top_band": 0.1, "intro_seconds": 2, "copyright_bypass": "aggressive",
+        "brand_top_band": 0.1, "intro_seconds": 2, "visual_variety": "aggressive",
     })
 
     service.create_job({"job_id": "vid1"})  # minimal payload inherits channel defaults
@@ -127,13 +127,13 @@ def test_create_job_prefills_unset_fields_from_active_channel(tmp_path):
     assert cfg.tts_voice == "banmai"
     assert cfg.brand_top_band == 0.1
     assert cfg.intro_seconds == 2
-    assert cfg.copyright_bypass == "aggressive"
+    assert cfg.visual_variety == "aggressive"
 
     # Explicit payload values override the channel default; unset fields still inherit.
-    service.create_job({"job_id": "vid2", "tts_provider": "edge", "copyright_bypass": "off"})
+    service.create_job({"job_id": "vid2", "tts_provider": "edge", "visual_variety": "off"})
     cfg2 = load_manifest(jobs / "vid2").config
     assert cfg2.tts_provider == "edge"
-    assert cfg2.copyright_bypass == "off"
+    assert cfg2.visual_variety == "off"
     assert cfg2.brand_top_band == 0.1
 
 

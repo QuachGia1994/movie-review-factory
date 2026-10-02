@@ -55,6 +55,9 @@ class CreatorLibrary:
             if not isinstance(data[key], dict):
                 raise ValueError("invalid creator library")
         data.setdefault("active_channel", None)
+        for record in data["channels"].values():
+            if isinstance(record, dict) and "copyright_bypass" in record:
+                record.setdefault("visual_variety", record.pop("copyright_bypass"))
         return data
 
     def _save(self, data: dict) -> None:
@@ -200,7 +203,7 @@ class CreatorLibrary:
     _CHANNEL_DEFAULT_FIELDS = (
         "language", "aspect_ratio", "tts_provider", "tts_voice",
         "intro_seconds", "outro_seconds", "brand_top_band",
-        "brand_bottom_band", "copyright_bypass",
+        "brand_bottom_band", "visual_variety",
     )
 
     def list_channels(self) -> dict:

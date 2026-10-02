@@ -14,3 +14,5 @@ import pytest
 @pytest.fixture(autouse=True)
 def _disable_auto_index(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("MRF_AUTO_INDEX", "0")
+    # Scout localization calls the AGY pool; tests opt in with a fake runner.
+    monkeypatch.setenv("MRF_SCOUT_LOCALIZE", "0")

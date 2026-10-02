@@ -1469,6 +1469,78 @@ def _all_source_quotas(limit: int) -> tuple[int, int, int]:
     return base + (1 if remainder > 0 else 0), base + (1 if remainder > 1 else 0), base
 
 
+_LIVE_ID_PREFIXES = ("yt-live-", "bili-")
+_LOCALIZE_BATCH = 20
+_LOCALIZE_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {"items": {"type": "array", "items": {
+        "type": "object",
+        "properties": {
+            "id": {"type": "string"},
+            "vietnamese_title": {"type": "string"},
+            "vietnamese_summary": {"type": "string"},
+        },
+        "required": ["id", "vietnamese_title", "vietnamese_summary"],
+    }}},
+    "required": ["items"],
+}
+
+
+def _default_localizer(prompt: str) -> dict[str, Any]:
+    from .agy_agent import run_agy_json
+    return run_agy_json(stage="scout_localize", prompt=prompt, schema=_LOCALIZE_SCHEMA)
+
+
+def localize_live_candidates(candidates: list[dict[str, Any]], runner=None) -> list[dict[str, Any]]:
+    """Give live finds a curated-style Vietnamese film title and plot summary.
+
+    One AGY call per batch of up to 20 cards. Each attempted card is marked
+    ``localized`` ("agy" or "failed") so cached results are never re-sent.
+    Disabled with ``MRF_SCOUT_LOCALIZE=0``.
+    """
+    if os.environ.get("MRF_SCOUT_LOCALIZE", "1") == "0":
+        return candidates
+    pending = [c for c in candidates if isinstance(c, dict) and not c.get("localized")
+               and str(c.get("id", "")).startswith(_LIVE_ID_PREFIXES)]
+    runner = runner or _default_localizer
+    for offset in range(0, len(pending), _LOCALIZE_BATCH):
+        batch = pending[offset:offset + _LOCALIZE_BATCH]
+        payload = [{
+            "id": str(c.get("id")),
+            "title": str(c.get("title") or "")[:200],
+            "description": str(c.get("summary") or "")[:600],
+            "year": c.get("release_year"),
+            "genres": c.get("genres") or [],
+        } for c in batch]
+        prompt = (
+            "Bạn là biên tập viên kênh review phim Việt Nam. Với mỗi video dưới đây (tựa và mô tả gốc "
+            "từ YouTube/Bilibili), trả về: vietnamese_title = tên phim tiếng Việt tự nhiên như tên phát hành, "
+            "kèm năm trong ngoặc nếu biết, ví dụ 'Cơn Điên Loạn Tột Cùng (1994)'; bỏ các chữ như Full Movie, HD, "
+            "tên diễn viên, tên kênh. vietnamese_summary = 1-2 câu tiếng Việt, tối đa 220 ký tự, tóm tắt cốt "
+            "truyện dựa trên mô tả gốc hoặc hiểu biết chắc chắn về phim; nếu không rõ cốt truyện thì mô tả "
+            "chung theo tựa và thể loại, không bịa tình tiết. Giữ nguyên id, trả đủ mọi mục.\n"
+            + json.dumps(payload, ensure_ascii=False)
+        )
+        try:
+            result = runner(prompt)
+            items = result.get("items") if isinstance(result, dict) else None
+        except Exception as exc:  # AGY offline or quota: keep the deterministic copy
+            logger.warning("scout localization failed: %s", exc)
+            items = None
+        by_id = {str(item.get("id")): item for item in items or [] if isinstance(item, dict)}
+        for candidate in batch:
+            item = by_id.get(str(candidate.get("id")))
+            title = " ".join(str((item or {}).get("vietnamese_title") or "").split())
+            summary = " ".join(str((item or {}).get("vietnamese_summary") or "").split())
+            if title and summary and len(title) <= 90:
+                candidate["vietnamese_title"] = title
+                candidate["vietnamese_summary"] = summary if len(summary) <= 300 else summary[:297].rstrip() + "…"
+                candidate["localized"] = "agy"
+            else:
+                candidate["localized"] = "failed"
+    return candidates
+
+
 def discover_hidden_gems(
     topic: str = "all",
     source: str = "all",
@@ -1489,6 +1561,11 @@ def discover_hidden_gems(
     if not refresh and _CACHE is not None:
         cached = _CACHE.get(topic, source)
         if cached is not None:
+            if any(isinstance(c, dict) and not c.get("localized")
+                   and str(c.get("id", "")).startswith(_LIVE_ID_PREFIXES) for c in cached):
+                cached = localize_live_candidates(cached)
+                if os.environ.get("MRF_SCOUT_LOCALIZE", "1") != "0":
+                    _CACHE.set(topic, source, cached)
             seen_urls: set[str] = set()
             filtered: list[dict[str, Any]] = []
             for candidate in cached:
@@ -1520,6 +1597,7 @@ def discover_hidden_gems(
         youtube_live = search_youtube_live(topic=topic, limit=limit)
         candidates = _source_pool(topic, normalized_source, limit, min_score, youtube_live)
 
+    candidates = localize_live_candidates(candidates)
     if _CACHE is not None:
         _CACHE.set(topic, source, candidates)
 

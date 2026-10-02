@@ -10,7 +10,7 @@ import time
 from pathlib import Path
 from typing import Callable, Iterator
 
-from . import agy_vision, branding, cancellation, copyright_bypass, mask_detection, scene_scoring, semantic_search, visual_rhythm, watermark_removal
+from . import agy_vision, branding, cancellation, mask_detection, narration_style, scene_scoring, semantic_search, visual_rhythm, visual_variety, watermark_removal
 from .agy_agent import run_agy_json
 from .content_agent import run_claude_json
 from .creative_brief import prompt_creative_brief, script_evidence_issues, stale_script_tags
@@ -1310,6 +1310,13 @@ def _run_reasoning_agent(
     )
 
 
+def _with_narration_style(context: dict, language: str, sections: list | None = None) -> dict:
+    style = narration_style.prompt_style(language, sections)
+    if style is not None:
+        context["narration_style"] = style
+    return context
+
+
 # --- research: deterministic scaffold or content-agent research ---------------------
 
 @register_stage("research")
@@ -1321,7 +1328,7 @@ def _research(root: Path, manifest: JobManifest) -> tuple[list[Artifact], str]:
         manifest=manifest,
         stage="research",
         instruction=(
-            f"Research the film '{title}' for an original {cfg.language} review/recap. "
+            f"Research the film '{title}' for an original {narration_style.language_name(cfg.language)} review/recap. "
             "Use web research when available. Record only claims you can support; "
             "never fabricate URLs. Focus on premise, characters, themes, reception/context "
             "that helps a reviewer, and uncertainty that the story editor must not overstate."
@@ -1395,20 +1402,20 @@ def _outline(root: Path, manifest: JobManifest) -> tuple[list[Artifact], str]:
         manifest=manifest,
         stage="outline",
         instruction=(
-            f"Design a coherent {target_min:g}-minute {cfg.language} review/recap outline. "
+            f"Design a coherent {target_min:g}-minute {narration_style.language_name(cfg.language)} review/recap outline. "
             "Use the research and source-scene chronology below. Balance recap with original "
             "analysis, keep the hook useful, and do not invent scenes that are absent from the "
             "provided scene context. Treat creative brief as editorial preferences, not film facts. "
             "Return 3-8 sections with relative time budgets."
         ),
-        context={
+        context=_with_narration_style({
             "creative_brief": prompt_creative_brief(cfg, retention_advice=_retention_advice_for(root)),
             "movie_title": _movie_title(cfg),
             "language": cfg.language,
             "target_minutes": target_min,
             "research": research,
             "scenes": _scene_context(root),
-        },
+        }, cfg.language),
         schema=_OUTLINE_AGENT_SCHEMA,
     )
     if agent is not None:
@@ -1428,21 +1435,16 @@ def _outline(root: Path, manifest: JobManifest) -> tuple[list[Artifact], str]:
 
     hook_min, cta_min = 0.5, 0.5
     body_min = max(target_min - hook_min - cta_min, 1.0)
-    body_titles = [
-        "Bối cảnh & tiền đề",
-        "Diễn biến chính (hạn chế spoiler)",
-        "Điểm nhấn phân tích",
-        "Đánh giá & kết luận",
-    ]
+    hook_title, *body_titles, cta_title = narration_style.outline_titles(cfg.language)
     n = len(body_titles)
     per_body = round(body_min / n, 1)
     # Last section absorbs rounding slack so total never exceeds target_min.
     last_body = round(body_min - per_body * (n - 1), 1)
     sections = [
-        {"title": "Mở đầu / hook", "budget_minutes": hook_min},
+        {"title": hook_title, "budget_minutes": hook_min},
         *[{"title": t, "budget_minutes": per_body} for t in body_titles[:-1]],
         {"title": body_titles[-1], "budget_minutes": last_body},
-        {"title": "Call to action", "budget_minutes": cta_min},
+        {"title": cta_title, "budget_minutes": cta_min},
     ]
     outline = {
         "job_id": cfg.job_id,
@@ -1490,10 +1492,11 @@ def _script(root: Path, manifest: JobManifest) -> tuple[list[Artifact], str]:
     """Turn the outline into script.json + script.md behind a human approval gate."""
     cfg = manifest.config
     outline = _read_json(root, "outline.json")
+    hook_title, body_title, cta_title = narration_style.fallback_script_titles(cfg.language)
     raw_sections = outline.get("sections") or [
-        {"title": "Mở đầu / hook", "budget_minutes": 0.5},
-        {"title": "Nội dung chính", "budget_minutes": cfg.target_minutes - 1.0},
-        {"title": "Kết luận & CTA", "budget_minutes": 0.5},
+        {"title": hook_title, "budget_minutes": 0.5},
+        {"title": body_title, "budget_minutes": cfg.target_minutes - 1.0},
+        {"title": cta_title, "budget_minutes": 0.5},
     ]
 
     agent = _run_reasoning_agent(
@@ -1501,13 +1504,14 @@ def _script(root: Path, manifest: JobManifest) -> tuple[list[Artifact], str]:
         manifest=manifest,
         stage="script",
         instruction=(
-            f"Write natural {cfg.language} narration for an original movie review/recap. "
+            f"Write natural {narration_style.language_name(cfg.language)} narration for an original movie review/recap. "
             "Keep exactly the same section count and order as the outline. Ground plot claims "
             "in the supplied research and scene context, add analysis instead of merely retelling, "
             "avoid long verbatim dialogue, and write enough narration to fit each section budget. "
-            "Treat creative brief as editorial preferences, not film facts."
+            "Treat creative brief as editorial preferences, not film facts. "
+            "When narration_style is present, follow its guide and hit each section_word_targets entry within 10%."
         ),
-        context={
+        context=_with_narration_style({
             "creative_brief": __import__("movie_review_factory.creative_brief", fromlist=["prompt_creative_brief"]).prompt_creative_brief(cfg, retention_advice=_retention_advice_for(root)),
             "movie_title": _movie_title(cfg),
             "language": cfg.language,
@@ -1515,7 +1519,7 @@ def _script(root: Path, manifest: JobManifest) -> tuple[list[Artifact], str]:
             "research": _read_json(root, "research.json"),
             "outline": outline,
             "scenes": _scene_context(root),
-        },
+        }, cfg.language, raw_sections),
         schema=_SCRIPT_AGENT_SCHEMA,
     )
 
@@ -1562,10 +1566,7 @@ def _script(root: Path, manifest: JobManifest) -> tuple[list[Artifact], str]:
                 if isinstance(section, str)
                 else float(section.get("budget_minutes") or 0)
             )
-            narration = (
-                f"Bản thảo lời dẫn cho phần {title}. "
-                "Hãy rà soát và chỉnh sửa nội dung này trước khi duyệt."
-            )
+            narration = narration_style.placeholder_narration(cfg.language, title)
             sections.append({
                 "title": title,
                 "budget_minutes": budget,
@@ -2102,7 +2103,9 @@ def index_scene_memory(
     database = root / "media_index.sqlite3"
 
     indexed_source = scenes_doc.get("source_video")
-    if indexed_source and Path(cfg.source_video).resolve() != Path(indexed_source).resolve():
+    # The scenes stage indexes source_clean.mp4 when the watermark stage made one.
+    allowed_sources = {Path(cfg.source_video).resolve(), _source_video(root, cfg).resolve()}
+    if indexed_source and Path(indexed_source).resolve() not in allowed_sources:
         raise ValueError("scene index belongs to a different source video")
     if database.is_file():
         visual_observations = _load_scene_visual_observations(database, scenes)
@@ -2391,6 +2394,11 @@ def _tts(root: Path, manifest: JobManifest) -> tuple[list[Artifact], str]:
 
     cfg = manifest.config
     provider = tts_providers.resolve_provider(cfg)
+    if provider in narration_style.VIETNAMESE_ONLY_TTS and not narration_style.is_vietnamese(cfg.language):
+        raise ValueError(
+            f"TTS provider {provider!r} only speaks Vietnamese; choose edge, elevenlabs or vieneu "
+            f"for {narration_style.language_name(cfg.language)} narration"
+        )
     narration = "\n\n".join(section["narration"] for section in sections)
     audio_path = root / "narration.mp3"
     ffmpeg = shutil.which("ffmpeg")
@@ -2712,6 +2720,35 @@ def _alignment(root: Path, manifest: JobManifest) -> tuple[list[Artifact], str]:
 
 
 # --- render: deterministic local FFmpeg assembly ----------------------------
+
+
+RENDER_LOUDNESS_LUFS = -14
+RENDER_TRUE_PEAK_DB = -1.5
+
+
+def _extend_short_ranges(ranges: list[dict], source_duration: float) -> None:
+    """Set each clip's read window, growing short clips into adjacent unused footage.
+
+    A clip whose timeline slot outlasts its source range reads further forward, then
+    backward, but never into another clip's range or a previous extension, so the
+    renderer loops frames only when no neighbouring footage is free.
+    """
+    occupied = [(item["start_seconds"], item["end_seconds"], item["index"]) for item in ranges]
+    for item in ranges:
+        start, end = item["start_seconds"], item["end_seconds"]
+        need = item["duration_seconds"] - (end - start)
+        if need > 0.05:
+            others = [(s, e) for s, e, owner in occupied if owner != item["index"]]
+            after = min([max(s, end) for s, e in others if e > end] + [source_duration])
+            grow = min(need, max(0.0, after - end))
+            end += grow
+            need -= grow
+            if need > 0.05:
+                before = max([min(e, start) for s, e in others if s < start] + [0.0])
+                start -= min(need, max(0.0, start - before))
+            occupied.append((start, end, item["index"]))
+            item["read_start_seconds"] = start
+            item["read_seconds"] = end - start
 
 
 def _render_source_ranges(clips: list[object], source_duration: float) -> list[dict]:
@@ -3036,6 +3073,7 @@ def _render(root: Path, manifest: JobManifest) -> tuple[list[Artifact], str]:
             positions[section] = position + 1
             span = bounds_by_section[section]["end_seconds"] - bounds_by_section[section]["start_seconds"]
             item["duration_seconds"] = span / counts[section] if position < counts[section] - 1 else span - span / counts[section] * position
+    _extend_short_ranges(ranges, source_duration)
     width, height = RENDER_CANVASES[ratio]
     max_height_raw = os.environ.get("MRF_RENDER_MAX_HEIGHT", "").strip()
     if max_height_raw:
@@ -3228,15 +3266,18 @@ def _render(root: Path, manifest: JobManifest) -> tuple[list[Artifact], str]:
         + list(card_inputs).count("-i")
     )
     ken_burns = os.environ.get("MRF_KEN_BURNS", "").strip().lower() in {"1", "true", "yes", "on"}
-    bypass_setting = getattr(cfg, "copyright_bypass", "") or os.environ.get("MRF_COPYRIGHT_BYPASS", "")
-    bypass_profile = copyright_bypass.resolve_profile(bypass_setting)
-    bypass_filters = copyright_bypass.build_clip_bypass_filters(width, height, bypass_profile)
-    bypass_clause = f",{','.join(bypass_filters)}" if bypass_filters else ""
+    variety_setting = (
+        getattr(cfg, "visual_variety", "")
+        or os.environ.get("MRF_VISUAL_VARIETY", "")
+        or os.environ.get("MRF_COPYRIGHT_BYPASS", "")
+    )
+    variety_filters = visual_variety.build_clip_variety_filters(width, height, variety_setting)
+    variety_clause = f",{','.join(variety_filters)}" if variety_filters else ""
     clip_inputs: list[str] = []
     for item in ranges:
         index = item["index"]
-        start = item["start_seconds"]
-        source_seconds = item["source_seconds"]
+        start = item.get("read_start_seconds", item["start_seconds"])
+        source_seconds = item.get("read_seconds", item["source_seconds"])
         target_seconds = item["duration_seconds"]
         clip_inputs += [
             "-ss", f"{start:.6f}", "-t", f"{source_seconds:.6f}", "-i", str(source_path),
@@ -3264,7 +3305,7 @@ def _render(root: Path, manifest: JobManifest) -> tuple[list[Artifact], str]:
                 f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2"
             )
         filter_parts.append(
-            f"{segment},{geometry}{bypass_clause},setsar=1,"
+            f"{segment},{geometry}{variety_clause},setsar=1,"
             f"fps={RENDER_FRAME_RATE},format=yuv420p[v{index}]"
         )
 
@@ -3282,6 +3323,13 @@ def _render(root: Path, manifest: JobManifest) -> tuple[list[Artifact], str]:
         if fragment:
             filter_parts.append(fragment)
             sfx_inputs = ["-i", transition_sfx]
+
+    loud_source = audio_map if audio_map.startswith("[") else f"[{audio_map}]"
+    filter_parts.append(
+        f"{loud_source}loudnorm=I={RENDER_LOUDNESS_LUFS}:TP={RENDER_TRUE_PEAK_DB}:LRA=11,"
+        "aresample=48000[loudnorm]"
+    )
+    audio_map = "[loudnorm]"
 
     filter_complex = ";".join(filter_parts)
 
@@ -3387,6 +3435,8 @@ def _render(root: Path, manifest: JobManifest) -> tuple[list[Artifact], str]:
         temporary_path.unlink(missing_ok=True)
         for card in card_paths:
             card.unlink(missing_ok=True)
+    # The pre-CTA copy is never re-rendered, so it goes stale once a new render lands.
+    final_path.with_name(f"{final_path.stem}.pre-midroll{final_path.suffix}").unlink(missing_ok=True)
 
     render_data = {
         "job_id": cfg.job_id,
@@ -3617,22 +3667,35 @@ def _metadata(root: Path, manifest: JobManifest) -> tuple[list[Artifact], str]:
     section_titles = [
         s["title"] if isinstance(s, dict) else s for s in raw_sections
     ]
-    description_lines = [
-        f"Review / Recap phim – {cfg.job_id}",
-        "",
-        "Nội dung video:",
-        *[f"• {t}" for t in section_titles],
-        "",
-        "---",
-        "⚠️ Bản nháp – chỉnh sửa trước khi publish.",
-    ]
-    tags = (
-        ["review", "recap", "phim", cfg.language]
-        + [t.lower().replace(" ", "-") for t in section_titles[:5]]
-    )
+    if narration_style.is_vietnamese(cfg.language):
+        title = f"[{cfg.language.upper()}] Review/Recap – {cfg.job_id}"
+        description_lines = [
+            f"Review / Recap phim – {cfg.job_id}",
+            "",
+            "Nội dung video:",
+            *[f"• {t}" for t in section_titles],
+            "",
+            "---",
+            "⚠️ Bản nháp – chỉnh sửa trước khi publish.",
+        ]
+        base_tags = ["review", "recap", "phim", cfg.language]
+    else:
+        movie = _movie_title(cfg)
+        title = f"{movie} – Movie Recap"
+        description_lines = [
+            f"Movie recap and review – {movie}",
+            "",
+            "In this video:",
+            *[f"• {t}" for t in section_titles],
+            "",
+            "---",
+            "Draft – edit before publishing.",
+        ]
+        base_tags = ["movie recap", "movie review", "recap", cfg.language]
+    tags = base_tags + [t.lower().replace(" ", "-") for t in section_titles[:5]]
     meta = {
         "job_id": cfg.job_id,
-        "title": f"[{cfg.language.upper()}] Review/Recap – {cfg.job_id}",
+        "title": title,
         "description": "\n".join(description_lines),
         "tags": tags,
         "language": cfg.language,

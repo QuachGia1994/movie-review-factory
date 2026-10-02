@@ -18,7 +18,7 @@ def test_update_job_config_persists_allowed_fields(tmp_path):
     status = service.update_job_config("demo", {
         "movie_title": "Hidden Gem",
         "content_agent": "agy",
-        "copyright_bypass": "balanced",
+        "visual_variety": "balanced",
         "watermark_removal": {"enabled": True, "detect": {"method": "temporal"}},
         "tts_provider": "vieneu",
         "tts_voice": "studio-vi",
@@ -29,7 +29,7 @@ def test_update_job_config_persists_allowed_fields(tmp_path):
     cfg = pipeline.load_manifest(tmp_path / "demo").config
     assert cfg.movie_title == "Hidden Gem"
     assert cfg.content_agent == "agy"
-    assert cfg.copyright_bypass == "balanced"
+    assert cfg.visual_variety == "balanced"
     assert cfg.watermark_removal.enabled is True
     assert cfg.watermark_removal.detect.method == "temporal"
     assert cfg.tts_provider == "vieneu"
@@ -53,7 +53,7 @@ def test_update_job_config_rejects_running_and_unknown_fields(tmp_path):
 def test_scout_enqueue_uses_candidate_and_active_channel_defaults(tmp_path, monkeypatch):
     service = JobsService(tmp_path)
     monkeypatch.setattr(service.creator_library, "active_channel_defaults", lambda: {
-        "tts_provider": "fptai", "tts_voice": "banmai", "copyright_bypass": "light"
+        "tts_provider": "fptai", "tts_voice": "banmai", "visual_variety": "light"
     })
     monkeypatch.setattr(
         "movie_review_factory.webapp.content_scout.enqueue_gem_for_review",
@@ -66,7 +66,7 @@ def test_scout_enqueue_uses_candidate_and_active_channel_defaults(tmp_path, monk
     cfg = pipeline.load_manifest(tmp_path / result["created_job"]["job_id"]).config
     assert cfg.movie_title == "Tên Việt"
     assert cfg.content_agent == "agy"
-    assert cfg.copyright_bypass == "light"
+    assert cfg.visual_variety == "light"
     assert cfg.tts_provider == "fptai"
     assert cfg.tts_voice == "banmai"
     assert cfg.watermark_removal.enabled is True

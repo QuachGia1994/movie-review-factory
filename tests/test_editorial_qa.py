@@ -56,6 +56,17 @@ def test_stretched_footage_requires_editorial_review():
     assert checks["stretched_footage"]["value"]["looped_clips"][0]["clip"] == 1
 
 
+def test_extended_read_window_clears_stretched_footage():
+    clip = _clip(5, 10)
+    clip["duration_seconds"] = 20
+    rendered = {"start_seconds": 5, "end_seconds": 10, "read_seconds": 20, "duration_seconds": 20}
+    checks = {item["check"]: item for item in editorial_qa.clip_checks(
+        {"clips": [clip]}, {"clips": [rendered]}
+    )}
+    assert checks["render_clip_provenance"]["passed"] is True
+    assert checks["stretched_footage"]["review_required"] is False
+
+
 def test_source_provenance_uses_windows_case_insensitive_paths():
     assert editorial_qa.provenance_checks({"source_video": "D:/Video/Ben.mp4"},
                                          "d:\\VIDEO\\ben.mp4")[0]["passed"] is True

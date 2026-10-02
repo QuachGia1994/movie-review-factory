@@ -54,6 +54,44 @@ def test_vietnamese_copy_is_meaningful_and_does_not_leak_source_prose():
     assert "45 phút" in fallback_summary and "Bilibili" in fallback_summary
 
 
+def test_localize_live_candidates_gives_curated_style_copy(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("MRF_SCOUT_LOCALIZE", "1")
+    prompts: list[str] = []
+
+    def runner(prompt: str) -> dict:
+        prompts.append(prompt)
+        return {"items": [{"id": "yt-live-a", "vietnamese_title": "Lễ Hội Của Những Linh Hồn (1962)",
+                           "vietnamese_summary": "Một cô gái sống sót sau tai nạn bị ám bởi bóng ma."}]}
+
+    candidates = [
+        {"id": "yt-live-a", "title": "Carnival of Souls (1962) | Full Movie", "summary": "Mary Henry...",
+         "vietnamese_title": "Phim xưa độc lạ: Câu Chuyện Bí Ẩn", "vietnamese_summary": "generic"},
+        {"id": "bili-b", "title": "短剧", "summary": "短剧", "vietnamese_title": "x", "vietnamese_summary": "y"},
+        {"id": "tmdb-1", "title": "The Vanishing", "vietnamese_title": "Biến Mất Không Dấu Vết (1988)"},
+    ]
+    content_scout.localize_live_candidates(candidates, runner=runner)
+
+    assert len(prompts) == 1 and "Carnival of Souls" in prompts[0] and "The Vanishing" not in prompts[0]
+    assert candidates[0]["vietnamese_title"] == "Lễ Hội Của Những Linh Hồn (1962)"
+    assert candidates[0]["localized"] == "agy"
+    assert candidates[1]["localized"] == "failed" and candidates[1]["vietnamese_title"] == "x"
+    assert "localized" not in candidates[2]
+
+    content_scout.localize_live_candidates(candidates, runner=runner)
+    assert len(prompts) == 1
+
+
+def test_localize_live_candidates_survives_agy_failure(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("MRF_SCOUT_LOCALIZE", "1")
+
+    def runner(prompt: str) -> dict:
+        raise RuntimeError("pool offline")
+
+    candidates = [{"id": "yt-live-a", "title": "T", "vietnamese_title": "generic", "vietnamese_summary": "s"}]
+    content_scout.localize_live_candidates(candidates, runner=runner)
+    assert candidates[0]["vietnamese_title"] == "generic" and candidates[0]["localized"] == "failed"
+
+
 def test_story_twist_index_baseline():
     """Text without any trigger keywords returns baseline 1.0."""
     score = content_scout.calculate_story_twist_index("Một bộ phim tài liệu về thế giới động vật.")
