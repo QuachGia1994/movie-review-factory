@@ -1,6 +1,8 @@
 # Documentation index
 
-- [Creator product identity](biz/creator-product.md) — primary creator, value proposition, rights and validation target.
+- [Creator product identity](biz/creator-product.md) — English-channel primary creator, offer and price ladder, feature boundary, kill signals and proof targets.
+- [International launch plan](plan/international-launch.md) — M1–M3 milestones: payment approval, English pipeline and blind test, proof channel, founding sale, price raise.
+- [Commercial release roadmap](plan/commercial-release-roadmap.md) — installer compile, licensing and TTS connection check for a paid Windows build.
 - [Creator production roadmap](plan/creator-production-roadmap.md) — full edit, QA, packaging and release gates after media search.
 
 - [Compact project workspace](plan/compact-workspace.md) — project cards, tabbed import-to-export workflow, responsive explorer, and manual QA gate.
