@@ -1,10 +1,19 @@
 # Commercial release roadmap
 
-Status: active · 2026-09-30. Scope: the last-mile items that turn the working pipeline into a sellable 1-click **paid** Windows desktop product. Sibling plans: [creator production roadmap](creator-production-roadmap.md) (production loop) and [Windows installer](../windows-installer.md) (build mechanics).
+Status: active · updated 2026-10-02 (Items 2 and 3 code shipped; Item 1 untouched). Tracked as M1 items 1.5/1.6 in the [international launch plan](international-launch.md). Scope: the last-mile items that turn the working pipeline into a sellable 1-click **paid** Windows desktop product. Sibling plans: [creator production roadmap](creator-production-roadmap.md) (production loop) and [Windows installer](../windows-installer.md) (build mechanics).
 
 These are acceptance thresholds for a shippable paid build, **not market facts**. The `88%` / `$499–$2,500` figures in the external "AKITHINK" evaluation are market projections and are out of scope here — this plan tracks code and build state only. Legend (from the sibling roadmap): **DONE(code)** = implemented + automated tests pass; **PARTIAL** = code done but a real machine / human step still gates it; **GAP** = not built, or needs an owner decision / external system.
 
-## Verified baseline · 2026-09-30 (read-only audit)
+## Current state · 2026-10-02
+| Item | Status | Evidence | Still open |
+|---|---|---|---|
+| 1 · Compile `.exe` | **GAP** | No `build/win/` folder; no `movie-review-factory-setup-*.exe` on this machine | Build on an ISCC host, observe a clean-Windows first launch |
+| 2 · License + machine binding | **PARTIAL** | `licensing.py` (`machine_fingerprint`, `verify_license`), `serve` gate, `/api/license` + `/api/license/activate`, `tests/test_licensing.py`, `tools/issue_license.py`, `docs/licensing.md` | `LICENSE_PUBLIC_KEY_B64` is still `""`: generate the real keypair, keep the private key offline, verify a key on a second machine (launch plan 1.6) |
+| 3 · TTS "Kiểm tra kết nối" | **DONE(code)** | `tts_providers.check_provider`, `GET /api/tts/test`, Settings button, offline tests in `tests/test_tts_providers.py` | Manual click with a real ElevenLabs key (optional) |
+
+Tests at this update: 817 passed, 6 skipped (`py -3 -m pytest tests -q --deselect tests/test_scout_e2e.py`).
+
+## Original baseline · 2026-09-30 (read-only audit, superseded by the table above)
 - Tests: `py -3 -m pytest tests -q` → **632 passed, 6 skipped, 0 failed** (638 collected, 123.98s). The 6 are opt-in network tests skipped by default, not failures.
 - Installer **source** is complete: `scripts/package_windows.py` + `installer/movie-review-factory.iss` stage CPython 3.12 + `ffmpeg`/`ffprobe` + `yt-dlp` + the app + `mrf-launch.vbs`, per-user, v0.2.0. No compiled `.exe` exists in the tree → **GAP**.
 - No licensing / machine-binding module exists anywhere in `src/` → **GAP**.
@@ -34,7 +43,7 @@ Open decision (owner): code-signing. An unsigned installer triggers SmartScreen 
 
 ## Item 2 — License key + machine binding
 Goal: a paid build refuses to run without a valid, machine-bound license; copying the install folder to another machine does not work.
-Status: **GAP** — nothing exists.
+Status: **PARTIAL** — code, tests and docs shipped (see Current state); the real keypair and second-machine check remain.
 
 Files touched:
 - New `src/movie_review_factory/licensing.py` — pure + injectable: `machine_fingerprint(reader=...)`, `verify_license(key, *, fingerprint, now=...) -> Result`; offline signature check (RSA or Ed25519) against an **embedded public key** (private key held only by the vendor).
@@ -53,7 +62,7 @@ Open decisions (owner — agent.B3 auth/billing boundary; do not invent silently
 
 ## Item 3 — "Test Connection" for TTS API keys (Web UI)
 Goal: a Settings button that tells the user immediately whether the FPT.AI / ElevenLabs key is present, valid, and (where possible) in credit — so an out-of-credit key is not mistaken for a software bug.
-Status: **GAP** — no endpoint; env-key handling already exists.
+Status: **DONE(code)** — endpoint, button and offline tests shipped.
 
 Files touched:
 - `src/movie_review_factory/tts_providers.py` — add `check_provider(provider, *, api_key, http_request=...) -> Result`, reusing the existing injectable HTTP layer plus `provider_api_key` / `missing_key_message`.
@@ -70,6 +79,6 @@ Done criteria:
 - Constraint (agent.B3): the default path must **not** spend paid API credits; any billable check (the FPT.AI synthesis probe) is opt-in and labeled as such in the UI.
 
 ## Sequencing & release gate
-1. Item 3 (smallest, fully offline-testable) → 2. Item 2 (paid-copy protection) → 3. Item 1 (compile + clean-machine launch — the real ship gate).
+1. Item 3 (smallest, fully offline-testable) → 2. Item 2 (paid-copy protection) → 3. Item 1 (compile + clean-machine launch — the real ship gate). Next: the Item 2 real keypair, then Item 1.
 
 Release gate (per project `CLAUDE.md` + sibling roadmap): `py -3 -m pytest tests -q` green, then `scripts/release_gate.py` (plus `--offline`). The compiled `.exe` clean-Windows first launch, and a signed binary if that route is chosen, are human / hand-off gates — not settled by tests alone.
