@@ -19,6 +19,7 @@ import re
 import threading
 import time
 import unicodedata
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -1494,7 +1495,8 @@ def _default_localizer(prompt: str) -> dict[str, Any]:
 def localize_live_candidates(candidates: list[dict[str, Any]], runner=None) -> list[dict[str, Any]]:
     """Give live finds a curated-style Vietnamese film title and plot summary.
 
-    One AGY call per batch of up to 20 cards. Each attempted card is marked
+    One AGY call per batch of up to 20 cards, batches in parallel across the
+    4-account pool. Each attempted card is marked
     ``localized`` ("agy" or "failed") so cached results are never re-sent.
     Disabled with ``MRF_SCOUT_LOCALIZE=0``.
     """
@@ -1503,8 +1505,8 @@ def localize_live_candidates(candidates: list[dict[str, Any]], runner=None) -> l
     pending = [c for c in candidates if isinstance(c, dict) and not c.get("localized")
                and str(c.get("id", "")).startswith(_LIVE_ID_PREFIXES)]
     runner = runner or _default_localizer
-    for offset in range(0, len(pending), _LOCALIZE_BATCH):
-        batch = pending[offset:offset + _LOCALIZE_BATCH]
+
+    def localize(batch: list[dict[str, Any]]) -> None:
         payload = [{
             "id": str(c.get("id")),
             "title": str(c.get("title") or "")[:200],
@@ -1538,6 +1540,13 @@ def localize_live_candidates(candidates: list[dict[str, Any]], runner=None) -> l
                 candidate["localized"] = "agy"
             else:
                 candidate["localized"] = "failed"
+
+    batches = [pending[i:i + _LOCALIZE_BATCH] for i in range(0, len(pending), _LOCALIZE_BATCH)]
+    if len(batches) > 1:
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            list(executor.map(localize, batches))
+    elif batches:
+        localize(batches[0])
     return candidates
 
 

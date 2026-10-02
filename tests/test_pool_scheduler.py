@@ -340,3 +340,98 @@ def test_default_state_file_follows_localappdata(tmp_path: Path, monkeypatch: py
     assert pool_scheduler.default_state_file() == (
         Path.home() / ".movie-review-factory" / "runtime" / "pool_health.json"
     )
+
+
+def test_parallel_run_keeps_every_role_busy_at_once(state_file: Path) -> None:
+    import threading
+
+    lock = threading.Lock()
+    active = {"now": 0, "peak": 0}
+    served: list[str] = []
+
+    def attempt(worker: tuple, unit: object) -> int:
+        with lock:
+            active["now"] += 1
+            active["peak"] = max(active["peak"], active["now"])
+        time.sleep(0.05)
+        with lock:
+            active["now"] -= 1
+            served.append(worker[0])
+        return int(unit) * 10
+
+    result = PoolScheduler(WORKERS, state_file=state_file).run("par", attempt, units=range(8), parallel=True)
+
+    assert result.data == {unit: unit * 10 for unit in range(8)}
+    assert active["peak"] == 4
+    assert set(served) == set(ROLES)
+    assert result.roles_used == list(ROLES)
+    assert set(_read_state(state_file)["progress"]["par"]["units"]) == {str(unit) for unit in range(8)}
+
+
+def test_parallel_run_retires_quota_role_and_reroutes_its_unit(state_file: Path) -> None:
+    def attempt(worker: tuple, unit: object) -> str:
+        if worker[0] == "advisor":
+            raise QuotaSignal("quota exhausted")
+        time.sleep(0.01)
+        return worker[0]
+
+    result = PoolScheduler(WORKERS, state_file=state_file).run("quota", attempt, units=range(6), parallel=True)
+
+    assert set(result.data) == set(range(6))
+    assert "advisor" not in result.data.values()
+    assert result.failures.count("advisor quota exhausted") == 1
+    assert _read_state(state_file)["roles"]["advisor"]["status"] == "quota"
+
+
+def test_parallel_run_reraises_non_rotating_failure(state_file: Path) -> None:
+    def attempt(worker: tuple, unit: object) -> int:
+        if unit == 2:
+            raise ValueError("bad batch")
+        return int(unit)
+
+    with pytest.raises(ValueError, match="bad batch"):
+        PoolScheduler(WORKERS, state_file=state_file).run(
+            "fatal", attempt, units=range(4), rotate_on_error=False, parallel=True,
+        )
+
+
+def test_parallel_run_resumes_only_missing_units(state_file: Path) -> None:
+    calls: list[object] = []
+    scheduler = PoolScheduler(WORKERS, state_file=state_file)
+    scheduler.run("resume", lambda worker, unit: unit, units=[0, 1], parallel=True)
+
+    def attempt(worker: tuple, unit: object) -> object:
+        calls.append(unit)
+        return unit
+
+    result = scheduler.run("resume", attempt, units=[0, 1, 2, 3], parallel=True)
+
+    assert sorted(calls) == [2, 3]
+    assert result.data == {0: 0, 1: 1, 2: 2, 3: 3}
+
+
+def test_concurrent_single_calls_start_on_different_idle_roles(state_file: Path) -> None:
+    import threading
+
+    gate = threading.Barrier(2)
+    first_roles: list[str] = []
+
+    def attempt(worker: tuple, unit: object) -> str:
+        first_roles.append(worker[0])
+        gate.wait(timeout=2)
+        return worker[0]
+
+    threads = [
+        threading.Thread(
+            target=PoolScheduler(WORKERS, state_file=state_file).run,
+            args=(f"single-{n}", attempt), kwargs={"resume": False},
+        )
+        for n in range(2)
+    ]
+    threads[0].start()
+    time.sleep(0.05)
+    threads[1].start()
+    for thread in threads:
+        thread.join(timeout=5)
+
+    assert first_roles == ["advisor", "executor"]

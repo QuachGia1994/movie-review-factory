@@ -28,6 +28,9 @@ Environment overrides:
   ``0..3`` validated like ``MRF_CLAUDE_RETRIES``; ``0`` and ``1`` both mean a
   single attempt, larger values add retries).  Between attempts the scheduler
   sleeps ``0.5s * attempt``.
+
+``run(..., parallel=True)`` serves independent units on every available role at
+once (one in-flight call per role), so a 4-account pool works ~4x faster.
 """
 
 from __future__ import annotations
@@ -35,6 +38,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import threading
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -57,6 +61,26 @@ DEFAULT_UNIT = "job"
 
 Worker = tuple[str, str, Path, str]
 Attempt = Callable[[Worker, Any], Any]
+
+# Roles with a call in flight in this process; concurrent runs try idle roles first.
+_IN_FLIGHT: dict[str, int] = {}
+_IN_FLIGHT_LOCK = threading.Lock()
+
+
+def _call(attempt: Attempt, worker: Worker, unit: Any) -> Any:
+    with _IN_FLIGHT_LOCK:
+        _IN_FLIGHT[worker[0]] = _IN_FLIGHT.get(worker[0], 0) + 1
+    try:
+        return attempt(worker, unit)
+    finally:
+        with _IN_FLIGHT_LOCK:
+            _IN_FLIGHT[worker[0]] -= 1
+
+
+def _idle_first(workers: Sequence[Worker]) -> list[Worker]:
+    with _IN_FLIGHT_LOCK:
+        busy = {role for role, count in _IN_FLIGHT.items() if count > 0}
+    return sorted(workers, key=lambda worker: worker[0] in busy)
 
 
 class PoolConfigError(ValueError):
@@ -197,7 +221,7 @@ def _save_state(path: Path, state: dict[str, Any]) -> None:
         return
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_name(path.name + ".tmp")
+        tmp = path.with_name(f"{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
         tmp.write_text(text, encoding="utf-8")
         tmp.replace(path)
     except OSError:
@@ -273,6 +297,7 @@ class PoolScheduler:
         units: Sequence[Any] | None = None,
         rotate_on_error: bool = True,
         resume: bool = True,
+        parallel: bool = False,
     ) -> ScheduleResult:
         """Run ``attempt(worker, unit)`` for every pending unit of ``key``.
 
@@ -281,7 +306,8 @@ class PoolScheduler:
         the units that did not succeed.  Roles in quota cooldown are skipped
         while the remaining roles still run.  ``rotate_on_error=False`` makes
         a non-quota/non-busy failure re-raise its original exception instead
-        of moving to the next role.
+        of moving to the next role.  ``parallel=True`` runs pending units
+        concurrently, one call per available role, saving progress per unit.
         """
         unit_list = list(units) if units is not None else [DEFAULT_UNIT]
         retries = max(1, retry_count())
@@ -313,9 +339,17 @@ class PoolScheduler:
             if isinstance(info, dict)
         }
 
+        if parallel and len(pending) > 1 and len(self.workers) > 1:
+            self._run_parallel(
+                pending, attempt, retries=retries, cooldown=cooldown, state=state,
+                progress_key=progress_key, cooldowns=cooldowns, resume=resume,
+                rotate_on_error=rotate_on_error, result=ScheduleResult(data, roles_used, skipped_roles, failures),
+            )
+            return ScheduleResult(data, roles_used, skipped_roles, failures)
+
         for unit in pending:
             served = False
-            for worker in self.workers:
+            for worker in _idle_first(self.workers):
                 role = worker[0]
                 if cooldowns.get(role, 0.0) > _now():
                     if role not in skipped_roles:
@@ -326,7 +360,7 @@ class PoolScheduler:
                 for attempt_no in range(1, retries + 1):
                     started = _now()
                     try:
-                        value = attempt(worker, unit)
+                        value = _call(attempt, worker, unit)
                     except Exception as exc:
                         status = classify_error(exc)
                         now = _now()
@@ -360,3 +394,118 @@ class PoolScheduler:
             # A unit no role could serve stays pending: the next run resumes it.
         _save_state(self.state_file, state)
         return ScheduleResult(data, roles_used, skipped_roles, failures)
+
+    def _run_parallel(
+        self,
+        pending: list[Any],
+        attempt: Attempt,
+        *,
+        retries: int,
+        cooldown: float,
+        state: dict[str, Any],
+        progress_key: dict[str, Any],
+        cooldowns: dict[str, float],
+        resume: bool,
+        rotate_on_error: bool,
+        result: ScheduleResult,
+    ) -> None:
+        roles_state: dict[str, Any] = state["roles"]
+        order = {worker[0]: index for index, worker in enumerate(self.workers)}
+        cond = threading.Condition()
+        retired = {worker[0] for worker in self.workers if cooldowns.get(worker[0], 0.0) > _now()}
+        for role in sorted(retired, key=order.__getitem__):
+            result.skipped_roles.append(role)
+            result.failures.append(f"{role} in cooldown")
+        idle = [worker for worker in self.workers if worker[0] not in retired]
+        fatal: list[BaseException] = []
+        queue = list(pending)
+
+        def acquire(tried: set[str]) -> Worker | None:
+            with cond:
+                while not fatal:
+                    for worker in idle:
+                        if worker[0] not in tried:
+                            idle.remove(worker)
+                            return worker
+                    if all(worker[0] in tried or worker[0] in retired for worker in self.workers):
+                        return None
+                    cond.wait()
+                return None
+
+        def release(worker: Worker, retire: bool) -> None:
+            with cond:
+                if retire:
+                    retired.add(worker[0])
+                else:
+                    idle.append(worker)
+                    idle.sort(key=lambda item: order[item[0]])
+                cond.notify_all()
+
+        def serve(unit: Any) -> None:
+            tried: set[str] = set()
+            while True:
+                worker = acquire(tried)
+                if worker is None:
+                    return  # No role left for this unit: the next run resumes it.
+                role = worker[0]
+                tried.add(role)
+                retire = False
+                try:
+                    for attempt_no in range(1, retries + 1):
+                        started = _now()
+                        try:
+                            value = _call(attempt, worker, unit)
+                        except Exception as exc:
+                            status = classify_error(exc)
+                            with cond:
+                                now = _now()
+                                _record_call(roles_state, role, status, int((now - started) * 1000), now, cooldown)
+                                if status == "quota":
+                                    cooldowns[role] = float(roles_state[role]["cooldown_until"])
+                                    retire = True
+                            if status == "quota" and attempt_no < retries:
+                                _sleep(RETRY_BACKOFF_SECONDS * attempt_no)
+                                continue
+                            if isinstance(exc, RoleSignal):
+                                rotate = exc.rotate
+                            else:
+                                rotate = status in ("quota", "busy") or rotate_on_error
+                            with cond:
+                                result.failures.append(f"{role} {_failure_message(exc)}")
+                                if not rotate:
+                                    fatal.append(exc)
+                                    cond.notify_all()
+                            if not rotate:
+                                return
+                            break  # next role
+                        with cond:
+                            now = _now()
+                            _record_call(roles_state, role, "ok", int((now - started) * 1000), now, cooldown)
+                            if resume:
+                                _record_progress(progress_key["units"], unit, role, value, now)
+                                progress_key["updated_at"] = now
+                                _save_state(self.state_file, state)
+                            result.data[unit] = value
+                            if role not in result.roles_used:
+                                result.roles_used.append(role)
+                        return
+                finally:
+                    release(worker, retire)
+
+        def runner() -> None:
+            while True:
+                with cond:
+                    if fatal or not queue:
+                        return
+                    unit = queue.pop(0)
+                serve(unit)
+
+        threads = [threading.Thread(target=runner, daemon=True) for _ in range(max(1, len(idle)))]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        result.roles_used.sort(key=order.__getitem__)
+        _save_state(self.state_file, state)
+        if fatal:
+            raise fatal[0]

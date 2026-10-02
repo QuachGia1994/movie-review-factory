@@ -9,13 +9,17 @@ import subprocess
 import urllib.error
 import urllib.parse
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
 
 from . import pool_scheduler
 from .pool_scheduler import QUOTA_ERROR
 
-BATCH_SIZE = 6
+BATCH_SIZE = 12
+# Story-graph scene evidence per AGY call; the backend rejects prompts above ~26,000 chars.
+STORY_CHUNK_CHARS = 18000
+IDENTITY_FRESH_LABELS = 12
 MODEL = "gemini-3.7-flash-medium"
 
 
@@ -44,6 +48,7 @@ def _source_stamp(source: Path) -> str:
 
 def _resume_key(prefix: str, basis: str) -> str:
     """Stable resume key so a re-run only redoes the units that failed."""
+    basis = f"batch={BATCH_SIZE};story={STORY_CHUNK_CHARS}|{basis}"
     return f"{prefix}:{hashlib.sha256(basis.encode('utf-8')).hexdigest()[:32]}"
 
 
@@ -298,13 +303,13 @@ def describe_candidate_observations(
         folders = {root: stack.enter_context(_shared_frames(root))
                    for root in {worker[2] for worker in workers}}
         primary = folders[workers[0][2]]
-        for offset in offsets:
-            if scheduler.completed(key, offset):
-                continue  # A resumed run replays this unit from pool health state.
-            batches[offset] = _extract_frames(
+        todo = [offset for offset in offsets if not scheduler.completed(key, offset)]
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            extracted = executor.map(lambda offset: _extract_frames(
                 source, ffmpeg, ordered, offset, primary,
                 prefix="frame", scale="320:-2", id_field="id", verb="source",
-            )
+            ), todo)
+            batches.update(zip(todo, extracted))
 
         def attempt(worker: tuple, unit: object) -> dict[int, dict]:
             role, url, root, token = worker
@@ -316,7 +321,7 @@ def describe_candidate_observations(
                 unsupported.add(role)
                 raise pool_scheduler.RotateSignal(str(exc)) from exc
 
-        result = scheduler.run(key, attempt, units=offsets, rotate_on_error=False)
+        result = scheduler.run(key, attempt, units=offsets, rotate_on_error=False, parallel=True)
 
     if len(result.data) != len(offsets):
         if unsupported:
@@ -457,34 +462,42 @@ def track_anonymous_people(
         folders = {root: stack.enter_context(_shared_frames(root))
                    for root in {worker[2] for worker in workers}}
         primary = folders[workers[0][2]]
-        for offset in range(0, len(ordered), BATCH_SIZE):
-            if scheduler.completed(key, offset):
-                # Resumed unit: replay the stored result so the roster below is rebuilt exactly as the successful run built it.
-                batch = []
-            else:
-                batch = _extract_frames(
+        offsets = list(range(0, len(ordered), BATCH_SIZE))
+        # One parallel wave = one batch per worker over a roster snapshot, each with its own fresh Person range.
+        wave_size = len(workers)
+        for wave_start in range(0, len(offsets), wave_size):
+            wave = offsets[wave_start:wave_start + wave_size]
+            # Resumed units replay their stored result, so they need no frames.
+            batches = {
+                offset: [] if scheduler.completed(key, offset) else _extract_frames(
                     source, ffmpeg, ordered, offset, primary,
                     prefix="identity", scale="384:-2", id_field="scene_id", verb="identity",
                 )
+                for offset in wave
+            }
+            snapshot = dict(roster)
+            first_label = next_label
 
             def attempt(worker: tuple, unit: object) -> list[dict]:
                 _, url, root, token = worker
+                batch = batches[int(unit)]
                 staged = batch if folders[root] == primary else _copy_frames(
                     batch, folders[root], "scene_id",
                     unavailable="AGY identity frame workspace is unavailable",
                 )
-                allowed = list(roster)
-                allowed.extend(f"Person {number}" for number in range(next_label, next_label + 12))
+                fresh_start = first_label + IDENTITY_FRESH_LABELS * wave.index(int(unit))
+                allowed = list(snapshot)
+                allowed.extend(f"Person {number}" for number in range(fresh_start, fresh_start + IDENTITY_FRESH_LABELS))
                 roster_payload = [
                     {"label": label, "description": description}
-                    for label, description in roster.items()
+                    for label, description in snapshot.items()
                 ]
                 return _identity_batch(url, root, token, staged, roster_payload, allowed)
 
-            result = scheduler.run(key, attempt, units=(offset,), rotate_on_error=False)
-            if offset not in result.data:
+            result = scheduler.run(key, attempt, units=wave, rotate_on_error=False, parallel=True)
+            if any(offset not in result.data for offset in wave):
                 raise VisionUnavailable("AGY identity tracking unavailable across configured accounts")
-            for scene_result in result.data[offset]:
+            for scene_result in (item for offset in wave for item in result.data[offset]):
                 for person in scene_result["people"]:
                     label = person["label"]
                     roster.setdefault(label, person["description"])
@@ -633,11 +646,6 @@ def extract_story_graph(
     pool_dir: Path | None = None,
 ) -> dict:
     workers = pool_workers(pool_dir)
-    expected_ids = {
-        int(scene["index"])
-        for scene in scenes
-        if isinstance(scene.get("index"), int)
-    }
     allowed_people = {
         str(label)
         for scene in scenes
@@ -658,7 +666,16 @@ def extract_story_graph(
         for scene in scenes
         if isinstance(scene.get("index"), int)
     ]
-    prompt = (
+    chunks: list[list[dict]] = [] if payload else [[]]
+    size = 0
+    for item in payload:
+        length = len(json.dumps(item, ensure_ascii=False))
+        if not chunks or size + length > STORY_CHUNK_CHARS:
+            chunks.append([])
+            size = 0
+        chunks[-1].append(item)
+        size += length
+    instruction = (
         "Build a compact story-memory graph from the supplied scene evidence. "
         "Return only JSON object {scenes:[{scene_id,entities,relations}]}. "
         "Entity types are exactly person, location, event, object. "
@@ -667,17 +684,18 @@ def extract_story_graph(
         "dialogue or visual evidence. Each entity is {type,label,description,confidence,evidence}. "
         "Each relation is {subject_type,subject_label,predicate,object_type,object_label,confidence,evidence}. "
         "Only relate entities that are included in that same scene. Keep labels short and stable across scenes. "
-        "SCENES: " + json.dumps(payload, ensure_ascii=False)
+        "SCENES: "
     )
     scheduler = pool_scheduler.PoolScheduler(workers)
     key = _resume_key("vision:story", json.dumps(payload, ensure_ascii=False, sort_keys=True))
 
     def attempt(worker: tuple, unit: object) -> dict:
         _, url, root, token = worker
+        chunk = chunks[int(unit)]
         request = urllib.request.Request(
             url,
             data=json.dumps({
-                "prompt": prompt,
+                "prompt": instruction + json.dumps(chunk, ensure_ascii=False),
                 "mode": "plan",
                 "model": MODEL,
                 "cwd": str(root),
@@ -700,12 +718,22 @@ def extract_story_graph(
             raise VisionUnavailable("AGY worker could not build story graph") from exc
         if not isinstance(result, dict) or result.get("ok") is not True or not isinstance(result.get("text"), str):
             raise VisionUnavailable("AGY worker did not return story graph output")
-        return _parse_story_graph(result["text"], expected_ids, allowed_people)
+        return _parse_story_graph(result["text"], {item["scene_id"] for item in chunk}, allowed_people)
 
-    outcome = scheduler.run(key, attempt, units=(0,), rotate_on_error=False)
-    if 0 not in outcome.data:
+    units = list(range(len(chunks)))
+    outcome = scheduler.run(key, attempt, units=units, rotate_on_error=False, parallel=True)
+    if any(unit not in outcome.data for unit in units):
         raise VisionUnavailable("AGY story graph quota exhausted across configured accounts")
-    return outcome.data[0]
+    entities: dict[tuple[str, str], dict] = {}
+    merged: dict = {"entities": [], "scene_entities": [], "relations": []}
+    for unit in units:
+        part = outcome.data[unit]
+        for entity in part["entities"]:
+            entities.setdefault((entity["type"], entity["label"]), entity)
+        merged["scene_entities"].extend(part["scene_entities"])
+        merged["relations"].extend(part["relations"])
+    merged["entities"] = list(entities.values())
+    return merged
 
 
 def describe_candidates(

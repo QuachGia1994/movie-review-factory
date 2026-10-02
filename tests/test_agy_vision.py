@@ -522,6 +522,7 @@ def test_describe_resumes_failed_batch_without_restarting_completed_batches(
         {"index": index, "start_seconds": index - 1, "end_seconds": index}
         for index in range(1, 8)  # two batches: scenes 1-6, then scene 7
     ]
+    monkeypatch.setattr(agy_vision, "BATCH_SIZE", 6)
     monkeypatch.setattr(agy_vision.shutil, "which", lambda name: "ffmpeg.exe")
     extracted: list[str] = []
 
@@ -565,8 +566,8 @@ def test_describe_resumes_failed_batch_without_restarting_completed_batches(
     with pytest.raises(agy_vision.VisionUnavailable, match="quota exhausted across configured accounts"):
         agy_vision.describe_candidates(source, [scenes], pool_dir=tmp_path)
 
-    assert requested == [[1, 2, 3, 4, 5, 6], [7], [7]]
-    assert extracted == [f"frame-{index}.jpg" for index in range(1, 8)]
+    assert sorted(requested) == [[1, 2, 3, 4, 5, 6], [7], [7]]
+    assert sorted(extracted) == sorted(f"frame-{index}.jpg" for index in range(1, 8))
 
     # Cooldown expired: only the batch that failed reaches a worker again.
     clock["now"] += 400
@@ -577,5 +578,73 @@ def test_describe_resumes_failed_batch_without_restarting_completed_batches(
     assert result == {index: f"scene {index}" for index in range(1, 8)}
     assert all(isinstance(index, int) for index in result)
     assert requested == [[7]]
-    assert extracted == [f"frame-{index}.jpg" for index in range(1, 8)] + ["frame-7.jpg"]
+    assert sorted(extracted) == sorted([f"frame-{index}.jpg" for index in range(1, 8)] + ["frame-7.jpg"])
     assert not list(pool.glob("mrf-vision-*"))
+
+
+class _JsonResponse:
+    def __init__(self, text: str) -> None:
+        self.text = text
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return None
+
+    def read(self) -> bytes:
+        return json.dumps({"ok": True, "text": self.text}).encode()
+
+
+def test_story_graph_splits_long_films_into_parallel_chunks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_pool_config(tmp_path)
+    monkeypatch.setattr(agy_vision, "STORY_CHUNK_CHARS", 300)
+    prompts: list[str] = []
+
+    def worker(request, timeout):
+        prompt = json.loads(request.data)["prompt"]
+        prompts.append(prompt)
+        scenes = json.loads(prompt.split("SCENES: ", 1)[1])
+        return _JsonResponse(json.dumps({"scenes": [{
+            "scene_id": scene["scene_id"],
+            "entities": [{"type": "location", "label": "Gas station", "description": "rest stop",
+                          "confidence": 0.8, "evidence": "sign"}],
+            "relations": [],
+        } for scene in scenes]}))
+
+    monkeypatch.setattr(agy_vision.urllib.request, "urlopen", worker)
+    scenes = [{"index": i, "start_seconds": i, "end_seconds": i + 1, "text": "x" * 150} for i in range(1, 4)]
+    graph = agy_vision.extract_story_graph(scenes, pool_dir=tmp_path)
+
+    assert len(prompts) == 3
+    assert [item["label"] for item in graph["entities"]] == ["Gas station"]
+    assert sorted(item["scene_index"] for item in graph["scene_entities"]) == [1, 2, 3]
+
+
+def test_identity_wave_gives_each_parallel_batch_its_own_fresh_labels(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_pool_config(tmp_path)
+    monkeypatch.setattr(agy_vision, "BATCH_SIZE", 1)
+    monkeypatch.setattr(agy_vision.shutil, "which", lambda name: "ffmpeg.exe")
+    monkeypatch.setattr(agy_vision.subprocess, "run", lambda command, **kwargs: Path(command[-1]).write_bytes(b"px"))
+    source = tmp_path / "owned.mp4"
+    source.write_bytes(b"video")
+
+    def worker(request, timeout):
+        prompt = json.loads(request.data)["prompt"]
+        allowed = json.loads(prompt.split("ALLOWED_LABELS: ", 1)[1].split(" FILES: ", 1)[0])
+        frames = json.loads(prompt.split("FILES: ", 1)[1])
+        return _JsonResponse(json.dumps([{
+            "scene_id": frame["scene_id"],
+            "people": [{"label": allowed[0], "description": "man in coat", "clothing": "coat",
+                        "ambiguous": False, "confidence": 0.9, "evidence": "visible"}],
+        } for frame in frames]))
+
+    monkeypatch.setattr(agy_vision.urllib.request, "urlopen", worker)
+    scenes = [{"index": i, "start_seconds": i, "end_seconds": i + 1} for i in (1, 2)]
+    identity = agy_vision.track_anonymous_people(source, scenes, pool_dir=tmp_path)
+
+    assert [track["label"] for track in identity["tracks"]] == ["Person 1", "Person 13"]
