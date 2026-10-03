@@ -4,6 +4,8 @@ import os
 from pathlib import Path
 
 CACHE_ROOT_ENV = "MRF_CACHE_ROOT"
+# Windows without Developer Mode has no symlinks; HF caching still works, so the warning is noise.
+QUIET_ENV = {"HF_HUB_DISABLE_SYMLINKS_WARNING": "1"}
 
 
 def cache_root() -> Path:
@@ -37,6 +39,8 @@ def cache_environment(root: Path | None = None) -> dict[str, str]:
 
 
 def configure_cache_environment(root: Path | None = None) -> Path:
+    for name, value in QUIET_ENV.items():
+        os.environ.setdefault(name, value)
     configured = (os.environ.get(CACHE_ROOT_ENV) or "").strip()
     target = Path(root) if root is not None else (Path(configured).expanduser() if configured else None)
     if target is None:

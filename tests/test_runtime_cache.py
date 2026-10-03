@@ -73,6 +73,18 @@ def test_specific_cache_override_wins(tmp_path: Path, monkeypatch) -> None:
     assert os.environ["UV_CACHE_DIR"] == str(root / "uv")
 
 
+def test_symlink_warning_is_silenced_unless_user_set_it(monkeypatch) -> None:
+    _clear(monkeypatch)
+    monkeypatch.delenv("HF_HUB_DISABLE_SYMLINKS_WARNING", raising=False)
+
+    runtime_cache.configure_cache_environment()
+    assert os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] == "1"
+
+    monkeypatch.setenv("HF_HUB_DISABLE_SYMLINKS_WARNING", "0")
+    runtime_cache.configure_cache_environment()
+    assert os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] == "0"
+
+
 def test_package_import_configures_cache_before_submodules(tmp_path: Path, monkeypatch) -> None:
     _clear(monkeypatch)
     root = tmp_path / "cache"

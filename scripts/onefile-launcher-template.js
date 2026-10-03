@@ -252,6 +252,7 @@ function cacheEnvironment() {
 
   return {
     MRF_CACHE_ROOT: root,
+    HF_HUB_DISABLE_SYMLINKS_WARNING: configured("HF_HUB_DISABLE_SYMLINKS_WARNING", "1"),
     XDG_CACHE_HOME: configured("XDG_CACHE_HOME", path.join(root, "xdg")),
     HF_HOME: configured("HF_HOME", path.join(root, "huggingface")),
     HF_HUB_CACHE: configured("HF_HUB_CACHE", path.join(root, "huggingface", "hub")),
