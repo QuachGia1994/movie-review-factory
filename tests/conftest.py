@@ -16,3 +16,9 @@ def _disable_auto_index(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("MRF_AUTO_INDEX", "0")
     # Scout localization calls the AGY pool; tests opt in with a fake runner.
     monkeypatch.setenv("MRF_SCOUT_LOCALIZE", "0")
+    # Auto-run chaining, the AGY-written CTA and AGY scout ideas are production
+    # defaults; tests opt in explicitly so unrelated flows stay deterministic.
+    monkeypatch.setenv("MRF_AUTO_RUN", "0")
+    monkeypatch.setenv("MRF_AUTO_CTA", "0")
+    monkeypatch.setenv("MRF_AUTO_PACKAGING", "0")
+    monkeypatch.setenv("MRF_SCOUT_IDEAS", "0")

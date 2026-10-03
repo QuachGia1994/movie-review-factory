@@ -350,28 +350,131 @@ def build_douyin_short_drama_query(subtopic: str) -> str:
     return subtopic_map.get(subtopic, f"#短剧 #{subtopic}")
 
 
+# Single topic catalog; the UI select and the rotating query pools (``_scan_plan``) are generated from it.
+SCOUT_TOPICS: dict[str, dict[str, Any]] = {
+    "horror": {
+        "vi": "Kinh dị", "label": "Kinh dị / Quái vật / Rùng rợn",
+        "youtube": ("retro horror full movie", "80s horror full movie", "90s horror full movie english",
+                    "haunted house full movie old", "slasher full movie 1980s", "supernatural horror full movie classic"),
+        "bilibili": ("恐怖片 完整版", "惊悚 恐怖 电影 完整版", "港片 鬼片 完整版"),
+    },
+    "asian_horror": {
+        "vi": "Kinh dị châu Á", "label": "Kinh dị châu Á (Thái / Hàn / Nhật / HK)",
+        "youtube": ("asian horror full movie", "thai horror full movie english sub", "korean horror full movie eng sub",
+                    "japanese horror full movie", "hong kong ghost movie full", "indonesian horror full movie"),
+        "bilibili": ("泰国恐怖片 完整版", "香港鬼片 完整版", "韩国恐怖片 完整版", "日本恐怖片 完整版"),
+    },
+    "fantasy_mystery": {
+        "vi": "Huyền ảo / Bí ẩn", "label": "Tiên hiệp / Huyền ảo / Bí ẩn",
+        "youtube": ("fantasy mystery full movie 1980s 1990s", "dark fantasy full movie",
+                    "mystery thriller full movie old", "fantasy adventure full movie 90s"),
+        "bilibili": ("奇幻 悬疑 电影 完整版", "玄幻 短剧 全集", "修仙 短剧 全集"),
+    },
+    "cult_classic": {
+        "vi": "Phim xưa độc lạ", "label": "Phim xưa lạ / B-Movie độc lạ",
+        "youtube": ("cult classic full movie", "b movie full movie", "forgotten 80s movie full",
+                    "obscure 90s movie full movie", "grindhouse full movie"),
+        "bilibili": ("邪典电影 完整版", "冷门 老电影 完整版"),
+    },
+    "action_thriller": {
+        "vi": "Hành động ly kỳ", "label": "Hành động ly kỳ",
+        "youtube": ("retro action thriller full movie", "90s action full movie english", "hong kong action full movie",
+                    "spy thriller full movie old"),
+        "bilibili": ("动作片 完整版", "港片 动作 完整版"),
+    },
+    "martial_arts": {
+        "vi": "Võ thuật / Kiếm hiệp", "label": "Võ thuật / Kiếm hiệp / Kung fu",
+        "youtube": ("kung fu full movie english dubbed", "martial arts full movie", "shaw brothers full movie",
+                    "wuxia full movie english sub"),
+        "bilibili": ("武侠 电影 完整版", "功夫片 完整版", "武侠 短剧 全集"),
+    },
+    "crime_heist": {
+        "vi": "Tội phạm / Phi vụ", "label": "Tội phạm / Băng đảng / Phi vụ",
+        "youtube": ("heist movie full movie", "crime thriller full movie 90s", "gangster full movie english",
+                    "hong kong triad full movie"),
+        "bilibili": ("犯罪 电影 完整版", "黑帮 港片 完整版", "警匪 短剧 全集"),
+    },
+    "psychological_thriller": {
+        "vi": "Tâm lý ly kỳ", "label": "Tâm lý ly kỳ / Cú lừa cuối phim",
+        "youtube": ("psychological thriller full movie", "twist ending thriller full movie", "mind bending thriller full movie",
+                    "neo noir full movie"),
+        "bilibili": ("悬疑 烧脑 电影 完整版", "悬疑 短剧 全集", "推理 电影 完整版"),
+    },
+    "scifi_timeloop": {
+        "vi": "Viễn tưởng / Vòng lặp thời gian", "label": "Viễn tưởng / Du hành & vòng lặp thời gian",
+        "youtube": ("sci-fi full movie 80s", "time loop full movie", "time travel full movie",
+                    "low budget sci-fi full movie", "alien invasion full movie old"),
+        "bilibili": ("科幻 电影 完整版", "时间循环 电影 完整版", "穿越时空 短剧 全集"),
+    },
+    "survival_disaster": {
+        "vi": "Sinh tồn / Thảm họa", "label": "Sinh tồn / Thảm họa",
+        "youtube": ("survival movie full movie", "disaster movie full movie", "stranded survival full movie english",
+                    "natural disaster full movie"),
+        "bilibili": ("灾难片 完整版", "末日 生存 短剧 全集", "荒岛 求生 电影 完整版"),
+    },
+    "zombie_apocalypse": {
+        "vi": "Xác sống / Tận thế", "label": "Xác sống / Tận thế",
+        "youtube": ("zombie full movie", "zombie apocalypse full movie english", "post apocalyptic full movie",
+                    "asian zombie full movie"),
+        "bilibili": ("丧尸 电影 完整版", "末世 丧尸 短剧 全集", "僵尸 港片 完整版"),
+    },
+    "monster_creature": {
+        "vi": "Quái vật / Sinh vật", "label": "Quái vật khổng lồ / Sinh vật lạ",
+        "youtube": ("creature feature full movie", "giant monster full movie", "sea monster full movie",
+                    "monster movie full 90s"),
+        "bilibili": ("怪兽 电影 完整版", "巨蟒 电影 完整版", "怪物 惊悚 完整版"),
+    },
+    "ceo_romance": {
+        "vi": "Tổng tài / Nghịch tập", "label": "Tổng tài / Nghịch tập / Đoản kịch",
+        "youtube": ("short drama full movie", "ceo romance short drama full", "billionaire short drama full movie",
+                    "contract marriage short drama full episode"),
+        "bilibili": ("短剧 总裁 逆袭", "霸道总裁 短剧 全集", "闪婚 总裁 短剧 全集", "先婚后爱 短剧 全集"),
+    },
+    "isekai_rebirth": {
+        "vi": "Xuyên không / Trùng sinh", "label": "Xuyên không / Trùng sinh",
+        "youtube": ("rebirth drama full movie", "reborn revenge short drama full", "transmigration drama full movie",
+                    "time travel romance drama full"),
+        "bilibili": ("短剧 穿越 重生", "重生 短剧 全集", "穿书 短剧 全集", "女帝 重生 短剧 全集"),
+    },
+    "revenge": {
+        "vi": "Báo thù", "label": "Báo thù / Vả mặt",
+        "youtube": ("revenge drama full movie", "revenge thriller full movie", "betrayal revenge short drama full",
+                    "revenge action full movie english"),
+        "bilibili": ("短剧 复仇 打脸", "复仇 爽剧 全集", "打脸 逆袭 短剧 全集"),
+    },
+    "hidden_identity": {
+        "vi": "Thân phận ẩn giấu / Chiến thần", "label": "Chiến thần / Ở rể / Thân phận ẩn giấu",
+        "youtube": ("hidden identity short drama full", "son in law short drama full movie",
+                    "secret billionaire short drama full", "war god returns short drama full"),
+        "bilibili": ("战神 短剧 全集", "赘婿 短剧 全集", "隐藏身份 短剧 全集", "神医 短剧 全集"),
+    },
+    "palace_intrigue": {
+        "vi": "Cung đấu / Trạch đấu", "label": "Cung đấu / Trạch đấu / Cổ trang",
+        "youtube": ("palace drama full movie", "chinese historical drama full movie",
+                    "ancient chinese drama full movie eng sub", "concubine drama full movie"),
+        "bilibili": ("宫斗 短剧 全集", "宅斗 短剧 全集", "古装 宫廷 电影 完整版", "嫡女 短剧 全集"),
+    },
+}
+
 YOUTUBE_TOPIC_QUERIES: dict[str, str] = {
-    "horror": "retro horror full movie",
-    "cult_classic": "cult classic full movie",
-    "fantasy_mystery": "fantasy mystery full movie 1980s 1990s",
-    "action_thriller": "retro action thriller full movie",
-    "ceo_romance": "short drama full movie",
-    "isekai_rebirth": "rebirth drama full movie",
-    "revenge": "revenge drama full movie",
+    **{topic: spec["youtube"][0] for topic, spec in SCOUT_TOPICS.items()},
     "all": "cult classic retro full movie",
 }
 
 # Vietnamese topic labels, prefixed to live results that cannot be translated offline.
 _TOPIC_VI_LABELS: dict[str, str] = {
-    "horror": "Kinh dị",
-    "fantasy_mystery": "Huyền ảo / Bí ẩn",
-    "cult_classic": "Phim xưa độc lạ",
-    "action_thriller": "Hành động ly kỳ",
-    "ceo_romance": "Tổng tài / Nghịch tập",
-    "isekai_rebirth": "Xuyên không / Trùng sinh",
-    "revenge": "Báo thù",
+    **{topic: spec["vi"] for topic, spec in SCOUT_TOPICS.items()},
     "all": "Phim độc lạ",
 }
+for _topic, _spec in SCOUT_TOPICS.items():
+    _GENRE_VI.setdefault(_topic.replace("_", " "), _spec["vi"].title())
+
+
+def scout_topic_options_html() -> str:
+    """``<option>`` list for the scout topic select, generated from ``SCOUT_TOPICS``."""
+    rows = ['<option value="all">Tất cả chủ đề</option>']
+    rows += [f'<option value="{topic}">{html.escape(spec["label"])}</option>' for topic, spec in SCOUT_TOPICS.items()]
+    return "\n".join(rows)
 
 
 def build_youtube_live_query(topic: str = "all") -> str:
@@ -763,7 +866,7 @@ def check_link_liveness(url: str, timeout: float = 3.0) -> bool:
 
 DEFAULT_CACHE_PATH = Path(".cache/mrf/scout_cache.json")
 DEFAULT_CACHE_TTL = 21600  # 6 hours in seconds
-SCOUT_CACHE_VERSION = 2
+SCOUT_CACHE_VERSION = 3  # v3: 20-card scans; v2 entries held 10
 
 
 class ScoutCache:
@@ -958,6 +1061,85 @@ class ScoutCache:
                             pass
             except OSError:
                 pass
+            try:
+                self.history_path.unlink()
+            except OSError:
+                pass
+
+    # --- Scan history: rotation round + already-shown URLs per topic/source -------------
+
+    @property
+    def history_path(self) -> Path:
+        return self.cache_path.with_name(f"{self.cache_path.stem}_history.json")
+
+    def _read_history(self) -> dict[str, Any]:
+        try:
+            data = json.loads(self.history_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def scan_state(self, topic: str | None, source: str | None) -> dict[str, Any]:
+        """Return ``{"round", "seen", "ideas"}`` for the next live scan of topic/source."""
+        key = self._normalize_key(topic, source)
+        with self._lock:
+            entry = self._read_history().get(key)
+        entry = entry if isinstance(entry, dict) else {}
+        try:
+            scan_round = max(0, int(entry.get("round", 0)))
+        except (TypeError, ValueError):
+            scan_round = 0
+        return {
+            "round": scan_round,
+            "seen": {str(u) for u in entry.get("seen") or [] if isinstance(u, str)},
+            "ideas": [str(q) for q in entry.get("ideas") or [] if isinstance(q, str)],
+        }
+
+    def record_scan(self, topic: str | None, source: str | None, urls: list[str], ideas: list[str] | None = None) -> None:
+        """Advance the rotation round and remember shown URLs / AGY idea queries (bounded)."""
+        key = self._normalize_key(topic, source)
+        with self._lock:
+            data = self._read_history()
+            entry = data.get(key) if isinstance(data.get(key), dict) else {}
+            seen = [u for u in entry.get("seen") or [] if isinstance(u, str)]
+            seen += [u for u in dict.fromkeys(urls) if u and u not in set(seen)]
+            used = [q for q in entry.get("ideas") or [] if isinstance(q, str)]
+            used += [q for q in dict.fromkeys(ideas or []) if q and q not in set(used)]
+            try:
+                scan_round = max(0, int(entry.get("round", 0))) + 1
+            except (TypeError, ValueError):
+                scan_round = 1
+            data[key] = {"round": scan_round, "seen": seen[-SCOUT_HISTORY_MAX_SEEN:],
+                         "ideas": used[-SCOUT_HISTORY_MAX_IDEAS:], "updated": time.time()}
+            _atomic_write_json(self.history_path, data)
+
+
+SCOUT_HISTORY_MAX_SEEN = 600
+SCOUT_HISTORY_MAX_IDEAS = 60
+
+
+def _atomic_write_json(path: Path, data: Any) -> None:
+    """Write JSON via tmp file + os.replace (retrying Windows transient locks); log, never raise."""
+    tmp_path = path.parent / f"{path.name}.{os.getpid()}_{threading.get_ident()}_{time.time_ns()}.tmp"
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        for attempt in range(10):
+            try:
+                os.replace(tmp_path, path)
+                return
+            except OSError:
+                if attempt == 9:
+                    raise
+                time.sleep(0.02 * (attempt + 1))
+    except Exception as err:
+        logger.error("Failed to write %s: %s", path, err)
+    finally:
+        if tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
 
 
 # Module-level default singleton cache instance
@@ -1061,11 +1243,16 @@ def search_youtube_live(
     topic: str = "all",
     limit: int = 10,
     timeout: float = 8.0,
+    query: str | None = None,
+    fetch_count: int | None = None,
+    skip_urls: set[str] | None = None,
 ) -> list[dict[str, Any]]:
     """Query YouTube for live full movies via yt-dlp flat extraction with duration filtering.
 
     Filters candidates by 45-120 minutes (2700s - 7200s), extracts live metadata,
     calculates viral scores dynamically, and returns formatted candidate dictionaries.
+    ``query`` overrides the topic's default query, ``fetch_count`` searches deeper, and
+    ``skip_urls`` (already shown) do not count toward ``limit``.
     """
     try:
         import yt_dlp
@@ -1080,8 +1267,9 @@ def search_youtube_live(
             logger.warning("yt-dlp is not installed; skipping YouTube live discovery")
             return []
 
-    query = build_youtube_live_query(topic)
-    fetch_count = max(limit * 2, 20)
+    query = query or build_youtube_live_query(topic)
+    fetch_count = int(fetch_count or max(limit * 2, 20))
+    skip = skip_urls or set()
     ydl_opts = _get_ytdlp_search_opts(timeout=timeout)
 
     candidates: list[dict[str, Any]] = []
@@ -1097,7 +1285,7 @@ def search_youtube_live(
                     continue
 
                 vid = str(entry.get("id") or "").strip()
-                if not vid:
+                if not vid or f"https://www.youtube.com/watch?v={vid}" in skip:
                     continue
 
                 raw_dur = entry.get("duration")
@@ -1197,9 +1385,7 @@ _bilibili_buvid_lock = threading.Lock()
 _bilibili_buvid_cookie: str | None = None
 
 BILIBILI_TOPIC_QUERIES: dict[str, str] = {
-    "ceo_romance": "短剧 总裁 逆袭",
-    "isekai_rebirth": "短剧 穿越 重生",
-    "revenge": "短剧 复仇 打脸",
+    **{topic: spec["bilibili"][0] for topic, spec in SCOUT_TOPICS.items()},
     "all": "短剧 逆袭 全集",
 }
 
@@ -1278,16 +1464,21 @@ def search_bilibili_short_dramas(
     topic: str = "all",
     limit: int = 10,
     timeout: float = 6.0,
+    keyword: str | None = None,
+    page: int = 1,
+    skip_urls: set[str] | None = None,
 ) -> list[dict[str, Any]]:
     """Query Bilibili public search API for live mini short dramas (30-60m).
 
     Returns candidate dictionaries conforming to CandidateMovie schema.
-    Falls back gracefully to verified _SEEDS on any error.
+    Falls back gracefully to verified _SEEDS on any error. ``keyword``/``page`` let
+    repeated scans rotate queries and page deeper; ``skip_urls`` are not counted.
     """
-    keyword = BILIBILI_TOPIC_QUERIES.get(
+    keyword = keyword or BILIBILI_TOPIC_QUERIES.get(
         topic,
         f"短剧 {topic} 全集" if topic != "all" else "短剧 逆袭 全集",
     )
+    skip = skip_urls or set()
 
     cookie = get_bilibili_cookie(timeout=min(3.0, timeout))
     headers = dict(BILIBILI_PROBE_HEADERS)
@@ -1298,7 +1489,7 @@ def search_bilibili_short_dramas(
         "search_type": "video",
         "keyword": keyword,
         "duration": "3",  # Bilibili native 30-60 min filter
-        "page": 1,
+        "page": max(1, int(page or 1)),
         "pagesize": max(20, limit),
         "order": "totalrank",
     }
@@ -1333,7 +1524,7 @@ def search_bilibili_short_dramas(
                     continue
 
                 bvid = item.get("bvid")
-                if not bvid:
+                if not bvid or f"https://www.bilibili.com/video/{bvid}" in skip:
                     continue
 
                 duration_sec = parse_bilibili_duration(item.get("duration"))
@@ -1453,21 +1644,164 @@ def _rank_and_deduplicate(candidates: list[dict[str, Any]], topic: str, source: 
     return ranked
 
 
-def _source_pool(topic: str, source: str, limit: int, min_score: float, live_candidates: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
-    seen_urls: set[str] = set()
+def _source_group(topic: str, source: str, min_score: float, live_candidates: list[dict[str, Any]] | None, seen_urls: set[str]) -> list[dict[str, Any]]:
+    """Ranked live finds then matching seeds for one source, deduplicated against ``seen_urls``."""
     live_ranked = _rank_and_deduplicate(live_candidates or [], topic, source, min_score, seen_urls)
-    selected = live_ranked[:limit]
-    if len(selected) >= limit:
-        return selected
-
     seed_candidates = [score_movie_candidate(seed).to_dict() for seed in _SEEDS]
-    seed_ranked = _rank_and_deduplicate(seed_candidates, topic, source, min_score, seen_urls)
-    return selected + seed_ranked[:limit - len(selected)]
+    return live_ranked + _rank_and_deduplicate(seed_candidates, topic, source, min_score, seen_urls)
+
+
+def _select(groups: list[tuple[list[dict[str, Any]], int]], limit: int, shown: set[str]) -> list[dict[str, Any]]:
+    """Fill ``limit`` cards: per-source quotas with not-yet-shown items, then round-robin
+    backfill with unseen items from any source, then already-shown ones as a last resort."""
+    def is_shown(candidate: dict[str, Any]) -> bool:
+        return str(candidate.get("source_url", "")) in shown
+
+    fresh = [[c for c in items if not is_shown(c)] for items, _ in groups]
+    stale = [[c for c in items if is_shown(c)] for items, _ in groups]
+    picked: list[dict[str, Any]] = []
+    for items, (_, quota) in zip(fresh, groups):
+        take = min(quota, limit - len(picked))
+        picked += items[:take]
+        del items[:take]
+    for pools in (fresh, stale):
+        while len(picked) < limit and any(pools):
+            for items in pools:
+                if items and len(picked) < limit:
+                    picked.append(items.pop(0))
+    return picked
 
 
 def _all_source_quotas(limit: int) -> tuple[int, int, int]:
     base, remainder = divmod(limit, 3)
     return base + (1 if remainder > 0 else 0), base + (1 if remainder > 1 else 0), base
+
+
+DEFAULT_SCOUT_LIMIT = 20
+SCAN_QUERIES_PER_SOURCE = 2
+_SCOUT_IDEAS_MAX = 4
+_LIVE_SOURCE_KEYS: dict[str, tuple[str, ...]] = {
+    "all": ("youtube", "bilibili"),
+    "tmdb_douban": (),
+    "douyin_bilibili": ("bilibili",),
+    "bilibili": ("bilibili",),
+}
+
+
+def _query_pool(topic: str, source_key: str) -> list[tuple[str, str]]:
+    """``(query, topic)`` pool for one live source; "all" interleaves every catalog topic so
+    each card keeps the topic of the query that found it."""
+    if topic in SCOUT_TOPICS:
+        return [(query, topic) for query in SCOUT_TOPICS[topic][source_key]]
+    if topic != "all":
+        fallback = build_youtube_live_query(topic) if source_key == "youtube" else BILIBILI_TOPIC_QUERIES.get(topic, f"短剧 {topic} 全集")
+        return [(fallback, topic)]
+    pools = [[(query, name) for query in spec[source_key]] for name, spec in SCOUT_TOPICS.items()]
+    merged: list[tuple[str, str]] = []
+    for index in range(max(len(pool) for pool in pools)):
+        merged += [pool[index] for pool in pools if index < len(pool)]
+    return merged
+
+
+def _scan_plan(topic: str, source_key: str, scan_round: int, ideas: list[tuple[str, str]] | None = None) -> list[tuple[str, str, int]]:
+    """``(query, topic, depth)`` for this scan. Each round advances through the pool; after a
+    full lap the same queries are searched one page deeper. AGY ideas, when given, win."""
+    if ideas:
+        return [(query, query_topic, 1) for query, query_topic in ideas[:SCAN_QUERIES_PER_SOURCE]]
+    pool = _query_pool(topic, source_key)
+    plan: list[tuple[str, str, int]] = []
+    for offset in range(min(SCAN_QUERIES_PER_SOURCE, len(pool))):
+        slot = scan_round * SCAN_QUERIES_PER_SOURCE + offset
+        query, query_topic = pool[slot % len(pool)]
+        plan.append((query, query_topic, 1 + slot // len(pool)))
+    return plan
+
+
+_IDEA_ITEM_SCHEMA: dict[str, Any] = {
+    "type": "array",
+    "items": {"type": "object", "properties": {"query": {"type": "string"}, "topic": {"type": "string"}},
+              "required": ["query", "topic"]},
+}
+_IDEAS_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {"youtube": _IDEA_ITEM_SCHEMA, "bilibili": _IDEA_ITEM_SCHEMA},
+    "required": ["youtube", "bilibili"],
+}
+
+
+def _default_ideas_runner(prompt: str) -> dict[str, Any]:
+    from .agy_agent import run_agy_json
+    return run_agy_json(stage="scout_ideas", prompt=prompt, schema=_IDEAS_SCHEMA)
+
+
+def suggest_trending_queries(topic: str, used: list[str], runner=None) -> dict[str, list[tuple[str, str]]]:
+    """Ask AGY for fresh trending search queries once the built-in pool is exhausted.
+
+    Returns ``{"youtube": [(query, topic)], "bilibili": [...]}`` (max 4 each, never a
+    used query); ``{}`` when disabled (``MRF_SCOUT_IDEAS=0``) or AGY fails, in which case
+    the caller keeps rotating the built-in pool one page deeper.
+    """
+    if os.environ.get("MRF_SCOUT_IDEAS", "1").strip().lower() in ("0", "false", "no", "off"):
+        return {}
+    allowed = [topic] if topic != "all" else list(SCOUT_TOPICS)
+    prompt = (
+        "Bạn là trợ lý săn phim cho kênh review/recap phim tiếng Việt. Đề xuất truy vấn tìm kiếm MỚI "
+        "cho thể loại đang thịnh hành/viral, khác hẳn các truy vấn đã dùng. youtube: tiếng Anh, nhắm tới "
+        "phim đầy đủ 45-120 phút (kèm 'full movie'), ưu tiên phim cũ/độc lập ít rủi ro bản quyền. "
+        "bilibili: tiếng Trung, phim hoặc đoản kịch 30-60 phút (kèm 完整版 hoặc 全集). Mỗi nguồn "
+        f"{_SCOUT_IDEAS_MAX} truy vấn, mỗi truy vấn tối đa 80 ký tự, không chứa URL. topic phải là một trong: "
+        + json.dumps(allowed) + "\nĐã dùng: " + json.dumps(used[-120:], ensure_ascii=False)
+    )
+    try:
+        result = (runner or _default_ideas_runner)(prompt)
+    except Exception as exc:  # AGY offline or quota: rotation continues deeper
+        logger.warning("scout ideas failed: %s", exc)
+        return {}
+    known = {" ".join(q.lower().split()) for q in used}
+    ideas: dict[str, list[tuple[str, str]]] = {}
+    for key in ("youtube", "bilibili"):
+        items: list[tuple[str, str]] = []
+        for item in (result.get(key) if isinstance(result, dict) else None) or []:
+            if not isinstance(item, dict):
+                continue
+            query = " ".join(str(item.get("query") or "").split())
+            if not query or len(query) > 80 or "://" in query or query.lower() in known:
+                continue
+            item_topic = str(item.get("topic") or "")
+            if item_topic not in allowed:
+                item_topic = allowed[0] if topic != "all" else ("cult_classic" if key == "youtube" else "ceo_romance")
+            known.add(query.lower())
+            items.append((query, item_topic))
+            if len(items) >= _SCOUT_IDEAS_MAX:
+                break
+        if items:
+            ideas[key] = items
+    return ideas
+
+
+def _gather_live(jobs: list[tuple[str, str, str, int]], limit: int, shown: set[str]) -> dict[str, list[dict[str, Any]]]:
+    """Run ``(source_key, query, topic, depth)`` searches in parallel and merge per source."""
+    def run(job: tuple[str, str, str, int]) -> tuple[str, list[dict[str, Any]]]:
+        key, query, query_topic, depth = job
+        try:
+            if key == "youtube":
+                return key, search_youtube_live(
+                    topic=query_topic, limit=limit, query=query,
+                    fetch_count=min(120, max(limit * 2, 30) * depth), skip_urls=shown,
+                ) or []
+            return key, search_bilibili_short_dramas(
+                topic=query_topic, limit=limit, keyword=query, page=depth, skip_urls=shown,
+            ) or []
+        except Exception as exc:
+            logger.warning("scout live search %s %r failed: %s", key, query, exc)
+            return key, []
+
+    merged: dict[str, list[dict[str, Any]]] = {"youtube": [], "bilibili": []}
+    if jobs:
+        with ThreadPoolExecutor(max_workers=min(4, len(jobs))) as executor:
+            for key, found in executor.map(run, jobs):
+                merged[key].extend(found)
+    return merged
 
 
 _LIVE_ID_PREFIXES = ("yt-live-", "bili-")
@@ -1554,10 +1888,16 @@ def discover_hidden_gems(
     topic: str = "all",
     source: str = "all",
     min_score: float = 0.0,
-    limit: int = 10,
+    limit: int = DEFAULT_SCOUT_LIMIT,
     refresh: bool = False,
 ) -> list[dict[str, Any]]:
-    """Discover and rank candidate hidden-gem movies across cache, live search, and static seeds."""
+    """Discover and rank candidate hidden-gem movies across cache, live search, and static seeds.
+
+    Every live scan (first load or "Quét lại") rotates to the next queries of the topic pool,
+    searches deeper after a full lap, asks AGY for fresh trending queries once the pool is
+    exhausted, and prefers cards not shown in earlier scans - so refreshes keep surfacing new
+    titles while still filling ``limit`` cards.
+    """
     global _CACHE
 
     if limit <= 0:
@@ -1588,27 +1928,41 @@ def discover_hidden_gems(
                 filtered.append(candidate)
             return filtered[:limit]
 
+    state = _CACHE.scan_state(topic, source) if _CACHE is not None else {"round": 0, "seen": set(), "ideas": []}
+    live_keys = _LIVE_SOURCE_KEYS.get(normalized_source, ("youtube",))
+    quotas: dict[str, int] = {}
     if normalized_source == "all":
-        youtube_quota, bilibili_quota, tmdb_quota = _all_source_quotas(limit)
-        youtube_live = search_youtube_live(topic=topic, limit=youtube_quota) if youtube_quota else []
-        bilibili_live = search_bilibili_short_dramas(topic=topic, limit=bilibili_quota) if bilibili_quota else []
-        candidates = (
-            _source_pool(topic, "youtube_obscure", youtube_quota, min_score, youtube_live)
-            + _source_pool(topic, "douyin_bilibili", bilibili_quota, min_score, bilibili_live)
-            + _source_pool(topic, "tmdb_douban", tmdb_quota, min_score)
-        )
-    elif normalized_source == "tmdb_douban":
-        candidates = _source_pool(topic, normalized_source, limit, min_score)
-    elif normalized_source in ("douyin_bilibili", "bilibili"):
-        bilibili_live = search_bilibili_short_dramas(topic=topic, limit=limit)
-        candidates = _source_pool(topic, normalized_source, limit, min_score, bilibili_live)
+        quotas = dict(zip(("youtube", "bilibili", "tmdb"), _all_source_quotas(limit)))
+        live_keys = tuple(key for key in live_keys if quotas[key])
+
+    ideas: dict[str, list[tuple[str, str]]] = {}
+    if live_keys and any(state["round"] * SCAN_QUERIES_PER_SOURCE >= len(_query_pool(topic, key)) for key in live_keys):
+        used = [query for key in ("youtube", "bilibili") for query, _ in _query_pool(topic, key)] + state["ideas"]
+        ideas = suggest_trending_queries(topic, used)
+    jobs = [(key, query, query_topic, depth) for key in live_keys
+            for query, query_topic, depth in _scan_plan(topic, key, state["round"], ideas.get(key))]
+    live = _gather_live(jobs, limit, state["seen"])
+
+    dedupe: set[str] = set()
+    if normalized_source == "all":
+        groups = [
+            (_source_group(topic, "youtube_obscure", min_score, live["youtube"], dedupe), quotas["youtube"]),
+            (_source_group(topic, "douyin_bilibili", min_score, live["bilibili"], dedupe), quotas["bilibili"]),
+            (_source_group(topic, "tmdb_douban", min_score, None, dedupe), quotas["tmdb"]),
+        ]
     else:
-        youtube_live = search_youtube_live(topic=topic, limit=limit)
-        candidates = _source_pool(topic, normalized_source, limit, min_score, youtube_live)
+        source_live = live[live_keys[0]] if live_keys else None
+        groups = [(_source_group(topic, normalized_source, min_score, source_live, dedupe), limit)]
+    candidates = _select(groups, limit, state["seen"])
 
     candidates = localize_live_candidates(candidates)
     if _CACHE is not None:
         _CACHE.set(topic, source, candidates)
+        _CACHE.record_scan(
+            topic, source,
+            [str(c.get("source_url", "")) for c in candidates],
+            [query for found in ideas.values() for query, _ in found],
+        )
 
     return candidates[:limit]
 

@@ -191,11 +191,11 @@ def test_discover_hidden_gems_all_uses_exact_source_quotas(monkeypatch, tmp_path
     calls = []
     monkeypatch.setattr(content_scout, "_CACHE", content_scout.ScoutCache(tmp_path / "scout.json"))
 
-    def fake_youtube(topic, limit):
+    def fake_youtube(topic, limit, **_):
         calls.append(("youtube", topic, limit))
         return _live_candidates("youtube_obscure", topic, limit + 2)
 
-    def fake_bilibili(topic, limit):
+    def fake_bilibili(topic, limit, **_):
         calls.append(("bilibili", topic, limit))
         return _live_candidates("douyin_bilibili", topic, limit + 2)
 
@@ -204,7 +204,10 @@ def test_discover_hidden_gems_all_uses_exact_source_quotas(monkeypatch, tmp_path
 
     gems = content_scout.discover_hidden_gems(limit=10, refresh=True)
 
-    assert calls == [("youtube", "all", 4), ("bilibili", "all", 3)]
+    # "all" interleaves the topic catalog: 2 rotating queries per live source, each tagged
+    # with its own topic, each asked for the full limit so a short source can be backfilled.
+    assert sorted(calls) == [("bilibili", "asian_horror", 10), ("bilibili", "horror", 10),
+                             ("youtube", "asian_horror", 10), ("youtube", "horror", 10)]
     assert [gem["source"] for gem in gems] == ["youtube_obscure"] * 4 + ["douyin_bilibili"] * 3 + ["tmdb_douban"] * 3
     assert len({gem["source_url"] for gem in gems}) == 10
 
@@ -213,8 +216,8 @@ def test_discover_hidden_gems_strict_source_dispatch_and_fallback(monkeypatch, t
     monkeypatch.setattr(content_scout, "_CACHE", content_scout.ScoutCache(tmp_path / "scout.json"))
     youtube_calls = []
     bilibili_calls = []
-    monkeypatch.setattr(content_scout, "search_youtube_live", lambda topic, limit: youtube_calls.append((topic, limit)) or [])
-    monkeypatch.setattr(content_scout, "search_bilibili_short_dramas", lambda topic, limit: bilibili_calls.append((topic, limit)) or [])
+    monkeypatch.setattr(content_scout, "search_youtube_live", lambda topic, limit, **_: youtube_calls.append(limit) or [])
+    monkeypatch.setattr(content_scout, "search_bilibili_short_dramas", lambda topic, limit, **_: bilibili_calls.append(limit) or [])
 
     tmdb = content_scout.discover_hidden_gems(source="tmdb_douban", limit=3, refresh=True)
     assert youtube_calls == []
@@ -224,21 +227,21 @@ def test_discover_hidden_gems_strict_source_dispatch_and_fallback(monkeypatch, t
 
     bilibili = content_scout.discover_hidden_gems(source="bilibili", limit=3, refresh=True)
     assert youtube_calls == []
-    assert bilibili_calls == [("all", 3)]
+    assert bilibili_calls == [3, 3]
     assert len(bilibili) == 3
     assert {gem["source"] for gem in bilibili} == {"douyin_bilibili"}
 
     youtube = content_scout.discover_hidden_gems(source="youtube", limit=3, refresh=True)
-    assert youtube_calls == [("all", 3)]
-    assert bilibili_calls == [("all", 3)]
+    assert youtube_calls == [3, 3]
+    assert bilibili_calls == [3, 3]
     assert len(youtube) == 3
     assert {gem["source"] for gem in youtube} == {"youtube_obscure"}
 
 
 def test_discover_hidden_gems_live_results_fill_with_matching_seeds(monkeypatch, tmp_path):
     monkeypatch.setattr(content_scout, "_CACHE", content_scout.ScoutCache(tmp_path / "scout.json"))
-    monkeypatch.setattr(content_scout, "search_youtube_live", lambda topic, limit: _live_candidates("youtube_obscure", topic, 1))
-    monkeypatch.setattr(content_scout, "search_bilibili_short_dramas", lambda topic, limit: [])
+    monkeypatch.setattr(content_scout, "search_youtube_live", lambda topic, limit, **_: _live_candidates("youtube_obscure", topic, 1))
+    monkeypatch.setattr(content_scout, "search_bilibili_short_dramas", lambda topic, limit, **_: [])
 
     youtube = content_scout.discover_hidden_gems(source="youtube_obscure", limit=3, refresh=True)
     bilibili = content_scout.discover_hidden_gems(source="douyin_bilibili", limit=3, refresh=True)
@@ -254,8 +257,8 @@ def test_discover_hidden_gems_cache_hit_reapplies_source_filter(monkeypatch, tmp
     cache = content_scout.ScoutCache(tmp_path / "scout.json")
     cache.set("all", "youtube", _live_candidates("youtube_obscure", "all", 2) + _live_candidates("douyin_bilibili", "all", 2))
     monkeypatch.setattr(content_scout, "_CACHE", cache)
-    monkeypatch.setattr(content_scout, "search_youtube_live", lambda topic, limit: pytest.fail("cache hit should not search YouTube"))
-    monkeypatch.setattr(content_scout, "search_bilibili_short_dramas", lambda topic, limit: pytest.fail("cache hit should not search Bilibili"))
+    monkeypatch.setattr(content_scout, "search_youtube_live", lambda topic, limit, **_: pytest.fail("cache hit should not search YouTube"))
+    monkeypatch.setattr(content_scout, "search_bilibili_short_dramas", lambda topic, limit, **_: pytest.fail("cache hit should not search Bilibili"))
 
     gems = content_scout.discover_hidden_gems(source="youtube", limit=10)
 
@@ -275,8 +278,8 @@ def test_discover_hidden_gems_cache_hit_reapplies_source_filter(monkeypatch, tmp
 )
 def test_discover_hidden_gems_small_limits_are_deterministic(monkeypatch, tmp_path, limit, expected_sources):
     monkeypatch.setattr(content_scout, "_CACHE", content_scout.ScoutCache(tmp_path / f"scout-{limit}.json"))
-    monkeypatch.setattr(content_scout, "search_youtube_live", lambda topic, limit: _live_candidates("youtube_obscure", topic, limit))
-    monkeypatch.setattr(content_scout, "search_bilibili_short_dramas", lambda topic, limit: _live_candidates("douyin_bilibili", topic, limit))
+    monkeypatch.setattr(content_scout, "search_youtube_live", lambda topic, limit, **_: _live_candidates("youtube_obscure", topic, limit))
+    monkeypatch.setattr(content_scout, "search_bilibili_short_dramas", lambda topic, limit, **_: _live_candidates("douyin_bilibili", topic, limit))
 
     gems = content_scout.discover_hidden_gems(limit=limit, refresh=True)
 
@@ -285,13 +288,104 @@ def test_discover_hidden_gems_small_limits_are_deterministic(monkeypatch, tmp_pa
 
 def test_discover_hidden_gems_drama_topic_all_keeps_live_source_diversity(monkeypatch, tmp_path):
     monkeypatch.setattr(content_scout, "_CACHE", content_scout.ScoutCache(tmp_path / "scout.json"))
-    monkeypatch.setattr(content_scout, "search_youtube_live", lambda topic, limit: _live_candidates("youtube_obscure", topic, limit))
-    monkeypatch.setattr(content_scout, "search_bilibili_short_dramas", lambda topic, limit: _live_candidates("douyin_bilibili", topic, limit))
+    monkeypatch.setattr(content_scout, "search_youtube_live", lambda topic, limit, **_: _live_candidates("youtube_obscure", topic, limit))
+    monkeypatch.setattr(content_scout, "search_bilibili_short_dramas", lambda topic, limit, **_: _live_candidates("douyin_bilibili", topic, limit))
 
     gems = content_scout.discover_hidden_gems(topic="ceo_romance", source="all", limit=4, refresh=True)
 
-    assert [gem["source"] for gem in gems] == ["youtube_obscure", "youtube_obscure", "douyin_bilibili"]
+    # No TMDb seed matches the drama topic, so its slot is backfilled instead of left empty.
+    assert [gem["source"] for gem in gems] == ["youtube_obscure", "youtube_obscure", "douyin_bilibili", "youtube_obscure"]
     assert all(gem["topic"] == "ceo_romance" for gem in gems)
+
+
+def _query_live(source):
+    """Fake live search whose results depend on the query and honour skip_urls."""
+    calls = []
+
+    def search(topic, limit, query=None, keyword=None, skip_urls=None, **_):
+        term = query or keyword
+        calls.append(term)
+        host = "youtube.com/watch?v=" if source == "youtube_obscure" else "bilibili.com/video/"
+        urls = [f"https://{host}{term}-{index}" for index in range(limit + 5)]
+        return [{"id": f"yt-live-{url}", "title": url, "source": source, "topic": topic, "source_url": url,
+                 "viral_score": 500.0 - index} for index, url in enumerate(urls) if url not in (skip_urls or set())][:limit]
+
+    return search, calls
+
+
+def test_default_scan_fills_twenty_cards_across_sources(monkeypatch, tmp_path):
+    monkeypatch.setattr(content_scout, "_CACHE", content_scout.ScoutCache(tmp_path / "scout.json"))
+    youtube, _ = _query_live("youtube_obscure")
+    bilibili, _ = _query_live("douyin_bilibili")
+    monkeypatch.setattr(content_scout, "search_youtube_live", youtube)
+    monkeypatch.setattr(content_scout, "search_bilibili_short_dramas", bilibili)
+
+    gems = content_scout.discover_hidden_gems(refresh=True)
+
+    assert content_scout.DEFAULT_SCOUT_LIMIT == 20 and len(gems) == 20
+    sources = [gem["source"] for gem in gems]
+    # Quotas 7/7/6, but only 4 TMDb seeds exist: the 2 empty slots are backfilled round-robin.
+    assert (sources.count("youtube_obscure"), sources.count("douyin_bilibili"), sources.count("tmdb_douban")) == (8, 8, 4)
+    assert len({gem["source_url"] for gem in gems}) == 20
+
+
+def test_refresh_rotates_queries_and_never_repeats_shown_cards(monkeypatch, tmp_path):
+    cache = content_scout.ScoutCache(tmp_path / "scout.json")
+    monkeypatch.setattr(content_scout, "_CACHE", cache)
+    youtube, calls = _query_live("youtube_obscure")
+    monkeypatch.setattr(content_scout, "search_youtube_live", youtube)
+
+    first = content_scout.discover_hidden_gems(topic="horror", source="youtube", limit=6, refresh=True)
+    second = content_scout.discover_hidden_gems(topic="horror", source="youtube", limit=6, refresh=True)
+
+    pool = content_scout.SCOUT_TOPICS["horror"]["youtube"]
+    assert calls == list(pool[:4])
+    assert len(first) == len(second) == 6
+    assert not {g["source_url"] for g in first} & {g["source_url"] for g in second}
+    assert cache.scan_state("horror", "youtube")["round"] == 2
+    cache.clear()
+    assert cache.scan_state("horror", "youtube")["round"] == 0 and not cache.history_path.exists()
+
+
+def test_exhausted_pool_asks_agy_for_fresh_trending_queries(monkeypatch, tmp_path):
+    cache = content_scout.ScoutCache(tmp_path / "scout.json")
+    monkeypatch.setattr(content_scout, "_CACHE", cache)
+    monkeypatch.setenv("MRF_SCOUT_IDEAS", "1")
+    youtube, calls = _query_live("youtube_obscure")
+    monkeypatch.setattr(content_scout, "search_youtube_live", youtube)
+    prompts = []
+
+    def ideas(prompt):
+        prompts.append(prompt)
+        return {"youtube": [{"query": "wuxia revenge full movie", "topic": "horror"},
+                            {"query": "kung fu full movie english dubbed", "topic": "martial_arts"},
+                            {"query": "x" * 81, "topic": "martial_arts"}],
+                "bilibili": []}
+
+    monkeypatch.setattr(content_scout, "_default_ideas_runner", ideas)
+    for _ in range(2):  # martial_arts has 4 YouTube queries = 2 scans per lap
+        cache.record_scan("martial_arts", "youtube", [])
+
+    gems = content_scout.discover_hidden_gems(topic="martial_arts", source="youtube", limit=3, refresh=True)
+
+    assert len(prompts) == 1 and "kung fu full movie english dubbed" in prompts[0]
+    assert calls == ["wuxia revenge full movie"]  # used and over-long ideas are dropped
+    assert {gem["topic"] for gem in gems} == {"martial_arts"}
+    assert cache.scan_state("martial_arts", "youtube")["ideas"] == ["wuxia revenge full movie"]
+
+    monkeypatch.setattr(content_scout, "_default_ideas_runner", lambda prompt: (_ for _ in ()).throw(RuntimeError("offline")))
+    calls.clear()
+    content_scout.discover_hidden_gems(topic="martial_arts", source="youtube", limit=3, refresh=True)
+    assert calls == list(content_scout.SCOUT_TOPICS["martial_arts"]["youtube"][2:4])  # rotation continues, deeper
+
+
+def test_scout_topic_select_is_generated_from_catalog():
+    from movie_review_factory.webapp import INDEX_HTML
+
+    assert "<!--@scout-topics-->" not in INDEX_HTML
+    for topic in ("all", "zombie_apocalypse", "hidden_identity", "palace_intrigue", "asian_horror"):
+        assert f'<option value="{topic}">' in INDEX_HTML
+    assert content_scout.build_vietnamese_copy("t", "s", [], "zombie_apocalypse", "youtube", 90)[0].startswith("Xác sống")
 
 
 def test_enqueue_gem_for_review():

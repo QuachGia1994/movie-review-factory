@@ -7,12 +7,14 @@ import re
 import shutil
 import subprocess
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Callable, Iterator
 
-from . import agy_vision, branding, cancellation, mask_detection, narration_style, scene_scoring, semantic_search, visual_rhythm, visual_variety, watermark_removal
+from . import agy_vision, branding, cancellation, genre_tone, mask_detection, midroll, narration_style, packaging, scene_scoring, semantic_search, shot_planner, visual_rhythm, visual_variety, watermark_removal
 from .agy_agent import run_agy_json
-from .content_agent import run_claude_json
+from .content_agent import ContentAgentError, run_claude_json
+from .creator_library import CreatorLibrary
 from .creative_brief import prompt_creative_brief, script_evidence_issues, stale_script_tags
 from .media_store import MediaStore
 from .models import Artifact, JobConfig, JobManifest, MediaAsset, Shot, StageResult, TranscriptSegment, VisualObservation
@@ -1310,11 +1312,42 @@ def _run_reasoning_agent(
     )
 
 
-def _with_narration_style(context: dict, language: str, sections: list | None = None) -> dict:
-    style = narration_style.prompt_style(language, sections)
+def _with_narration_style(context: dict, language: str, sections: list | None = None, factor: float = 1.0) -> dict:
+    style = narration_style.prompt_style(language, sections, factor)
     if style is not None:
         context["narration_style"] = style
     return context
+
+
+def _channel_context(root: Path, cfg: JobConfig) -> dict:
+    """Active channel identity plus this job's series position; never fails a stage."""
+    channel = {"name": "", "greeting": "", "channel_url": ""}
+    series = None
+    try:
+        library = CreatorLibrary(root.parent)
+        channel = library.active_channel_identity()
+        series = library.series_context(cfg.job_id)
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    if not channel["name"]:
+        try:
+            channel["name"] = branding.load_settings(root.parent)["name"]
+        except Exception:
+            channel["name"] = ""
+    channel["series"] = series or {}
+    return channel
+
+
+def _story_context(root: Path, cfg: JobConfig) -> dict:
+    channel = _channel_context(root, cfg)
+    return {
+        "genre": cfg.genre,
+        "review_format": cfg.review_format,
+        "channel_name": channel["name"],
+        "series": channel["series"],
+        "genre_voice": genre_tone.voice_label(cfg.language, cfg.genre),
+        "story_structure": packaging.structure_guide(cfg.language, cfg.review_format, channel, cfg.genre),
+    }
 
 
 # --- research: deterministic scaffold or content-agent research ---------------------
@@ -1406,7 +1439,11 @@ def _outline(root: Path, manifest: JobManifest) -> tuple[list[Artifact], str]:
             "Use the research and source-scene chronology below. Balance recap with original "
             "analysis, keep the hook useful, and do not invent scenes that are absent from the "
             "provided scene context. Treat creative brief as editorial preferences, not film facts. "
-            "Return 3-8 sections with relative time budgets."
+            "Follow the story_structure rules: hook first, open loops between sections, twist and "
+            "comment question in the last sections. "
+            + ("For an anthology, give each story its own section titled per story_structure. "
+               if cfg.review_format == "compilation" else "")
+            + "Return 3-8 sections with relative time budgets."
         ),
         context=_with_narration_style({
             "creative_brief": prompt_creative_brief(cfg, retention_advice=_retention_advice_for(root)),
@@ -1415,7 +1452,8 @@ def _outline(root: Path, manifest: JobManifest) -> tuple[list[Artifact], str]:
             "target_minutes": target_min,
             "research": research,
             "scenes": _scene_context(root),
-        }, cfg.language),
+            **_story_context(root, cfg),
+        }, cfg.language, factor=_speech_factor(cfg)),
         schema=_OUTLINE_AGENT_SCHEMA,
     )
     if agent is not None:
@@ -1435,7 +1473,7 @@ def _outline(root: Path, manifest: JobManifest) -> tuple[list[Artifact], str]:
 
     hook_min, cta_min = 0.5, 0.5
     body_min = max(target_min - hook_min - cta_min, 1.0)
-    hook_title, *body_titles, cta_title = narration_style.outline_titles(cfg.language)
+    hook_title, *body_titles, cta_title = narration_style.outline_titles(cfg.language, cfg.review_format)
     n = len(body_titles)
     per_body = round(body_min / n, 1)
     # Last section absorbs rounding slack so total never exceeds target_min.
@@ -1487,6 +1525,119 @@ def _script_markdown(script: dict) -> str:
     return "\n".join(lines)
 
 
+SCRIPT_LENGTH_TOLERANCE = 0.85
+SCRIPT_EXPAND_ROUNDS = 2
+SCRIPT_EXPAND_MIN_MINUTES = 0.5
+_SECTION_EXPAND_SCHEMA = {
+    "type": "object",
+    "properties": {"narration": {"type": "string"}},
+    "required": ["narration"],
+    "additionalProperties": False,
+}
+
+
+def _expand_short_sections(root: Path, manifest: JobManifest, sections: list[dict]) -> int:
+    """Rewrite sections far below their word target, in parallel; returns sections expanded."""
+    cfg = manifest.config
+    language = narration_style.language_name(cfg.language)
+    research = _read_json(root, "research.json")
+    scenes = _scene_context(root)
+
+    def target(section: dict) -> int:
+        return _target_words(section, cfg)
+
+    def expand(position: int) -> str | None:
+        section = sections[position]
+        current = narration_style.word_count(section["narration"])
+        try:
+            agent = _run_reasoning_agent(
+                root=root,
+                manifest=manifest,
+                stage="script_expand",
+                instruction=(
+                    f"Rewrite the {language} narration of section {section['title']!r} to about "
+                    f"{target(section)} words (within 10%; it has {current} now, counting whitespace-separated "
+                    "tokens). Keep its grounded facts, order and role in the video. Add concrete on-screen "
+                    "detail, character motivation and analysis from the research and scene context; "
+                    "no filler, repetition, or events that belong to the neighbouring sections."
+                ),
+                context=_with_narration_style({
+                    "movie_title": _movie_title(cfg),
+                    "language": cfg.language,
+                    "section": {"title": section["title"], "narration": section["narration"]},
+                    "previous_section": sections[position - 1]["title"] if position else "",
+                    "next_section": sections[position + 1]["title"] if position + 1 < len(sections) else "",
+                    "research": research,
+                    "scenes": scenes,
+                }, cfg.language, factor=_speech_factor(cfg)),
+                schema=_SECTION_EXPAND_SCHEMA,
+            )
+        except ContentAgentError:
+            return None
+        narration = str((agent or {}).get("narration") or "").strip()
+        return narration if narration_style.word_count(narration) > current else None
+
+    expanded: set[int] = set()
+    for _ in range(SCRIPT_EXPAND_ROUNDS):
+        short = [
+            position for position, section in enumerate(sections)
+            if section["budget_minutes"] >= SCRIPT_EXPAND_MIN_MINUTES
+            and narration_style.word_count(section["narration"]) < SCRIPT_LENGTH_TOLERANCE * target(section)
+        ]
+        if not short:
+            break
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            rewrites = list(executor.map(expand, short))
+        for position, narration in zip(short, rewrites):
+            if narration:
+                sections[position]["narration"] = narration
+                expanded.add(position)
+    return len(expanded)
+
+
+def _auto_midroll(root: Path, manifest: JobManifest, sections: list[dict]) -> tuple[list[dict], str]:
+    """Insert an AGY-written like/subscribe CTA near the narration midpoint; never fails the script.
+
+    The CTA is always written by AGY (same as the manual midroll panel), whichever agent wrote
+    the script. ``MRF_AUTO_CTA=0`` disables it; scaffold jobs never call an agent.
+    """
+    cfg = manifest.config
+    if os.environ.get("MRF_AUTO_CTA", "1").strip().lower() in ("0", "false", "no", "off"):
+        return sections, ""
+    if cfg.content_agent not in ("claude", "agy"):
+        return sections, ""
+    if not sections or any(section.get("midroll") for section in sections):
+        return sections, ""
+    estimate, index = midroll.cta_position(sections)
+    if not index:
+        return sections, "CTA skipped: no section boundary"
+    try:
+        brand_name = branding.load_settings(root.parent)["name"]
+    except Exception:
+        brand_name = ""
+    try:
+        context = {
+            "movie_title": _movie_title(cfg),
+            "previous_narration_tail": estimate[index - 1]["narration"][-600:],
+            "next_narration_head": estimate[index]["narration"][:600],
+        }
+        agent = run_agy_json(
+            stage="script_cta",
+            prompt=midroll.cta_prompt(
+                cfg.language, brand_name or "this channel", _movie_title(cfg),
+                estimate[index - 1]["title"], estimate[index]["title"],
+            ) + "\n\nCONTEXT:\n" + json.dumps(context, ensure_ascii=False),
+            schema=midroll.CTA_SCHEMA,
+        )
+    except ContentAgentError as exc:
+        return sections, f"CTA skipped: {exc}"
+    line = midroll.clean_line((agent or {}).get("line"))
+    if not line:
+        return sections, "CTA skipped: empty or too long"
+    sections, index = midroll.insert_cta(sections, line, cfg.language)
+    return sections, f"CTA after {sections[index - 1]['title']!r}"
+
+
 @register_stage("script")
 def _script(root: Path, manifest: JobManifest) -> tuple[list[Artifact], str]:
     """Turn the outline into script.json + script.md behind a human approval gate."""
@@ -1509,7 +1660,9 @@ def _script(root: Path, manifest: JobManifest) -> tuple[list[Artifact], str]:
             "in the supplied research and scene context, add analysis instead of merely retelling, "
             "avoid long verbatim dialogue, and write enough narration to fit each section budget. "
             "Treat creative brief as editorial preferences, not film facts. "
-            "When narration_style is present, follow its guide and hit each section_word_targets entry within 10%."
+            "When narration_style is present, follow its guide and hit each section_word_targets entry within 10%. "
+            "Follow every story_structure rule, including the genre voice rules tagged in brackets; "
+            "picture-sync rules still apply to each sentence."
         ),
         context=_with_narration_style({
             "creative_brief": __import__("movie_review_factory.creative_brief", fromlist=["prompt_creative_brief"]).prompt_creative_brief(cfg, retention_advice=_retention_advice_for(root)),
@@ -1519,7 +1672,8 @@ def _script(root: Path, manifest: JobManifest) -> tuple[list[Artifact], str]:
             "research": _read_json(root, "research.json"),
             "outline": outline,
             "scenes": _scene_context(root),
-        }, cfg.language, raw_sections),
+            **_story_context(root, cfg),
+        }, cfg.language, raw_sections, factor=_speech_factor(cfg)),
         schema=_SCRIPT_AGENT_SCHEMA,
     )
 
@@ -1556,7 +1710,15 @@ def _script(root: Path, manifest: JobManifest) -> tuple[list[Artifact], str]:
             })
         notes = str(agent.get("notes") or "").strip()
         generator = cfg.content_agent
-        message = f"script generated by {_agent_display(cfg.content_agent)} (approval required before TTS)"
+        expanded = _expand_short_sections(root, manifest, sections)
+        words = sum(narration_style.word_count(section["narration"]) for section in sections)
+        goal = sum(_target_words(section, cfg) for section in sections)
+        sections, cta_note = _auto_midroll(root, manifest, sections)
+        message = (
+            f"script generated by {_agent_display(cfg.content_agent)} ({words}/{goal} words"
+            f"{f', {expanded} sections expanded' if expanded else ''}"
+            f"{f', {cta_note}' if cta_note else ''}; approval required before TTS)"
+        )
     else:
         # Normalise: sections may arrive as plain strings (legacy) or dicts.
         for section in raw_sections:
@@ -1586,6 +1748,10 @@ def _script(root: Path, manifest: JobManifest) -> tuple[list[Artifact], str]:
         "sections": sections,
         "notes": notes,
         "generator": generator,
+        "word_count": sum(narration_style.word_count(section["narration"]) for section in sections),
+        "target_words": sum(
+            _target_words(section, cfg) for section in sections
+        ),
     }
     json_art = _write_json(root, "script.json", script_data)
     md_art = _write_text(root, "script.md", _script_markdown(script_data))
@@ -1804,9 +1970,13 @@ def _assign_source_shots(
 
 def _expand_scene_plan_clips(
     sections: list[dict],
-    assignments: list[list[tuple[dict, str]]],
+    assignments: list[list[tuple]],
 ) -> tuple[list[dict], float]:
-    """Expand each narration section into ordered top-level visual shot clips."""
+    """Expand each narration section into ordered top-level visual shot clips.
+
+    A shot is ``(source_clip, rationale)`` or ``(source_clip, rationale, extras)``;
+    extras with a ``weight`` split the section time by weight instead of evenly.
+    """
     if len(assignments) != len(sections):
         raise ValueError("scene plan assignment count does not match script sections")
 
@@ -1814,15 +1984,17 @@ def _expand_scene_plan_clips(
     cursor = 0.0
     for section_index, (section, shots) in enumerate(zip(sections, assignments), start=1):
         duration = max(float(section.get("duration_seconds") or 0.0), 0.0)
-        shot_entries = shots or [(None, "")]
+        shot_entries = [tuple(shot) + ({},) * (3 - len(shot)) for shot in shots] or [(None, "", {})]
         shot_count = len(shot_entries)
+        weights = [float(extras.get("weight") or 1.0) for _, _, extras in shot_entries]
+        total_weight = sum(weights)
         allocated = 0.0
-        for shot_index, (source_clip, rationale) in enumerate(shot_entries, start=1):
+        for shot_index, (source_clip, rationale, extras) in enumerate(shot_entries, start=1):
             if duration > 0:
                 shot_duration = (
                     duration - allocated
                     if shot_index == shot_count
-                    else duration / shot_count
+                    else duration * weights[shot_index - 1] / total_weight
                 )
             else:
                 shot_duration = 0.0
@@ -1832,14 +2004,26 @@ def _expand_scene_plan_clips(
                 "section_index": section_index,
                 "shot_index": shot_index,
                 "shot_count": shot_count,
-                "type": "narration",
+                "type": "midroll" if section.get("midroll") else "narration",
                 "start_seconds": cursor,
                 "duration_seconds": shot_duration,
                 "source_clip": source_clip,
                 "notes": rationale,
+                **extras,
             })
             cursor += shot_duration
     return clips, cursor
+
+
+def _fill_midroll_shots(sections: list[dict], assignments: list[list[tuple]]) -> None:
+    """Give each shot-less CTA section the opening shot of the next (else previous) section."""
+    for position, section in enumerate(sections):
+        if not section.get("midroll") or assignments[position]:
+            continue
+        neighbours = [assignments[i][0] for i in range(position + 1, len(sections)) if assignments[i]]
+        neighbours += [assignments[i][-1] for i in range(position - 1, -1, -1) if assignments[i]]
+        if neighbours:
+            assignments[position] = [(neighbours[0][0], "Mid-roll CTA over the neighbouring scene")]
 
 
 def _scene_range_key(scene: dict) -> tuple[float, float]:
@@ -2201,6 +2385,9 @@ def _scene_plan(root: Path, manifest: JobManifest) -> tuple[list[Artifact], str]
     story_error = ""
     story_graph: dict = {"entities": [], "scene_entities": [], "relations": []}
     database = root / "media_index.sqlite3"
+    beat_assignments: list | None = None
+    shot_mode = "section"
+    shot_error = ""
 
     if scenes:
         if cfg.content_agent in ("claude", "agy") and cfg.source_video:
@@ -2217,6 +2404,23 @@ def _scene_plan(root: Path, manifest: JobManifest) -> tuple[list[Artifact], str]
             story_error = memory["story_error"]
             story_graph = memory["story_graph"]
 
+        if cfg.content_agent == "agy" and visual_observations:
+            try:
+                beat_assignments = shot_planner.plan_beat_shots(
+                    sections,
+                    scenes,
+                    run_agent=lambda stage, instruction, context, schema: _run_reasoning_agent(
+                        root=root, manifest=manifest, stage=stage, instruction=instruction,
+                        context=context, schema=schema, allowed_tools=[],
+                    ),
+                    words_per_minute=_words_per_minute(cfg),
+                    movie_title=_movie_title(cfg),
+                )
+                shot_mode = "beat"
+            except (ContentAgentError, shot_planner.ShotPlanError) as exc:
+                shot_error = str(exc)
+
+    if scenes and beat_assignments is None:
         candidates = _retrieve_scene_candidates(sections, scenes_doc)
         if database.is_file():
             try:
@@ -2254,7 +2458,11 @@ def _scene_plan(root: Path, manifest: JobManifest) -> tuple[list[Artifact], str]
             allowed_tools=[],
         )
 
-    if agent is not None:
+    if beat_assignments is not None:
+        scene_assignments = beat_assignments
+        generator = cfg.content_agent
+        plan_notes = "One AGY-picked source scene per narration beat (located on the film timeline first)."
+    elif agent is not None:
         scene_assignments = _agent_scene_assignments(
             sections,
             scenes_doc,
@@ -2272,6 +2480,15 @@ def _scene_plan(root: Path, manifest: JobManifest) -> tuple[list[Artifact], str]
             else "Scene plan scaffold. Populate source shots from scenes.json after transcript/scenes stages."
         )
 
+    _fill_midroll_shots(sections, scene_assignments)
+    # A shot longer than ~3 s becomes a forward montage so the picture keeps up with the voice.
+    shot_seconds = shot_planner.shot_target_seconds()
+    before = sum(len(shots) for shots in scene_assignments)
+    scene_assignments = shot_planner.pace_shots(
+        sections, scene_assignments, scenes,
+        words_per_minute=_words_per_minute(cfg), shot_seconds=shot_seconds,
+    )
+    montage_shots = sum(len(shots) for shots in scene_assignments) - before
     clips, cursor = _expand_scene_plan_clips(sections, scene_assignments)
     resolved = sum(1 for clip in clips if clip["source_clip"] is not None)
     data = {
@@ -2281,6 +2498,10 @@ def _scene_plan(root: Path, manifest: JobManifest) -> tuple[list[Artifact], str]
         "clips": clips,
         "notes": plan_notes,
         "generator": generator,
+        "shot_mode": shot_mode,
+        "pacing": {"shot_seconds": shot_seconds, "matched_shots": before,
+                   "montage_shots": montage_shots},
+        "shot_error": shot_error,
         "visual_mode": visual_mode,
         "visual_descriptions": [
             {"scene_index": index, "description": observation["description"]}
@@ -2345,13 +2566,22 @@ _TTS_PERCENT_RE = re.compile(r"^[+-]\d{1,3}%$")
 _TTS_HZ_RE = re.compile(r"^[+-]\d{1,3}Hz$")
 
 
-def _tts_prosody() -> dict[str, str]:
-    """Resolve edge-tts prosody (rate/pitch/volume) from an emotion preset plus
-    explicit env overrides. Invalid or no-op ("+0%"/"+0Hz") values are dropped so
-    the default is plain, unmodified narration and existing renders are unchanged.
+_EDGE_VOICE_RE = re.compile(r"^[a-z]{2,3}-[A-Z]{2}-\w+Neural$")
+
+
+def _voice_genre(cfg: JobConfig) -> str:
+    """Genre that drives voice and prosody; MRF_GENRE_VOICE=0 keeps the plain default voice."""
+    off = os.environ.get("MRF_GENRE_VOICE", "1").strip().lower() in ("0", "false", "no", "off")
+    return "" if off else cfg.genre
+
+
+def _tts_prosody(genre: str = "") -> dict[str, str]:
+    """Resolve edge-tts prosody (rate/pitch/volume): genre preset, replaced by an
+    MRF_TTS_EMOTION preset, then explicit env overrides. Invalid or no-op
+    ("+0%"/"+0Hz") values are dropped so plain jobs keep unmodified narration.
     """
     preset = os.environ.get("MRF_TTS_EMOTION", "").strip().lower()
-    values = dict(_TTS_EMOTION_PRESETS.get(preset, {}))
+    values = dict(_TTS_EMOTION_PRESETS[preset]) if preset in _TTS_EMOTION_PRESETS else genre_tone.prosody(genre)
     for key, env_name in (("rate", "MRF_TTS_RATE"), ("pitch", "MRF_TTS_PITCH"), ("volume", "MRF_TTS_VOLUME")):
         raw = os.environ.get(env_name, "").strip()
         if raw:
@@ -2363,6 +2593,26 @@ def _tts_prosody() -> dict[str, str]:
             continue
         prosody[key] = value
     return prosody
+
+
+def _speech_factor(cfg: JobConfig) -> float:
+    """Speaking-rate multiplier the TTS stage will apply, so word budgets keep the target length."""
+    from . import tts_providers
+    try:
+        provider = tts_providers.resolve_provider(cfg)
+    except tts_providers.TTSProviderError:
+        return 1.0
+    if provider not in genre_tone.RATE_PROVIDERS:
+        return 1.0
+    return genre_tone.rate_factor(_tts_prosody(_voice_genre(cfg)).get("rate", ""))
+
+
+def _words_per_minute(cfg: JobConfig) -> int:
+    return round(narration_style.words_per_minute(cfg.language) * _speech_factor(cfg))
+
+
+def _target_words(section: dict, cfg: JobConfig) -> int:
+    return round(max(float(section.get("budget_minutes") or 0), 0.0) * _words_per_minute(cfg))
 
 
 @register_stage("tts")
@@ -2411,11 +2661,15 @@ def _tts(root: Path, manifest: JobManifest) -> tuple[list[Artifact], str]:
             import edge_tts
         except ImportError as exc:
             raise SkipStage("edge-tts not installed - install the tts extra") from exc
-        voice = VOICE_BY_LANGUAGE.get(cfg.language, DEFAULT_TTS_VOICE)
+        explicit = str(cfg.tts_voice or "").strip()
+        voice = (
+            explicit if _EDGE_VOICE_RE.match(explicit)
+            else genre_tone.voice("edge", cfg.language, _voice_genre(cfg)) or VOICE_BY_LANGUAGE.get(cfg.language, DEFAULT_TTS_VOICE)
+        )
         no_audio_error = getattr(getattr(edge_tts, "exceptions", None), "NoAudioReceived", None)
         if no_audio_error is None:
             no_audio_error = type("_NoAudioReceived", (Exception,), {})
-        prosody = _tts_prosody()
+        prosody = _tts_prosody(_voice_genre(cfg))
         communicate_factory = edge_tts.Communicate
         if prosody:
             # Bake the prosody into the factory so chunked_tts / narration_alignment
@@ -2448,12 +2702,15 @@ def _tts(root: Path, manifest: JobManifest) -> tuple[list[Artifact], str]:
             raise SkipStage(tts_providers.missing_key_message(provider))
         if not ffprobe:
             raise SkipStage("ffprobe not on PATH - required to time non-edge TTS providers")
-        voice = tts_providers.resolve_voice(provider, cfg=cfg)
-        prosody = {}
+        explicit = str(cfg.tts_voice or "").strip() or os.environ.get(tts_providers.VOICE_ENV, "").strip()
+        voice = explicit or genre_tone.voice(provider, cfg.language, _voice_genre(cfg)) or tts_providers.resolve_voice(provider, cfg=cfg)
+        rate = _tts_prosody(_voice_genre(cfg)).get("rate", "")
+        prosody = {"rate": rate} if rate else {}
         communicate_factory = None
         no_audio_error = type("_NoAudioReceived", (Exception,), {})
         synthesize = tts_providers.build_synthesize(
             provider, api_key=api_key, ffprobe_bin=ffprobe or "ffprobe",
+            speed=genre_tone.rate_factor(rate),
         )
         engine = provider
         timing_mode = "estimated_word_timing"
@@ -2726,18 +2983,25 @@ RENDER_LOUDNESS_LUFS = -14
 RENDER_TRUE_PEAK_DB = -1.5
 
 
+LONG_RANGE_CENTER_SECONDS = 1.0
+
+
 def _extend_short_ranges(ranges: list[dict], source_duration: float) -> None:
     """Set each clip's read window, growing short clips into adjacent unused footage.
 
     A clip whose timeline slot outlasts its source range reads further forward, then
     backward, but never into another clip's range or a previous extension, so the
-    renderer loops frames only when no neighbouring footage is free.
+    renderer loops frames only when no neighbouring footage is free. A range much
+    longer than its slot reads its middle instead of only its opening seconds.
     """
     occupied = [(item["start_seconds"], item["end_seconds"], item["index"]) for item in ranges]
     for item in ranges:
         start, end = item["start_seconds"], item["end_seconds"]
         need = item["duration_seconds"] - (end - start)
-        if need > 0.05:
+        if need < -LONG_RANGE_CENTER_SECONDS:
+            item["read_start_seconds"] = start - need / 2
+            item["read_seconds"] = item["duration_seconds"]
+        elif need > 0.05:
             others = [(s, e) for s, e, owner in occupied if owner != item["index"]]
             after = min([max(s, end) for s, e in others if e > end] + [source_duration])
             grow = min(need, max(0.0, after - end))
@@ -2749,6 +3013,68 @@ def _extend_short_ranges(ranges: list[dict], source_duration: float) -> None:
             occupied.append((start, end, item["index"]))
             item["read_start_seconds"] = start
             item["read_seconds"] = end - start
+
+
+_SPOKEN_TOKEN = re.compile(r"[^\W_]+", re.UNICODE)
+BEAT_MIN_TIMED_SECONDS = 0.3
+
+
+def _spoken_word_starts(boundaries: object) -> list[float]:
+    """Start time of every spoken token in the TTS word boundaries (ticks of 100 ns)."""
+    starts: list[float] = []
+    for item in boundaries if isinstance(boundaries, list) else []:
+        try:
+            start = float(item["offset"]) / 10_000_000
+            end = (float(item["offset"]) + float(item["duration"])) / 10_000_000
+        except (KeyError, TypeError, ValueError):
+            continue
+        parts = _SPOKEN_TOKEN.findall(str(item.get("text", "")).casefold())
+        if not parts or not (math.isfinite(start) and math.isfinite(end)) or end <= start:
+            continue
+        starts.extend(start + (end - start) * index / len(parts) for index in range(len(parts)))
+    return starts
+
+
+def _beat_timed_durations(items: list[dict], start: float, end: float, spoken: list[float]) -> list[float] | None:
+    """Clip seconds inside one section where each narration beat starts on its first spoken word.
+
+    Clips sharing a ``beat`` key (a montage) split their beat by weight. Returns None when
+    the section has no per-beat narration or no word timing, so the caller falls back to
+    splitting the section by weight.
+    """
+    groups: list[list[int]] = []
+    for position, item in enumerate(items):
+        key = item.get("beat")
+        if groups and key is not None and items[groups[-1][0]].get("beat") == key:
+            groups[-1].append(position)
+        else:
+            groups.append([position])
+    texts = [items[group[0]].get("narration") for group in groups]
+    if len(groups) < 2 or not all(isinstance(text, str) and text.strip() for text in texts):
+        return None
+    words = [moment for moment in spoken if start <= moment < end]
+    counts = [len(_SPOKEN_TOKEN.findall(text.casefold())) for text in texts]
+    total = sum(counts)
+    if not words or total <= 0:
+        return None
+    edges = [start]
+    cumulative = 0
+    for count in counts[:-1]:
+        cumulative += count
+        edges.append(max(edges[-1], words[min(len(words) - 1, round(cumulative * len(words) / total))]))
+    edges.append(end)
+    durations = [0.0] * len(items)
+    for group, left, right in zip(groups, edges, edges[1:]):
+        span = right - left
+        if span < BEAT_MIN_TIMED_SECONDS:
+            return None
+        weights = [float(items[position].get("weight") or 1.0) for position in group]
+        allocated = 0.0
+        for order, position in enumerate(group):
+            share = span - allocated if order == len(group) - 1 else span * weights[order] / sum(weights)
+            durations[position] = share
+            allocated += share
+    return durations
 
 
 def _render_source_ranges(clips: list[object], source_duration: float) -> list[dict]:
@@ -2793,7 +3119,7 @@ def _render_source_ranges(clips: list[object], source_duration: float) -> list[d
             "source_seconds": source_seconds,
             "duration_seconds": target_seconds,
         }
-        for key in ("section_index", "shot_index", "shot_count"):
+        for key in ("section_index", "shot_index", "shot_count", "weight", "beat", "narration"):
             if key in clip:
                 item[key] = clip[key]
         ranges.append(item)
@@ -3061,18 +3387,27 @@ def _render(root: Path, manifest: JobManifest) -> tuple[list[Artifact], str]:
     voice_timed_visuals = bool(bounds_by_section) and all(
         item.get("section_index") in bounds_by_section for item in ranges
     )
+    beat_timed_sections = 0
     if voice_timed_visuals:
-        counts: dict[int, int] = {}
+        members: dict[int, list[dict]] = {}
         for item in ranges:
-            section = item["section_index"]
-            counts[section] = counts.get(section, 0) + 1
-        positions: dict[int, int] = {}
-        for item in ranges:
-            section = item["section_index"]
-            position = positions.get(section, 0)
-            positions[section] = position + 1
-            span = bounds_by_section[section]["end_seconds"] - bounds_by_section[section]["start_seconds"]
-            item["duration_seconds"] = span / counts[section] if position < counts[section] - 1 else span - span / counts[section] * position
+            members.setdefault(item["section_index"], []).append(item)
+        spoken = _spoken_word_starts(_read_json(root, "voice.json").get("word_boundaries"))
+        for section, items in members.items():
+            bound = bounds_by_section[section]
+            span = bound["end_seconds"] - bound["start_seconds"]
+            timed = _beat_timed_durations(items, bound["start_seconds"], bound["end_seconds"], spoken)
+            if timed is not None:
+                beat_timed_sections += 1
+                for item, share in zip(items, timed):
+                    item["duration_seconds"] = share
+                continue
+            weights = [float(item.get("weight") or 1.0) for item in items]
+            allocated = 0.0
+            for position, item in enumerate(items):
+                share = span - allocated if position == len(items) - 1 else span * weights[position] / sum(weights)
+                item["duration_seconds"] = share
+                allocated += share
     _extend_short_ranges(ranges, source_duration)
     width, height = RENDER_CANVASES[ratio]
     max_height_raw = os.environ.get("MRF_RENDER_MAX_HEIGHT", "").strip()
@@ -3091,14 +3426,32 @@ def _render(root: Path, manifest: JobManifest) -> tuple[list[Artifact], str]:
     # for jobs whose footage has verified letterbox bands.
     titles = branding.chapter_titles([item["section"] for item in ranges], cfg.movie_title or "")
     unique_titles = list(dict.fromkeys(titles))
+    # Brand guard without a top band: docs/research/brand-guard.md.
+    guard = branding.brand_guard_enabled()
     overlay_paths = []
     for number, title in enumerate(unique_titles):
         overlay = root / f"brand-overlay-{number}.png"
         branding.render_overlay(
             root.parent, overlay, width, height, title,
             cfg.brand_top_band, cfg.brand_bottom_band,
+            include_mark=not guard or bool(cfg.brand_top_band),
         )
         overlay_paths.append(overlay)
+    guard_layers: list[tuple[Path, tuple[str, str]]] = []
+    if guard:
+        mark_margin = max(12, round(width * .028))
+        if not cfg.brand_top_band:
+            guard_layers.append((
+                branding.render_mark(root.parent, root / "brand-mark.png", height),
+                branding.mark_overlay_xy(mark_margin),
+            ))
+        seed = int(hashlib.sha256(cfg.job_id.encode("utf-8")).hexdigest()[:6], 16) % 1000 / 7
+        guard_layers.append((
+            branding.render_ghost(root.parent, root / "brand-ghost.png", height),
+            branding.ghost_overlay_xy(mark_margin, seed),
+        ))
+    chapter_overlay_count = len(overlay_paths)
+    overlay_paths.extend(path for path, _ in guard_layers)
     filter_parts: list[str] = []
     # Each clip is decoded from its OWN seeked source input (built after the
     # other inputs, below) instead of N trims of a single shared [0:v]. A single
@@ -3142,6 +3495,14 @@ def _render(root: Path, manifest: JobManifest) -> tuple[list[Artifact], str]:
         filter_parts.append(
             f"[{video_label}][{number + 2}:v]overlay=0:0:"
             f"enable='{windows}':shortest=0:format=auto[{next_label}]"
+        )
+        video_label = next_label
+    for offset, (_, (x_expr, y_expr)) in enumerate(guard_layers):
+        next_label = f"guarded{offset}"
+        x_expr, y_expr = (expr.replace(",", "\\,") for expr in (x_expr, y_expr))
+        filter_parts.append(
+            f"[{video_label}][{chapter_overlay_count + offset + 2}:v]overlay="
+            f"x='{x_expr}':y='{y_expr}':shortest=0:format=auto[{next_label}]"
         )
         video_label = next_label
     if subtitles_path.stat().st_size:
@@ -3458,7 +3819,9 @@ def _render(root: Path, manifest: JobManifest) -> tuple[list[Artifact], str]:
         "output_duration_seconds": output_duration,
         "duration_drift_seconds": abs(output_duration - total_duration),
         "clips": ranges,
-        "visual_timing_mode": "voice_section_bounds" if voice_timed_visuals else "scene_plan_estimate",
+        "visual_timing_mode": ("voice_beat_words" if beat_timed_sections
+                               else "voice_section_bounds" if voice_timed_visuals else "scene_plan_estimate"),
+        "beat_timed_sections": beat_timed_sections,
         "audio_mix": {
             "provenance": list(mix.provenance),
             "voice_master": True,
@@ -3657,54 +4020,65 @@ def _qa(root: Path, manifest: JobManifest) -> tuple[list[Artifact], str]:
 
 @register_stage("metadata")
 def _metadata(root: Path, manifest: JobManifest) -> tuple[list[Artifact], str]:
-    """Draft platform metadata (title, description, tags) from script + outline."""
+    """Draft YouTube packaging: curiosity titles, hook description with chapters, hashtags, pinned comment."""
     cfg = manifest.config
     script = _read_json(root, "script.json")
     outline = _read_json(root, "outline.json")
+    movie = _movie_title(cfg)
+    channel = _channel_context(root, cfg)
+    series = channel["series"]
+    vi = narration_style.is_vietnamese(cfg.language)
 
     # Prefer script sections (they inherit outline titles); fall back to outline.
     raw_sections = script.get("sections") or outline.get("sections") or []
-    section_titles = [
-        s["title"] if isinstance(s, dict) else s for s in raw_sections
-    ]
-    if narration_style.is_vietnamese(cfg.language):
-        title = f"[{cfg.language.upper()}] Review/Recap – {cfg.job_id}"
-        description_lines = [
-            f"Review / Recap phim – {cfg.job_id}",
-            "",
-            "Nội dung video:",
-            *[f"• {t}" for t in section_titles],
-            "",
-            "---",
-            "⚠️ Bản nháp – chỉnh sửa trước khi publish.",
-        ]
-        base_tags = ["review", "recap", "phim", cfg.language]
-    else:
-        movie = _movie_title(cfg)
-        title = f"{movie} – Movie Recap"
-        description_lines = [
-            f"Movie recap and review – {movie}",
-            "",
-            "In this video:",
-            *[f"• {t}" for t in section_titles],
-            "",
-            "---",
-            "Draft – edit before publishing.",
-        ]
-        base_tags = ["movie recap", "movie review", "recap", cfg.language]
-    tags = base_tags + [t.lower().replace(" ", "-") for t in section_titles[:5]]
+    narration = " ".join(
+        str(s.get("narration") or "") for s in raw_sections if isinstance(s, dict) and not s.get("midroll")
+    )
+    agent, note = {}, "draft metadata written"
+    auto = os.environ.get("MRF_AUTO_PACKAGING", "1").strip().lower() not in ("0", "false", "no", "off")
+    if auto and cfg.content_agent in ("claude", "agy") and narration.strip():
+        context = {"movie_title": movie, "genre": cfg.genre, "script_head": narration[:2500], "script_tail": narration[-1200:]}
+        try:
+            agent = packaging.clean_packaging(run_agy_json(
+                stage="metadata_packaging",
+                prompt=packaging.packaging_prompt(cfg.language, movie, cfg.genre, channel["name"], cfg.review_format)
+                + "\n\nCONTEXT:\n" + json.dumps(context, ensure_ascii=False),
+                schema=packaging.PACKAGING_SCHEMA,
+            ))
+            note = "metadata packaged by AGY"
+        except ContentAgentError as exc:
+            note = f"draft metadata written (AGY packaging skipped: {exc})"
+    titles = list(dict.fromkeys(
+        (agent.get("titles") or []) + packaging.fallback_titles(cfg.language, movie, cfg.genre, cfg.review_format)
+    ))
+    tags_hash = packaging.hashtags(cfg.language, movie, channel["name"], cfg.genre)
+    subscribe = packaging.subscribe_link(channel["channel_url"])
+    chapter_text = packaging.chapters(_read_json(root, "render.json"), script)
+    question = agent.get("comment_question") or packaging.fallback_comment_question(cfg.language, movie, cfg.review_format, cfg.genre)
+    base_tags = ["review phim", "tóm tắt phim", "recap"] if vi else ["movie recap", "movie review", "recap"]
+    tags = list(dict.fromkeys(
+        [movie, *(agent.get("tags") or []), *base_tags, *([cfg.genre] if cfg.genre else []), cfg.language]
+    ))
     meta = {
         "job_id": cfg.job_id,
-        "title": title,
-        "description": "\n".join(description_lines),
+        "title": titles[0],
+        "title_options": titles[:4],
+        "description": packaging.description(
+            language=cfg.language, hook=agent.get("hook") or "", movie=movie,
+            chapter_text=chapter_text, tags=tags_hash, subscribe_url=subscribe, series=series,
+        ),
         "tags": tags,
+        "hashtags": tags_hash,
+        "pinned_comment": packaging.pinned_comment(
+            cfg.language, question, channel["name"], subscribe, series.get("next", ""),
+        ),
         "language": cfg.language,
         "aspect_ratio": cfg.aspect_ratio,
         "approved": False,
         "publish": False,
-        "notes": "Edit title/description/tags, set approved=true before publish stage.",
+        "notes": "Edit title/description/tags/pinned comment, set approved=true before publish stage.",
     }
-    return [_write_json(root, "youtube_metadata.json", meta)], "draft metadata written"
+    return [_write_json(root, "youtube_metadata.json", meta)], note
 
 
 # --- thumbnail: deterministic clean-frame candidates ------------------------
@@ -4280,7 +4654,7 @@ def update_metadata(root: Path, fields: dict) -> dict:
     if not path.exists():
         raise FileNotFoundError(f"{METADATA_NAME} missing - run the metadata stage first")
     meta = json.loads(path.read_text(encoding="utf-8"))
-    for key in ("title", "description", "tags"):
+    for key in ("title", "description", "tags", "pinned_comment"):
         if key in fields and fields[key] is not None:
             meta[key] = fields[key]
     meta["approved"] = False

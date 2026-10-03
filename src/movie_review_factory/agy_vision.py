@@ -20,6 +20,8 @@ BATCH_SIZE = 12
 # Story-graph scene evidence per AGY call; the backend rejects prompts above ~26,000 chars.
 STORY_CHUNK_CHARS = 18000
 IDENTITY_FRESH_LABELS = 12
+# 12 frames per call with all four accounts busy can take over two minutes.
+VISION_TIMEOUT_SECONDS = 240
 MODEL = "gemini-3.7-flash-medium"
 
 
@@ -44,6 +46,13 @@ def _source_stamp(source: Path) -> str:
     except OSError:
         return str(source)
     return f"{source}:{stat.st_mtime_ns}:{stat.st_size}"
+
+
+def _rotate_transient(exc: VisionUnavailable) -> None:
+    """Retry timeouts and unusable output on another account; quota and HTTP rejections keep their own path."""
+    if isinstance(exc, QuotaExhausted) or isinstance(exc.__cause__, urllib.error.HTTPError):
+        raise exc
+    raise pool_scheduler.RotateSignal(str(exc)) from exc
 
 
 def _resume_key(prefix: str, basis: str) -> str:
@@ -246,7 +255,7 @@ def _describe_batch(url: str, root: Path, token: str, frames: list[dict]) -> dic
         method="POST",
     )
     try:
-        with urllib.request.urlopen(request, timeout=135) as response:
+        with urllib.request.urlopen(request, timeout=VISION_TIMEOUT_SECONDS) as response:
             result = json.loads(response.read())
     except urllib.error.HTTPError as exc:
         detail = exc.read(4096).decode("utf-8", errors="replace")
@@ -293,6 +302,7 @@ def describe_candidate_observations(
     offsets = list(range(0, len(ordered), BATCH_SIZE))
     scheduler = pool_scheduler.PoolScheduler(workers)
     unsupported: set[str] = set()
+    errors: list[str] = []
     key = _resume_key(
         "vision:describe",
         f"{_source_stamp(source)}|"
@@ -320,12 +330,19 @@ def describe_candidate_observations(
             except VisionUnsupported as exc:
                 unsupported.add(role)
                 raise pool_scheduler.RotateSignal(str(exc)) from exc
+            except QuotaExhausted:
+                raise
+            except VisionUnavailable as exc:
+                errors.append(str(exc))
+                _rotate_transient(exc)
 
         result = scheduler.run(key, attempt, units=offsets, rotate_on_error=False, parallel=True)
 
     if len(result.data) != len(offsets):
         if unsupported:
             raise VisionUnavailable("AGY vision unavailable across configured accounts")
+        if errors:
+            raise VisionUnavailable(f"{errors[-1]} ({len(offsets) - len(result.data)} batches left for the next run)")
         raise VisionUnavailable("AGY vision quota exhausted across configured accounts")
     observations: dict[int, dict] = {}
     for offset in offsets:
@@ -420,7 +437,7 @@ def _identity_batch(
         method="POST",
     )
     try:
-        with urllib.request.urlopen(request, timeout=135) as response:
+        with urllib.request.urlopen(request, timeout=VISION_TIMEOUT_SECONDS) as response:
             result = json.loads(response.read())
     except urllib.error.HTTPError as exc:
         detail = exc.read(4096).decode("utf-8", errors="replace")
@@ -492,7 +509,10 @@ def track_anonymous_people(
                     {"label": label, "description": description}
                     for label, description in snapshot.items()
                 ]
-                return _identity_batch(url, root, token, staged, roster_payload, allowed)
+                try:
+                    return _identity_batch(url, root, token, staged, roster_payload, allowed)
+                except VisionUnavailable as exc:
+                    _rotate_transient(exc)
 
             result = scheduler.run(key, attempt, units=wave, rotate_on_error=False, parallel=True)
             if any(offset not in result.data for offset in wave):
@@ -576,7 +596,7 @@ def _parse_story_graph(
             if entity_type not in _STORY_TYPES or not label or not 0 <= confidence <= 1:
                 raise VisionUnavailable("AGY returned invalid story entity metadata")
             if entity_type == "person" and label not in allowed_people:
-                raise VisionUnavailable("AGY returned unknown anonymous person in story graph")
+                continue  # Only tracked anonymous labels may enter memory; drop names and untracked people.
             key = (entity_type, label)
             local_keys.add(key)
             entities.setdefault(key, {
@@ -615,11 +635,11 @@ def _parse_story_graph(
                 subject_type not in _STORY_TYPES
                 or object_type not in _STORY_TYPES
                 or not predicate
-                or subject_key not in local_keys
-                or object_key not in local_keys
                 or not 0 <= confidence <= 1
             ):
                 raise VisionUnavailable("AGY returned invalid story relation metadata")
+            if subject_key not in local_keys or object_key not in local_keys:
+                continue
             relations.append({
                 "scene_index": scene_id,
                 "subject_type": subject_type,
@@ -689,7 +709,7 @@ def extract_story_graph(
     scheduler = pool_scheduler.PoolScheduler(workers)
     key = _resume_key("vision:story", json.dumps(payload, ensure_ascii=False, sort_keys=True))
 
-    def attempt(worker: tuple, unit: object) -> dict:
+    def request_chunk(worker: tuple, unit: object) -> dict:
         _, url, root, token = worker
         chunk = chunks[int(unit)]
         request = urllib.request.Request(
@@ -707,7 +727,7 @@ def extract_story_graph(
             method="POST",
         )
         try:
-            with urllib.request.urlopen(request, timeout=150) as response:
+            with urllib.request.urlopen(request, timeout=VISION_TIMEOUT_SECONDS) as response:
                 result = json.loads(response.read())
         except urllib.error.HTTPError as exc:
             detail = exc.read(4096).decode("utf-8", errors="replace")
@@ -719,6 +739,12 @@ def extract_story_graph(
         if not isinstance(result, dict) or result.get("ok") is not True or not isinstance(result.get("text"), str):
             raise VisionUnavailable("AGY worker did not return story graph output")
         return _parse_story_graph(result["text"], {item["scene_id"] for item in chunk}, allowed_people)
+
+    def attempt(worker: tuple, unit: object) -> dict:
+        try:
+            return request_chunk(worker, unit)
+        except VisionUnavailable as exc:
+            _rotate_transient(exc)
 
     units = list(range(len(chunks)))
     outcome = scheduler.run(key, attempt, units=units, rotate_on_error=False, parallel=True)

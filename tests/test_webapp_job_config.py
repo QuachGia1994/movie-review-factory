@@ -71,6 +71,53 @@ def test_scout_enqueue_uses_candidate_and_active_channel_defaults(tmp_path, monk
     assert cfg.tts_voice == "banmai"
     assert cfg.watermark_removal.enabled is True
     assert cfg.watermark_removal.detect.method == "color"
+    assert cfg.target_minutes == 10
+
+
+def test_scout_quick_config_sets_review_target_minutes(tmp_path, monkeypatch):
+    service = JobsService(tmp_path)
+    monkeypatch.setattr(
+        "movie_review_factory.webapp.content_scout.enqueue_gem_for_review",
+        lambda candidate_id: {"candidate": {"id": candidate_id, "title": "Gem"}},
+    )
+    result = service.scout_enqueue({"candidate_id": "gem-1", "auto_create": True, "target_minutes": 18})
+    assert pipeline.load_manifest(tmp_path / result["created_job"]["job_id"]).config.target_minutes == 18
+    for bad in (0, 61, "abc"):
+        with pytest.raises(ValueError, match="Thời lượng review"):
+            service.scout_enqueue({"candidate_id": "gem-2", "auto_create": True, "target_minutes": bad})
+
+
+def test_overnight_batch_uses_quick_config_and_runs_to_final_video(tmp_path, monkeypatch):
+    import time
+    import movie_review_factory.webapp as webapp_mod
+
+    monkeypatch.setenv("MRF_AUTO_RUN", "1")
+    service = JobsService(tmp_path)
+    source = tmp_path / "dl.mp4"
+    source.write_bytes(b"\x00" * 16)
+    monkeypatch.setattr(webapp_mod.link_download, "download_video",
+                        lambda url, root, **kw: {"source_video": str(source)})
+    calls: list = []
+
+    class Manifest:
+        stages = [type("Stage", (), {"stage": "script", "status": "ready"})()]
+
+    monkeypatch.setattr(webapp_mod.pipeline, "run_job", lambda root, until=None: calls.append(until) or Manifest())
+    monkeypatch.setattr(webapp_mod.pipeline, "approve_script", lambda root: calls.append("approve") or {})
+    monkeypatch.setattr(service, "_auto_cover", lambda job_id, root, manifest: calls.append("cover"))
+
+    service.start_batch({"links": "https://example.com/watch?v=a", "confirm_rights": True,
+                         "target_minutes": 15, "content_agent": "agy", "visual_variety": "light",
+                         "tts_provider": "edge", "tts_voice": "", "watermark_enabled": False})
+    deadline = time.time() + 10
+    while time.time() < deadline and service.batch_status()["running"]:
+        time.sleep(0.05)
+    item = service.batch_status()["items"][0]
+    assert item["error"] is None, item
+    cfg = pipeline.load_manifest(tmp_path / item["job_id"]).config
+    assert cfg.target_minutes == 15 and cfg.content_agent == "agy" and cfg.visual_variety == "light"
+    assert cfg.watermark_removal.enabled is False
+    assert calls == ["script", "approve", webapp_mod.RUN_UNTIL_STAGE, "cover"]
 
 
 def test_job_config_http_route(tmp_path):
@@ -133,7 +180,10 @@ def test_update_job_config_keeps_mask_and_detector_knobs(tmp_path):
 def test_dashboard_offers_and_explains_watermark_methods():
     from movie_review_factory.webapp import INDEX_HTML
 
-    assert INDEX_HTML.count('class="wm-method"') == 3
+    # New project, Scout quick config, project settings, overnight batch quick config.
+    assert INDEX_HTML.count('class="wm-method"') == 4
+    for prefix in ("scout", "batch"):
+        assert f'id="{prefix}TargetMinutes"' in INDEX_HTML
     assert 'name="watermark_method"' in INDEX_HTML
     for method in ("propainter", "delogo", "blur"):
         assert f"value: '{method}'" in INDEX_HTML

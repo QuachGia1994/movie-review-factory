@@ -22,13 +22,51 @@ import threading
 from importlib.util import find_spec
 from pathlib import Path
 from typing import Callable
+from urllib.parse import urlsplit, urlunsplit
 
-# 1080p mp4 video + m4a audio, merged to mp4; graceful fallbacks for sites that
-# do not expose separate streams.
+# H.264 first: Bilibili ranks HEVC/AV1 higher, but H.264 decodes faster and more reliably in render.
 DEFAULT_FORMAT = (
+    "bestvideo[height<=1080][vcodec^=avc1]+bestaudio[ext=m4a]/"
     "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/"
     "best[height<=1080][ext=mp4]/best"
 )
+# Second try after a broken stream: another rendition (often another CDN file).
+FALLBACK_FORMAT = (
+    "bestvideo[height<=720][vcodec^=avc1]+bestaudio[ext=m4a]/"
+    "bestvideo[height<=720]+bestaudio/best[height<=720]/best"
+)
+# yt-dlp errors where the stream broke mid-transfer, not where the video is unavailable.
+_STREAM_FAILURES = ("Got error:", "more expected", "timed out", "Connection reset", "HTTP Error 5")
+
+# Bilibili's overseas Akamai mirror drops after ~2 MB; its own upos mirrors serve the same signed path.
+_BILIBILI_HOSTS = ("bilibili.com", "b23.tv")
+_AKAMAI_MIRROR_RE = re.compile(r"^upos-[a-z0-9]+-mirrorakam\.akamaized\.net$", re.IGNORECASE)
+BILIBILI_MIRROR_HOST = "upos-sz-mirrorcos.bilivideo.com"
+
+
+def _is_bilibili(url: str) -> bool:
+    host = (urlsplit(url).hostname or "").lower()
+    return any(host == name or host.endswith("." + name) for name in _BILIBILI_HOSTS)
+
+
+def _swap_bilibili_mirrors(info: dict) -> int:
+    """Point Akamai-mirrored stream URLs at Bilibili's own mirror; returns how many changed."""
+    changed = 0
+    for key in ("formats", "requested_formats", "requested_downloads"):
+        for item in info.get(key) or []:
+            if not isinstance(item, dict):
+                continue
+            if key == "requested_downloads":
+                changed += _swap_bilibili_mirrors(item)
+            if not isinstance(item.get("url"), str):
+                continue
+            parts = urlsplit(item["url"])
+            if parts.scheme in {"http", "https"} and _AKAMAI_MIRROR_RE.match(parts.netloc):
+                item["url"] = urlunsplit(parts._replace(netloc=BILIBILI_MIRROR_HOST))
+                changed += 1
+    return changed
+
+
 DEFAULT_SUB_LANGS = "vi,en"
 _VIDEO_SUFFIXES = {".mp4", ".mkv", ".webm", ".mov", ".m4v"}
 
@@ -207,18 +245,25 @@ def build_download_command(
     *,
     sub_langs: str = DEFAULT_SUB_LANGS,
     include_subs: bool = True,
+    video_format: str = DEFAULT_FORMAT,
+    info_json: str | None = None,
 ) -> list[str]:
-    """`yt-dlp` command that fetches <=1080p mp4 and, optionally, matching subtitles."""
+    """`yt-dlp` command that fetches <=1080p mp4 and, optionally, matching subtitles.
+
+    ``info_json`` downloads from a pre-extracted (mirror-adjusted) info file instead of
+    re-extracting ``url``.
+    """
+    source = ["--load-info-json", info_json] if info_json else ["--", url]
     subs = ["--write-subs", "--write-auto-subs", "--sub-langs", sub_langs, "--convert-subs", "srt"]
     return [
         ytdlp,
         "--no-playlist",
         "--socket-timeout", str(SOCKET_TIMEOUT_SECONDS),
-        "-f", DEFAULT_FORMAT,
+        "-f", video_format,
         "--merge-output-format", "mp4",
         *(subs if include_subs else []),
         "-o", output_template,
-        "--", url,
+        *source,
     ]
 
 
@@ -227,8 +272,23 @@ _SUBTITLE_FAILURE = "Unable to download video subtitles"
 
 
 def _ytdlp_error(stderr: str) -> str:
-    """The ERROR lines of yt-dlp stderr, without the WARNING noise; tail as fallback."""
-    errors = [line.strip() for line in (stderr or "").splitlines() if line.strip().startswith("ERROR:")]
+    """The ERROR lines of yt-dlp stderr, without the WARNING noise; tail as fallback.
+
+    yt-dlp writes download errors as ``ERROR: \\r[download] Got error: ...``; text-mode
+    pipes turn that carriage return into a line break, so an empty ``ERROR:`` line takes
+    the next non-empty line as its message.
+    """
+    lines = [" ".join(line.split()) for line in (stderr or "").splitlines()]
+    errors: list[str] = []
+    for number, line in enumerate(lines):
+        if not line.startswith("ERROR:"):
+            continue
+        if line == "ERROR:":
+            following = next((text for text in lines[number + 1:] if text), "")
+            if not following or following.startswith(("ERROR:", "WARNING:")):
+                continue
+            line = f"ERROR: {following}"
+        errors.append(line)
     return (" ".join(errors) or (stderr or "").strip())[-1000:]
 
 
@@ -276,6 +336,29 @@ def _find_source_video(dest_dir: Path) -> Path | None:
     return None
 
 
+def _bilibili_info_json(binary: str, url: str, staging: Path, runner: Callable[..., object]) -> str | None:
+    """Extract a Bilibili video once and save its info with stream URLs on Bilibili's mirror.
+
+    None (plain URL download) when extraction fails or no Akamai URL needs swapping.
+    """
+    try:
+        result = runner(build_metadata_command(binary, url), capture_output=True, text=True,
+                        timeout=METADATA_TIMEOUT_SECONDS)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if getattr(result, "returncode", 1) != 0:
+        return None
+    try:
+        info = json.loads(getattr(result, "stdout", "") or "")
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(info, dict) or not _swap_bilibili_mirrors(info):
+        return None
+    path = staging / "info.json"
+    path.write_text(json.dumps(info, ensure_ascii=False), encoding="utf-8")
+    return str(path)
+
+
 def download_video(
     url: str,
     dest_dir: Path,
@@ -310,10 +393,15 @@ def download_video(
         with tempfile.TemporaryDirectory(prefix=".download-", dir=dest_dir) as staging_name:
             staging = Path(staging_name)
             template = str(staging / "source.%(ext)s")
+            info_json = _bilibili_info_json(binary, url, staging, runner) if _is_bilibili(url) else None
             subtitle_warning = None
-            for include_subs in (True, False):
+            stream_warning = None
+            include_subs = True
+            video_format = DEFAULT_FORMAT
+            while True:
                 command = build_download_command(
                     binary, url, template, sub_langs=sub_langs, include_subs=include_subs,
+                    video_format=video_format, info_json=info_json,
                 )
                 try:
                     result = runner(command, capture_output=True, text=True, timeout=timeout)
@@ -322,10 +410,20 @@ def download_video(
                 if getattr(result, "returncode", 1) == 0:
                     break
                 error = _ytdlp_error(getattr(result, "stderr", "") or "")
-                if not (include_subs and _SUBTITLE_FAILURE in error):
-                    raise RuntimeError("yt-dlp download failed: " + error)
-                # Subtitles only save a Whisper pass; retry the video without them.
-                subtitle_warning = error
+                if include_subs and _SUBTITLE_FAILURE in error:
+                    # Subtitles only save a Whisper pass; retry the video without them.
+                    subtitle_warning = error
+                    include_subs = False
+                    continue
+                if video_format == DEFAULT_FORMAT and any(mark in error for mark in _STREAM_FAILURES):
+                    # Rendition broke mid-transfer: retry once at a lower rendition.
+                    for partial in staging.glob("source.*"):
+                        if partial.is_file():
+                            partial.unlink()
+                    stream_warning = error
+                    video_format = FALLBACK_FORMAT
+                    continue
+                raise RuntimeError("yt-dlp download failed: " + error)
             source = _find_source_video(staging)
             if source is None:
                 raise RuntimeError("yt-dlp reported success but no source video was produced")
@@ -339,7 +437,7 @@ def download_video(
                 promoted_subtitles.append(str(target))
             return {
                 "source_video": str(promoted_source), "subtitles": promoted_subtitles, "url": url,
-                "subtitle_warning": subtitle_warning,
+                "subtitle_warning": subtitle_warning, "stream_warning": stream_warning,
             }
     except OSError as exc:
         raise RuntimeError(f"could not stage/promote downloaded video: {exc}") from exc

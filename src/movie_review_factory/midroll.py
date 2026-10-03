@@ -1,8 +1,117 @@
-"""Insert a short approved-by-editor CTA at a visual section boundary near 50%."""
+"""Mid-roll like/subscribe CTA: auto-placed at script time, or staged into an approved video."""
 from __future__ import annotations
 
 import copy
 import math
+import re
+
+from . import narration_style
+
+CTA_SCHEMA = {
+    "type": "object",
+    "properties": {"line": {"type": "string"}},
+    "required": ["line"],
+    "additionalProperties": False,
+}
+CTA_MAX_WORDS = 50
+CTA_MAX_CHARS = 250
+CTA_ESTIMATED_WORDS = 32
+BOUNDARY_TOLERANCE = 0.05
+_SENTENCE_END = re.compile(r"(?<=[.!?…])\s+")
+
+
+def section_title(language: str | None) -> str:
+    return "Giữa phim: Màn Kể" if narration_style.is_vietnamese(language) else "Mid-roll: like & subscribe"
+
+
+def cta_prompt(language: str | None, brand_name: str, movie_title: str, previous: str, following: str) -> str:
+    if narration_style.is_vietnamese(language):
+        return (
+            "Viết một lời thoại CTA bằng tiếng Việt, 25–40 từ, một hoặc hai câu, "
+            "hài hước tự nhiên theo chi tiết của phim. Nhắc bấm thích và đăng ký "
+            f"kênh {brand_name} để không bỏ lỡ phần tiếp theo. Chèn ở 50% video giữa "
+            f"'{previous}' và '{following}' của '{movie_title}'. "
+            "Không bịa sự kiện, không lặp nguyên văn thoại phim. Trả JSON đúng schema."
+        )
+    return (
+        f"Write one spoken call-to-action line in {narration_style.language_name(language)}, 25-40 words, "
+        "one or two sentences, with light humor tied to a detail of the movie. Ask viewers "
+        f"to like and subscribe to {brand_name} so they don't miss what comes next. It plays "
+        f"at the 50% mark between '{previous}' and '{following}' of '{movie_title}'. "
+        "Do not invent events or quote dialogue verbatim; never say 'smash that like button'. "
+        "Return JSON matching the schema."
+    )
+
+
+def clean_line(line: object) -> str:
+    """Normalized CTA text, or "" when it is empty or too long to be a short mid-roll."""
+    text = " ".join(str(line or "").split())
+    if not text or len(text) > CTA_MAX_CHARS or len(text.split()) > CTA_MAX_WORDS:
+        return ""
+    return text
+
+
+def _words(section: dict) -> int:
+    return narration_style.word_count(str(section.get("narration") or ""))
+
+
+def _split_section(section: dict, words_wanted: int) -> tuple[dict, dict] | None:
+    """Split one section at the sentence boundary closest to ``words_wanted`` words."""
+    sentences = [part for part in _SENTENCE_END.split(str(section.get("narration") or "").strip()) if part]
+    if len(sentences) < 2:
+        return None
+    counts = [narration_style.word_count(sentence) for sentence in sentences]
+    cut = min(range(1, len(sentences)), key=lambda k: abs(sum(counts[:k]) - words_wanted))
+    ratio = sum(counts[:cut]) / max(1, sum(counts))
+    budget = float(section.get("budget_minutes") or 0)
+    base = {key: value for key, value in section.items() if key not in ("annotations", "narration")}
+    first = {**base, "narration": " ".join(sentences[:cut]),
+             "budget_minutes": round(budget * ratio, 2),
+             "duration_seconds": round(budget * ratio * 60)}
+    second = {**base, "title": f"{section.get('title', '')} (2)", "continued": True,
+              "narration": " ".join(sentences[cut:]),
+              "budget_minutes": round(budget * (1 - ratio), 2),
+              "duration_seconds": round(budget * (1 - ratio) * 60)}
+    return first, second
+
+
+def cta_position(sections: list[dict], cta_words: int = CTA_ESTIMATED_WORDS) -> tuple[list[dict], int]:
+    """Sections (one split if no boundary lands near half the narration) and the CTA index."""
+    sections = list(sections)
+    counts = [_words(section) for section in sections]
+    total = sum(counts)
+
+    def offset(after: int) -> float:
+        return abs((sum(counts[:after]) + cta_words / 2) / (total + cta_words) - 0.5)
+
+    best = min(range(1, len(sections)), key=offset) if len(sections) > 1 else 0
+    if best and offset(best) <= BOUNDARY_TOLERANCE:
+        return sections, best
+    half = total / 2
+    position = next((index for index in range(len(sections)) if sum(counts[:index + 1]) >= half), 0)
+    split = _split_section(sections[position], round(half - sum(counts[:position])))
+    if split is None:
+        return sections, best
+    sections[position:position + 1] = list(split)
+    return sections, position + 1
+
+
+def insert_cta(sections: list[dict], line: str, language: str | None) -> tuple[list[dict], int]:
+    """Return sections with the CTA section inserted near the narration midpoint, and its index."""
+    words = narration_style.word_count(line)
+    sections, index = cta_position(sections, words)
+    if not index:
+        raise ValueError("script has no section boundary for a mid-roll CTA")
+    seconds = max(6, round(words / narration_style.words_per_minute(language) * 60))
+    sections.insert(index, {
+        "title": section_title(language),
+        "budget_minutes": round(seconds / 60, 2),
+        "duration_seconds": seconds,
+        "narration": line,
+        "midroll": True,
+        "generator": "agy",
+    })
+    return sections, index
 
 
 def prepare(script: dict, plan: dict, line: str, seconds: float = 10,

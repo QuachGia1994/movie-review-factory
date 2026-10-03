@@ -13,6 +13,9 @@
 
 - [Agent workflow](AGENT_WORKFLOW.md) — reasoning-agent and deterministic media boundaries.
 - [References](REFERENCES.md) — external implementation references.
+- [Brand guard](research/brand-guard.md) — transparent Màn Kể logo, plate-free overlay, moving corner mark and faint ghost watermark against static-mask removal.
+- [YouTube packaging](research/youtube-packaging.md) — curiosity titles, chapters, hashtags, pinned comment, retention structure (greeting, hook, open loops, ending), compilation mode, thumbnail film band.
+- [Picture sync](research/picture-sync.md) — why recap picture lagged the voice, ~3 s forward montage per beat, word-timed beat cuts, Vietnamese sync rules.
 - [Windows installer](windows-installer.md) — build the 1-click .exe (embedded Python + FFmpeg + yt-dlp), per-user install, launcher, and code-signing/SmartScreen notes.
 - [Completed multi-clip visual plan](plan/done/multiclip-visual-plan.md) — multi-shot scene planning and exact-duration render contract.
 - [Completed one-file JS launcher](plan/done/onefile-js-launcher.md) — single-file local-web distribution, runtime cache, and startup verification.

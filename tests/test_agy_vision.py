@@ -238,14 +238,17 @@ def test_story_graph_parser_uses_only_anonymous_people() -> None:
     )
     assert {item["label"] for item in parsed["entities"]} == {"Person 1", "Hospital"}
     assert parsed["relations"][0]["predicate"] == "at"
-    with pytest.raises(agy_vision.VisionUnavailable, match="unknown anonymous person"):
-        agy_vision._parse_story_graph(
-            '{"scenes":[{"scene_id":1,"entities":['
-            '{"type":"person","label":"Actor Name","description":"person","confidence":0.9,"evidence":"face"}'
-            '],"relations":[]}]}',
-            {1},
-            {"Person 1"},
-        )
+    dropped = agy_vision._parse_story_graph(
+        '{"scenes":[{"scene_id":1,"entities":['
+        '{"type":"person","label":"Actor Name","description":"person","confidence":0.9,"evidence":"face"},'
+        '{"type":"location","label":"Hospital","description":"corridor","confidence":0.95,"evidence":"sign"}'
+        '],"relations":[{"subject_type":"person","subject_label":"Actor Name","predicate":"at",'
+        '"object_type":"location","object_label":"Hospital","confidence":0.88,"evidence":"inside"}]}]}',
+        {1},
+        {"Person 1"},
+    )
+    assert [item["label"] for item in dropped["entities"]] == ["Hospital"]
+    assert dropped["relations"] == []
 
 
 def test_story_graph_quota_rotates_across_four_agy_accounts(
@@ -648,3 +651,33 @@ def test_identity_wave_gives_each_parallel_batch_its_own_fresh_labels(
     identity = agy_vision.track_anonymous_people(source, scenes, pool_dir=tmp_path)
 
     assert [track["label"] for track in identity["tracks"]] == ["Person 1", "Person 13"]
+
+
+def test_describe_timeout_retries_the_batch_on_another_account(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pool = tmp_path / "pool"
+    pool.mkdir()
+    (tmp_path / "setting.json").write_text(json.dumps({"agy": {"workers": {
+        role: {"url": f"http://127.0.0.1:{7411 + i}", "root": str(pool), "secretRef": role}
+        for i, role in enumerate(("advisor", "executor"))}}}), encoding="utf-8")
+    (tmp_path / "agy-pool-secrets.json").write_text(json.dumps({"advisor": "one", "executor": "two"}), encoding="utf-8")
+    monkeypatch.setattr(pool_scheduler, "default_state_file", lambda: tmp_path / "pool_health.json")
+    monkeypatch.setattr(agy_vision.shutil, "which", lambda name: "ffmpeg.exe")
+    monkeypatch.setattr(agy_vision.subprocess, "run", lambda command, **kwargs: Path(command[-1]).write_bytes(b"pixels"))
+    source = tmp_path / "owned.mp4"
+    source.write_bytes(b"video")
+    calls: list[str] = []
+
+    def worker(request, timeout):
+        calls.append(request.full_url)
+        if len(calls) == 1:
+            raise TimeoutError("slow worker")
+        return _JsonResponse(json.dumps([{"id": 1, "description": "a door"}]))
+
+    monkeypatch.setattr(agy_vision.urllib.request, "urlopen", worker)
+
+    result = agy_vision.describe_candidates(source, [[{"index": 1, "start_seconds": 0, "end_seconds": 2}]], pool_dir=tmp_path)
+
+    assert result == {1: "a door"}
+    assert len(calls) == 2 and calls[0] != calls[1]

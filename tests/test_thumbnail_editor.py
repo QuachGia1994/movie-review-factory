@@ -148,3 +148,18 @@ def test_headlines_list_prints_a_distinct_headline_per_variant(tmp_path: Path) -
     )
     assert [v["headline"] for v in manifest["variants"]] == ["CÂU MỘT", "CÂU HAI", "CÂU BA"]
     assert manifest["headline"] == "CÂU MỘT"
+
+
+@pytest.mark.parametrize("title", ["Marui Video", "Chuyện kinh dị ngắn Nhật Bản 2 bản đặc biệt đạo diễn cắt dài hơn rất nhiều"])
+def test_title_band_names_the_film_inside_safe_area(tmp_path: Path, title: str) -> None:
+    create_job(tmp_path, JobConfig(job_id="band", movie_title=title))
+    _candidates(tmp_path)
+    manifest = render_thumbnail_variants(tmp_path, headline="CUỐN BĂNG BỊ NGUYỀN", channel_name="Màn Kể")
+    for variant in manifest["variants"]:
+        band = [layer for layer in variant["layers"] if layer["kind"] == "title_band"]
+        assert len(band) == 1 and band[0]["text"].startswith("Review Phim : ")
+        a = band[0]["box"]
+        for b in (layer["box"] for layer in variant["layers"] if layer["kind"] != "title_band"):
+            assert a[2] <= b[0] or b[2] <= a[0] or a[3] <= b[1] or b[3] <= a[1], "title band overlaps"
+    no_band = render_thumbnail_variants(tmp_path, headline="CUỐN BĂNG", channel_name="Màn Kể", title_band=False)
+    assert all(layer["kind"] != "title_band" for v in no_band["variants"] for layer in v["layers"])

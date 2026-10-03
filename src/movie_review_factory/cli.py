@@ -35,6 +35,10 @@ def init_job(
     aspect_ratio: str = "16:9",
     source_video: Optional[Path] = None,
     movie_title: Optional[str] = None,
+    genre: str = typer.Option("", help="Optional genre used in titles, hashtags and prompts (e.g. 'kinh dị')."),
+    review_format: str = typer.Option(
+        "single", help="single, or compilation for anthology films told as 'Câu chuyện thứ N' sections.",
+    ),
     content_agent: str = typer.Option(
         "scaffold",
         help="Content generator for research/outline/script: scaffold, claude, or agy.",
@@ -79,6 +83,8 @@ def init_job(
         movie_title=movie_title,
         content_agent=content_agent,
         watermark_removal=watermark_removal,
+        genre=genre.strip(),
+        review_format=review_format.strip().lower(),
     )
     typer.echo(f"created {create_job(path, config)}")
 

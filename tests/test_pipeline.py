@@ -1915,7 +1915,7 @@ def test_render_removes_stale_pre_midroll_video(
     assert (tmp_path / "script.pre-midroll.json").exists()
 
 
-def test_render_trims_long_source_to_exact_shot_duration(
+def test_render_reads_the_middle_of_a_long_source_range(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _render_job(
@@ -1949,12 +1949,10 @@ def test_render_trims_long_source_to_exact_shot_duration(
     pipeline._render(tmp_path, load_manifest(tmp_path))
 
     filter_complex = commands[0][commands[0].index("-filter_complex") + 1]
-    # Clip decodes from its own seeked input (-ss/-t); a target shorter than the
-    # source still trims to the target, but there is no shared-input trim=start.
+    # Clip decodes from its own seeked input (-ss/-t): the middle second of the 3 s range.
     assert "trim=start=" not in filter_complex
     _ss = commands[0].index("-ss")
-    assert commands[0][_ss:_ss + 4] == ["-ss", "0.000000", "-t", "3.000000"]
-    assert "trim=end=1.000000" in filter_complex
+    assert commands[0][_ss:_ss + 4] == ["-ss", "1.000000", "-t", "1.000000"]
     assert "loop=loop=" not in filter_complex
     doc = json.loads((tmp_path / "render.json").read_text(encoding="utf-8"))
     assert doc["clips"][0]["source_seconds"] == 3.0
@@ -2071,6 +2069,55 @@ def test_render_real_ffmpeg_changes_brand_between_chapters(
     assert [artifact.name for artifact in artifacts] == ["render.json", "final.mp4"]
     assert (tmp_path / "final.mp4").stat().st_size > 0
     assert len(list(tmp_path.glob("brand-overlay-*.png"))) == 3
+    # A top band keeps the lockup static inside it; only the faint ghost drifts.
+    assert not (tmp_path / "brand-mark.png").exists()
+    assert (tmp_path / "brand-ghost.png").exists()
+
+
+def test_render_brand_guard_moves_corner_mark_without_bands(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import shutil
+    import subprocess
+    from PIL import Image
+    import movie_review_factory.branding as branding
+    import movie_review_factory.pipeline as pipeline
+
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg or not shutil.which("ffprobe"):
+        pytest.skip("FFmpeg toolchain unavailable")
+    source = _render_job(tmp_path, clips=[
+        {"section": "Mở đầu", "type": "narration", "duration_seconds": 3.0,
+         "source_clip": {"start_seconds": 0, "end_seconds": 3}},
+    ])
+    subprocess.run([ffmpeg, "-v", "error", "-y", "-f", "lavfi",
+                    "-i", "color=c=black:s=320x180:r=25:d=3",
+                    "-c:v", "libx264", "-pix_fmt", "yuv420p", str(source)],
+                   capture_output=True, check=True)
+    subprocess.run([ffmpeg, "-v", "error", "-y", "-f", "lavfi",
+                    "-i", "sine=frequency=440:duration=3",
+                    "-c:a", "libmp3lame", str(tmp_path / "narration.mp3")],
+                   capture_output=True, check=True)
+    (tmp_path / "aligned.srt").write_text("", encoding="utf-8")
+    monkeypatch.setenv("MRF_RENDER_MAX_HEIGHT", "180")
+    monkeypatch.delenv(branding.BRAND_GUARD_ENV, raising=False)
+    monkeypatch.setattr(branding, "MARK_HOP_SECONDS", 1)
+    pipeline._render(tmp_path, load_manifest(tmp_path))
+    assert (tmp_path / "brand-mark.png").exists() and (tmp_path / "brand-ghost.png").exists()
+
+    def corner_peaks(at: float) -> tuple[int, int]:
+        frame = tmp_path / f"frame-{at}.png"
+        subprocess.run([ffmpeg, "-v", "error", "-y", "-ss", str(at), "-i", str(tmp_path / "final.mp4"),
+                        "-frames:v", "1", str(frame)], capture_output=True, check=True)
+        with Image.open(frame) as image:
+            gray = image.convert("L")
+            return (gray.crop((0, 0, 60, 50)).getextrema()[1],
+                    gray.crop((gray.width - 60, 0, gray.width, 50)).getextrema()[1])
+
+    left, right = corner_peaks(0.5)
+    assert left > 180 and right < 120  # first hop: top-left
+    left, right = corner_peaks(1.5)
+    assert left < 120 and right > 180  # next hop: top-right
 
 
 @pytest.mark.parametrize(("planned", "padding"), [(1.5, 1.5), (2.0, 1.0)])
@@ -3119,6 +3166,7 @@ def test_claude_content_agent_drives_research_outline_and_script(
             }
         raise AssertionError(stage)
 
+    monkeypatch.setattr(pipeline_mod, "SCRIPT_EXPAND_ROUNDS", 0)
     monkeypatch.setattr(pipeline_mod, "run_claude_json", fake_agent)
 
     create_job(
@@ -3279,6 +3327,7 @@ def test_agy_content_agent_drives_research_outline_and_script(
     def forbidden(**_: object) -> dict:
         raise AssertionError("claude runner must not run for agy jobs")
 
+    monkeypatch.setattr(pipeline_mod, "SCRIPT_EXPAND_ROUNDS", 0)
     monkeypatch.setattr(pipeline_mod, "run_agy_json", fake_agent)
     monkeypatch.setattr(pipeline_mod, "run_claude_json", forbidden)
 
@@ -3301,6 +3350,111 @@ def test_agy_content_agent_drives_research_outline_and_script(
     script = json.loads((tmp_path / "script.json").read_text(encoding="utf-8"))
     assert script["generator"] == "agy"
     assert manifest.stage("script").message.startswith("script generated by AGY")
+
+
+@pytest.mark.parametrize("agent", ["claude", "agy"])
+def test_script_stage_inserts_agy_written_midroll_cta(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    agent: str,
+) -> None:
+    import movie_review_factory.pipeline as pipeline_mod
+
+    monkeypatch.setenv("MRF_AUTO_CTA", "1")
+    line = "Nếu bạn cũng muốn biết cái kết, bấm thích và đăng ký kênh để không bỏ lỡ phần tiếp theo nhé."
+    calls: list[tuple[str, str]] = []
+
+    def content(stage: str) -> dict:
+        if stage == "research":
+            return {"brief": "Nghiên cứu.", "facts": ["Một sự kiện."], "sources": [], "uncertainties": []}
+        if stage == "outline":
+            return {"sections": [{"title": t, "budget_minutes": 1, "purpose": "p"} for t in ("Hook", "Diễn biến", "Kết")], "notes": ""}
+        if stage == "script":
+            return {"sections": [
+                {"title": "Hook", "narration": "Mở đầu có nội dung thật. Câu thứ hai cũng thật."},
+                {"title": "Diễn biến", "narration": "Phần diễn biến có nội dung thật. Thêm một câu nữa."},
+                {"title": "Kết", "narration": "Phần kết có nội dung thật. Câu cuối cùng."},
+            ], "notes": ""}
+        raise AssertionError(stage)
+
+    def fake_agy(**kwargs: object) -> dict:
+        stage = str(kwargs["stage"])
+        calls.append(("agy", stage))
+        if stage == "script_cta":
+            assert "đăng ký" in str(kwargs["prompt"]) and "Example Movie" in str(kwargs["prompt"])
+            return {"line": line}
+        return content(stage)
+
+    def fake_claude(**kwargs: object) -> dict:
+        calls.append(("claude", str(kwargs["stage"])))
+        return content(str(kwargs["stage"]))
+
+    monkeypatch.setattr(pipeline_mod, "SCRIPT_EXPAND_ROUNDS", 0)
+    monkeypatch.setattr(pipeline_mod, "run_agy_json", fake_agy)
+    monkeypatch.setattr(pipeline_mod, "run_claude_json", fake_claude)
+    create_job(tmp_path, JobConfig(job_id="cta-job", language="vi", target_minutes=5,
+                                   movie_title="Example Movie", content_agent=agent))
+
+    manifest = run_job(tmp_path, until="script")
+
+    # The CTA is always AGY-written, whichever agent wrote the script.
+    assert calls == [(agent, "research"), (agent, "outline"), (agent, "script"), ("agy", "script_cta")]
+    script = json.loads((tmp_path / "script.json").read_text(encoding="utf-8"))
+    midrolls = [section for section in script["sections"] if section.get("midroll")]
+    assert len(midrolls) == 1 and midrolls[0]["narration"] == line
+    assert 0 < script["sections"].index(midrolls[0]) < len(script["sections"]) - 1
+    assert script["approved"] is False
+    assert "CTA after" in manifest.stage("script").message
+    assert line in (tmp_path / "script.md").read_text(encoding="utf-8")
+
+
+def test_script_stage_cta_failure_never_blocks_the_script(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import movie_review_factory.pipeline as pipeline_mod
+    from movie_review_factory.content_agent import ContentAgentError
+
+    monkeypatch.setenv("MRF_AUTO_CTA", "1")
+
+    def fake_agy(**kwargs: object) -> dict:
+        stage = str(kwargs["stage"])
+        if stage == "script_cta":
+            raise ContentAgentError("pool offline")
+        if stage == "research":
+            return {"brief": "b", "facts": [], "sources": [], "uncertainties": []}
+        if stage == "outline":
+            return {"sections": [{"title": "A", "budget_minutes": 1}, {"title": "B", "budget_minutes": 1}], "notes": ""}
+        return {"sections": [{"title": "A", "narration": "Một câu. Hai câu."},
+                             {"title": "B", "narration": "Ba câu. Bốn câu."}], "notes": ""}
+
+    monkeypatch.setattr(pipeline_mod, "SCRIPT_EXPAND_ROUNDS", 0)
+    monkeypatch.setattr(pipeline_mod, "run_agy_json", fake_agy)
+    create_job(tmp_path, JobConfig(job_id="cta-fail", language="vi", target_minutes=2,
+                                   movie_title="Example Movie", content_agent="agy"))
+
+    manifest = run_job(tmp_path, until="script")
+
+    assert manifest.stage("script").status == "ready"
+    assert "CTA skipped: pool offline" in manifest.stage("script").message
+    script = json.loads((tmp_path / "script.json").read_text(encoding="utf-8"))
+    assert not any(section.get("midroll") for section in script["sections"])
+
+
+def test_insert_cta_lands_near_narration_midpoint() -> None:
+    from movie_review_factory import midroll
+
+    sections = [{"title": "Only", "budget_minutes": 2,
+                 "narration": " ".join(f"Câu số {i} có năm từ." for i in range(20))}]
+    line = "Bấm thích và đăng ký kênh nhé."
+
+    out, index = midroll.insert_cta(sections, line, "vi")
+
+    assert [s["title"] for s in out] == ["Only", midroll.section_title("vi"), "Only (2)"]
+    assert index == 1 and out[1]["midroll"] is True and out[1]["narration"] == line
+    assert out[2]["continued"] is True
+    assert sections[0]["title"] == "Only" and len(sections) == 1  # input not mutated
+    assert midroll.clean_line("x " * 60) == "" and midroll.clean_line("  a  b ") == "a b"
 
 
 def _fit_context_scenes(count: int = 47, repeats: int = 30) -> list[dict]:

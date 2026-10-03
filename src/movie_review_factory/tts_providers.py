@@ -188,13 +188,17 @@ def _request_with_retry(request: Callable, url: str, *, sleep: Callable[[float],
 
 def _elevenlabs_fetcher(api_key: str, *, request: Callable, sleep: Callable[[float], None],
                          timeout: float, retry_attempts: int = 3,
-                         retry_delay: float = 0.5) -> Callable[[str, str], bytes]:
+                         retry_delay: float = 0.5, speed: float = 1.0) -> Callable[[str, str], bytes]:
+    settings = {"stability": 0.5, "similarity_boost": 0.75, "style": 0.35}
+    if abs(speed - 1.0) >= 0.01:
+        settings["speed"] = round(max(0.7, min(1.2, speed)), 2)
+
     def fetch(text: str, voice: str) -> bytes:
         url = ELEVENLABS_TTS_URL.format(voice=voice)
         body = json.dumps({
             "text": text,
             "model_id": ELEVENLABS_MODEL,
-            "voice_settings": {"stability": 0.5, "similarity_boost": 0.75, "style": 0.35},
+            "voice_settings": settings,
         }).encode("utf-8")
         headers = {"xi-api-key": api_key, "accept": "audio/mpeg", "content-type": "application/json"}
         status, payload, _ = _request_with_retry(
@@ -209,9 +213,11 @@ def _elevenlabs_fetcher(api_key: str, *, request: Callable, sleep: Callable[[flo
 
 def _fptai_fetcher(api_key: str, *, request: Callable, sleep: Callable[[float], None],
                    timeout: float, poll_attempts: int = 8, poll_delay: float = 1.0,
-                   retry_attempts: int = 3, retry_delay: float = 0.5) -> Callable[[str, str], bytes]:
+                   retry_attempts: int = 3, retry_delay: float = 0.5, speed: float = 1.0) -> Callable[[str, str], bytes]:
+    step = max(-3, min(3, round((speed - 1.0) * 10)))
+
     def fetch(text: str, voice: str) -> bytes:
-        headers = {"api-key": api_key, "voice": voice, "speed": ""}
+        headers = {"api-key": api_key, "voice": voice, "speed": str(step) if step else ""}
         status, payload, _ = _request_with_retry(
             request, FPTAI_TTS_URL, method="POST", headers=headers,
             data=text.encode("utf-8"), timeout=timeout, sleep=sleep,
@@ -398,6 +404,7 @@ def build_synthesize(
     http_request: Callable | None = None,
     sleep: Callable[[float], None] = time.sleep,
     timeout: float = 60.0,
+    speed: float = 1.0,
 ) -> Callable:
     """Build a ``synthesize(text, voice, part, communicate_factory)`` for a non-edge provider.
 
@@ -426,9 +433,9 @@ def build_synthesize(
             raise TTSProviderError(missing_key_message(provider))
         request = http_request or _http_request
         if provider == "fptai":
-            producer = _fptai_fetcher(api_key, request=request, sleep=sleep, timeout=timeout)
+            producer = _fptai_fetcher(api_key, request=request, sleep=sleep, timeout=timeout, speed=speed)
         else:
-            producer = _elevenlabs_fetcher(api_key, request=request, sleep=sleep, timeout=timeout)
+            producer = _elevenlabs_fetcher(api_key, request=request, sleep=sleep, timeout=timeout, speed=speed)
     probe = probe_duration or (lambda path: probe_mp3_duration(path, ffprobe_bin=ffprobe_bin))
 
     def synthesize(text: str, voice: str, part: Path, communicate_factory: object = None) -> list[dict]:

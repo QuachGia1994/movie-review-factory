@@ -9,6 +9,7 @@ import re
 import zipfile
 from pathlib import Path
 
+from .packaging import chapters as _chapters
 from .pipeline import load_manifest
 
 EXPORT_NAME = "review-handoff.zip"
@@ -33,42 +34,6 @@ def _sha256(path: Path) -> str:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
-
-
-def _timecode(seconds: float) -> str:
-    rounded = max(0, int(seconds))
-    minutes, seconds = divmod(rounded, 60)
-    hours, minutes = divmod(minutes, 60)
-    return f"{hours:02}:{minutes:02}:{seconds:02}"
-
-
-def _chapters(plan: dict, script: dict) -> str:
-    sections = script.get("sections") or []
-    lines: list[str] = []
-    seen: set[int] = set()
-    cursor = 0.0
-    for clip in plan.get("clips") or []:
-        if not isinstance(clip, dict):
-            continue
-        try:
-            index = int(clip.get("section_index"))
-            duration = float(clip.get("duration_seconds"))
-        except (TypeError, ValueError):
-            continue
-        if index < 1 or index > len(sections) or duration <= 0:
-            continue
-        start = cursor
-        cursor += duration
-        if index in seen:
-            continue
-        seen.add(index)
-        section = sections[index - 1]
-        title = section.get("title", "") if isinstance(section, dict) else str(section)
-        title = " ".join(str(title).split()) or f"Phần {index}"
-        lines.append(f"{_timecode(start)} {title}")
-    if lines and not lines[0].startswith("00:00:00 "):
-        lines.insert(0, "00:00:00 Mở đầu")
-    return "\n".join(lines) + ("\n" if lines else "")
 
 
 def build_handoff(root: Path) -> Path:
@@ -102,9 +67,13 @@ def build_handoff(root: Path) -> Path:
     if not title or not description:
         raise ValueError("handoff blocked: title and description must be filled in")
     chapters = _chapters(plan, script)
+    pinned = str(metadata.get("pinned_comment") or "").strip()
+    alternatives = [str(item) for item in metadata.get("title_options") or [] if str(item).strip() and str(item) != title]
     notes = "\n".join((
         title, "", description, "", "Chapters:", chapters.rstrip(), "",
         "Tags: " + ", ".join(str(tag) for tag in metadata.get("tags") or []), "",
+        *(("Title options:", *alternatives, "") if alternatives else ()),
+        *(("Pinned comment:", pinned, "") if pinned else ()),
         "Credits / source use:", str(metadata.get("credits") or "Creator review required before upload."), "",
     ))
     srt = (root / "aligned.srt").read_text(encoding="utf-8-sig")
@@ -116,6 +85,8 @@ def build_handoff(root: Path) -> Path:
         "chapters.txt": chapters.encode("utf-8"),
         "upload-notes.txt": notes.encode("utf-8"),
     }
+    if pinned:
+        generated["pinned-comment.txt"] = (pinned + "\n").encode("utf-8")
     checksums = {
         name: {"sha256": _sha256(path), "bytes": path.stat().st_size}
         for path, name in files

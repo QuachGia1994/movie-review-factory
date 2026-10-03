@@ -8,11 +8,15 @@ public service.
 
 Publishing safety is built into the shape of the API, not just the UI:
 
-* Creating a project and importing its source never start the pipeline;
-  every run is triggered explicitly by the operator.
-* The web "run" action stops at the ``script`` stage for review and only
-  advances toward the ``thumbnail`` stage once the script is approved - it
-  never reaches ``publish`` on its own.
+* With ``MRF_AUTO_RUN`` on (default) an import runs in one pass to the
+  finished video: AGY writes the script (mid-roll CTA included), it is
+  auto-approved, and the same run continues to ``thumbnail`` and preselects an
+  AGY cover; approving metadata builds the handoff package.
+  ``MRF_SCRIPT_REVIEW=1`` restores the stop at the ``script`` gate, and with
+  ``MRF_AUTO_RUN=0`` every run is triggered explicitly by the operator.
+* Manual runs stop at the ``script`` stage for review and only advance toward
+  the ``thumbnail`` stage once the script is approved. No run ever reaches
+  ``publish`` on its own.
 * Metadata approval (``approved=true``) is a separate, explicit endpoint.
 * Publishing requires an explicit ``confirm`` and, even then, only runs the
   ``publish`` stage - which merely writes the handoff record
@@ -219,6 +223,13 @@ class JobsService:
         self._closed = threading.Event()
         self._index_auto = os.environ.get("MRF_AUTO_INDEX", "0").strip().lower() not in (
             "0", "false", "no", "off",
+        )
+        self._auto_run = os.environ.get("MRF_AUTO_RUN", "1").strip().lower() not in (
+            "0", "false", "no", "off",
+        )
+        # MRF_SCRIPT_REVIEW=1 restores the manual stop at the script gate.
+        self._script_review = os.environ.get("MRF_SCRIPT_REVIEW", "0").strip().lower() in (
+            "1", "true", "yes", "on",
         )
         self._index_worker_thread = threading.Thread(
             target=self._index_worker, name="mrf-index-queue", daemon=True
@@ -485,6 +496,7 @@ class JobsService:
             "script_approved": bool(script.get("approved")),
             "metadata_present": bool(meta),
             "metadata_approved": bool(meta.get("approved")),
+            "auto_flow": bool(self._auto_run and not self._script_review),
         }
         qa = self._read_json(root, "qa.json")
         info["qa_findings"] = [
@@ -1378,6 +1390,8 @@ class JobsService:
             visual_variety=str(_with_default("visual_variety", "off")),
             tts_provider=str(_with_default("tts_provider", "edge")),
             tts_voice=str(_with_default("tts_voice", "")).strip(),
+            review_format=str(payload.get("review_format") or "single"),
+            genre=str(payload.get("genre") or "").strip(),
         )
         pipeline.create_job(root, config)
         return self.status(job_id)
@@ -1392,6 +1406,7 @@ class JobsService:
         allowed = {
             "movie_title", "content_agent", "visual_variety", "watermark_removal",
             "tts_provider", "tts_voice", "target_minutes", "aspect_ratio",
+            "review_format", "genre",
         }
         unknown = set(payload) - allowed
         if unknown:
@@ -1413,6 +1428,8 @@ class JobsService:
             raise ValueError("tts_provider không được hỗ trợ")
         if "tts_voice" in updates:
             updates["tts_voice"] = str(updates["tts_voice"] or "").strip()
+        if "genre" in updates:
+            updates["genre"] = str(updates["genre"] or "").strip()
         if "watermark_removal" in updates:
             watermark = updates["watermark_removal"]
             if not isinstance(watermark, dict):
@@ -1435,7 +1452,7 @@ class JobsService:
         result = self.status(job_id)
         completed = {stage["stage"] for stage in result["stages"] if stage["status"] == "ready"}
         warnings = []
-        if "content_agent" in updates and completed.intersection({"research", "outline", "script"}):
+        if {"content_agent", "review_format", "genre"}.intersection(updates) and completed.intersection({"research", "outline", "script"}):
             warnings.append("Bộ tạo nội dung mới chỉ áp dụng khi chạy lại các bước nghiên cứu/kịch bản.")
         if {"tts_provider", "tts_voice"}.intersection(updates) and "tts" in completed:
             warnings.append("Giọng đọc mới chỉ áp dụng khi chạy lại bước tạo giọng.")
@@ -1502,9 +1519,19 @@ class JobsService:
         finally:
             with self._lock:
                 self._uploads.discard(job_id)
+        self._after_source_ready(job_id)
+        return self.status(job_id)
+
+    def _after_source_ready(self, job_id: str) -> None:
+        """Auto mode runs straight to the finished video; otherwise optionally pre-index."""
+        if self._auto_run:
+            try:
+                self.start_run(job_id)
+                return
+            except Exception:
+                pass
         if self._index_auto:
             self._enqueue_index_quietly(job_id)
-        return self.status(job_id)
 
     def hook_path(self, job_id: str) -> Path:
         root = self._require_job(job_id)
@@ -1574,12 +1601,7 @@ class JobsService:
             temporary.unlink(missing_ok=True)
             with self._lock:
                 self._uploads.discard(job_id)
-        # Importing the source never advances the pipeline: the operator starts
-        # every run explicitly. Pre-warming the heavy transcript/scene/visual/
-        # embedding work in the background is opt-in via MRF_AUTO_INDEX=1
-        # (roadmap #14) for operators who want it ready before the run.
-        if self._index_auto:
-            self._enqueue_index_quietly(job_id)
+        self._after_source_ready(job_id)
         return self.status(job_id)
 
     def delete_job(self, job_id: str, confirmation: str) -> dict:
@@ -1663,7 +1685,8 @@ class JobsService:
             raise link_download.RightsConfirmationRequired(
                 "Xác nhận bạn có quyền dùng các video này trước khi chạy hàng đợi."
             )
-        language = str(payload.get("language") or "vi")
+        quick = self._quick_config(payload) if process is None else {}
+        language = str(payload.get("language") or quick.get("language") or "vi")
         sub_langs = str(payload.get("sub_langs") or "vi,en")
         with self._lock:
             if self._batch["running"]:
@@ -1673,7 +1696,7 @@ class JobsService:
                            "started_at": datetime.now(timezone.utc).isoformat()}
 
         worker_process = process or self._build_batch_process(
-            confirm_rights=confirm_rights, language=language, sub_langs=sub_langs)
+            confirm_rights=confirm_rights, language=language, sub_langs=sub_langs, config=quick)
 
         def on_event(item: dict) -> None:
             with self._lock:
@@ -1702,8 +1725,9 @@ class JobsService:
         threading.Thread(target=worker, name="mrf-batch-queue", daemon=True).start()
         return self.batch_status()
 
-    def _build_batch_process(self, *, confirm_rights: bool, language: str, sub_langs: str):
-        """Real per-item worker: create job -> download link -> run to script gate."""
+    def _build_batch_process(self, *, confirm_rights: bool, language: str, sub_langs: str,
+                             config: dict | None = None):
+        """Real per-item worker: create job (quick config) -> download link -> run to final.mp4."""
         from . import batch_queue
 
         def process(url: str, index: int) -> str:
@@ -1714,17 +1738,36 @@ class JobsService:
                 suffix += 1
                 job_id = f"{batch_queue.slug_for(url, index)}-{suffix}"
                 root = self.jobs_root / job_id
-            pipeline.create_job(root, JobConfig(job_id=job_id, language=language))
+            self.create_job({**(config or {}), "job_id": job_id, "language": language})
             result = link_download.download_video(
                 url, root, confirm_rights=confirm_rights, sub_langs=sub_langs)
             manifest = pipeline.load_manifest(root)
             manifest.config.source_video = Path(result["source_video"]).resolve()
             pipeline.save_manifest(root, manifest)
-            # Approval gate stays intact: stop at the script draft, never auto-approve.
-            pipeline.run_job(root, until=SCRIPT_REVIEW_STAGE)
+            self._run_one_pass(job_id, root)
             return job_id
 
         return process
+
+    def _run_one_pass(self, job_id: str, root: Path) -> None:
+        """Synchronous auto flow for the overnight batch: script -> auto-approve -> final.mp4 + cover.
+
+        With ``MRF_SCRIPT_REVIEW=1`` (or ``MRF_AUTO_RUN=0``) it stops at the script draft.
+        """
+        manifest = pipeline.run_job(root, until=SCRIPT_REVIEW_STAGE)
+        if not self._auto_run or self._script_review or not self._script_ready(manifest):
+            return
+        try:
+            pipeline.approve_script(root)
+        except ValueError as exc:
+            raise RuntimeError(f"Tự duyệt kịch bản dừng lại, cần rà soát: {exc}") from exc
+        manifest = pipeline.run_job(root, until=RUN_UNTIL_STAGE)
+        self._auto_cover(job_id, root, manifest)
+
+    @staticmethod
+    def _script_ready(manifest) -> bool:
+        return any(stage.stage == SCRIPT_REVIEW_STAGE and stage.status == "ready"
+                   for stage in getattr(manifest, "stages", []) or [])
 
     def start_run(self, job_id: str, *, until: str | None = None) -> dict:
         self._ensure_open()
@@ -1757,11 +1800,26 @@ class JobsService:
                     state["process"] = None
 
         def worker() -> None:
+            target = until
             error = None
             try:
                 context = cancellation.CancellationContext(event, register, unregister)
                 with cancellation.cancellation_scope(context):
-                    pipeline.run_job(root, until=until)
+                    manifest = pipeline.run_job(root, until=target)
+                    if (self._auto_run and not self._script_review and target == SCRIPT_REVIEW_STAGE
+                            and not event.is_set() and self._script_ready(manifest)):
+                        # Auto flow: approve the AGY script and continue to the finished video.
+                        try:
+                            pipeline.approve_script(root)
+                        except ValueError as exc:
+                            raise RuntimeError(f"Tự duyệt kịch bản dừng lại, cần rà soát: {exc}") from exc
+                        target = RUN_UNTIL_STAGE
+                        with self._lock:
+                            if self._runs.get(job_id) is state:
+                                state["until"] = target
+                        manifest = pipeline.run_job(root, until=target)
+                if self._auto_run and target == RUN_UNTIL_STAGE and not event.is_set():
+                    self._auto_cover(job_id, root, manifest)
             except Exception as exc:
                 error = str(exc)
             finally:
@@ -2021,7 +2079,13 @@ class JobsService:
     def approve_metadata(self, job_id: str) -> dict:
         root = self._require_job(job_id)
         meta = pipeline.approve_metadata(root)
-        return {"approved": True, "metadata": meta}
+        result = {"approved": True, "metadata": meta}
+        if self._auto_run and not self._is_running(job_id):
+            try:
+                result["handoff"] = self.build_handoff(job_id)
+            except Exception as exc:
+                result["handoff_error"] = str(exc)
+        return result
 
     def update_metadata(self, job_id: str, fields: dict) -> dict:
         with self._version_lock:
@@ -2141,6 +2205,23 @@ class JobsService:
         root = self._require_job(job_id)
         if self._is_running(job_id):
             raise RuntimeError("Chờ pipeline hoàn tất trước khi tạo ảnh bìa.")
+        return self._render_auto_thumbnails(job_id, root)
+
+    def _auto_cover(self, job_id: str, root, manifest) -> None:
+        """After a full run, stage branded AGY covers and preselect the first for review."""
+        stage = manifest.stage("thumbnail")
+        if stage is None or stage.status != "ready" or self._read_json(root, "thumbnail_edits.json").get("variants"):
+            return
+        try:
+            variants = self._render_auto_thumbnails(job_id, root).get("variants") or []
+            if variants and variants[0].get("file"):
+                pipeline.select_thumbnail(root, variants[0]["file"])
+        except Exception:
+            pass
+
+    def _render_auto_thumbnails(self, job_id: str, root) -> dict:
+        from .thumbnail_editor import render_thumbnail_variants
+
         manifest = pipeline.load_manifest(root)
         channel_name = branding.load_settings(self.jobs_root)["name"]
         movie_title = (manifest.config.movie_title or job_id or "").strip()
@@ -2271,6 +2352,14 @@ class JobsService:
             start_seconds = staged.get("start_seconds")
         if start_seconds is None and isinstance(draft, dict):
             start_seconds = draft.get("start_seconds")
+        sections = [s for s in script.get("sections", []) if isinstance(s, dict)]
+        position = next((i for i, s in enumerate(sections) if s.get("midroll")), 0)
+        if isinstance(start_seconds, (int, float)):
+            location = f"Khoảng {round(float(start_seconds))} giây · gần giữa video"
+        elif position:
+            location = f"Sau phần '{sections[position - 1].get('title', '')}' · gần giữa video"
+        else:
+            location = "Chưa xác định vị trí"
         return {
             "draft": draft,
             "staged": staged,
@@ -2278,10 +2367,7 @@ class JobsService:
             "insertion": {
                 "status": "inserted" if staged else "draft" if draft else "missing",
                 "start_seconds": start_seconds,
-                "location_label": (
-                    f"Khoảng {round(float(start_seconds))} giây · gần giữa video"
-                    if isinstance(start_seconds, (int, float)) else "Chưa xác định vị trí"
-                ),
+                "location_label": location,
             },
         }
 
@@ -2295,31 +2381,13 @@ class JobsService:
         # runs regardless of the project's content_agent (scaffold/claude included).
         if not script.get("approved") or any(s.get("midroll") for s in script.get("sections", []) if isinstance(s, dict)):
             raise ValueError("Kịch bản cần được duyệt và chưa có CTA.")
-        schema = {"type": "object", "properties": {"line": {"type": "string"}},
-                  "required": ["line"], "additionalProperties": False}
         midpoint = len(script["sections"]) // 2
-        brand_name = branding.load_settings(self.jobs_root)["name"]
-        previous = script["sections"][midpoint - 1]["title"]
-        following = script["sections"][midpoint]["title"]
-        if narration_style.is_vietnamese(manifest.config.language):
-            prompt = (
-                "Viết một lời thoại CTA bằng tiếng Việt, 25–40 từ, một hoặc hai câu, "
-                "hài hước tự nhiên theo chi tiết của phim. Nhắc bấm thích và đăng ký "
-                f"kênh {brand_name} để không bỏ lỡ phần tiếp theo. Chèn ở 50% video giữa "
-                f"'{previous}' và '{following}' của '{manifest.config.movie_title}'. "
-                "Không bịa sự kiện, không lặp nguyên văn thoại phim. Trả JSON đúng schema."
-            )
-        else:
-            prompt = (
-                f"Write one spoken call-to-action line in "
-                f"{narration_style.language_name(manifest.config.language)}, 25-40 words, "
-                "one or two sentences, with light humor tied to a detail of the movie. Ask viewers "
-                f"to like and subscribe to {brand_name} so they don't miss what comes next. It plays "
-                f"at the 50% mark between '{previous}' and '{following}' of "
-                f"'{manifest.config.movie_title}'. Do not invent events or quote dialogue verbatim; "
-                "never say 'smash that like button'. Return JSON matching the schema."
-            )
-        result = run_agy_json(stage="midroll", prompt=prompt, schema=schema)
+        prompt = midroll.cta_prompt(
+            manifest.config.language, branding.load_settings(self.jobs_root)["name"],
+            manifest.config.movie_title, script["sections"][midpoint - 1]["title"],
+            script["sections"][midpoint]["title"],
+        )
+        result = run_agy_json(stage="midroll", prompt=prompt, schema=midroll.CTA_SCHEMA)
         line = str(result.get("line") or "").strip()
         render = self._read_json(root, "render.json")
         _, _, at = midroll.prepare(script, plan, line, 10, render.get("narration_duration_seconds"))
@@ -2490,7 +2558,13 @@ class JobsService:
         self._assert_no_preview(job_id)
         root = self._require_job(job_id)
         script = pipeline.approve_script(root)
-        return {"approved": True, "script": script}
+        result = {"approved": True, "script": script, "auto_run": False}
+        if self._auto_run and not self._is_running(job_id):
+            try:
+                result["auto_run"] = bool(self.start_run(job_id).get("started"))
+            except Exception as exc:
+                result["auto_run_error"] = str(exc)
+        return result
 
     def prepare_publish(self, job_id: str, *, confirm: bool) -> dict:
         """The publishing gate. Without ``confirm`` it does nothing and reports
@@ -2523,6 +2597,30 @@ class JobsService:
         candidates = content_scout.discover_hidden_gems(topic=topic, source=source, refresh=refresh)
         return {"candidates": candidates, "total": len(candidates)}
 
+    def _quick_config(self, payload: dict) -> dict:
+        """Quick-config fields shared by Scout "Dựng review video này" and the overnight
+        batch -> a ``create_job`` payload (active channel defaults fill the gaps)."""
+        defaults = self.creator_library.active_channel_defaults() or {}
+        try:
+            raw = payload.get("target_minutes")
+            minutes = float(raw if raw not in (None, "") else defaults.get("target_minutes") or 10)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Thời lượng review phải là số phút.") from exc
+        if not 1 <= minutes <= 60:
+            raise ValueError("Thời lượng review cần 1–60 phút.")
+        config = {
+            **defaults,
+            "target_minutes": minutes,
+            "content_agent": payload.get("content_agent") or "agy",
+            "visual_variety": payload.get("visual_variety") or defaults.get("visual_variety") or "balanced",
+            "tts_provider": payload.get("tts_provider") or defaults.get("tts_provider") or "edge",
+            "tts_voice": payload.get("tts_voice") if payload.get("tts_voice") is not None else defaults.get("tts_voice", ""),
+        }
+        if payload.get("watermark_enabled", True):
+            config["watermark_detect"] = payload.get("watermark_detect") or "color"
+            config["watermark_method"] = payload.get("watermark_method") or "propainter"
+        return config
+
     def scout_enqueue(self, payload: dict) -> dict:
         candidate_id = str(payload.get("candidate_id") or "")
         data = content_scout.enqueue_gem_for_review(candidate_id)
@@ -2535,20 +2633,8 @@ class JobsService:
             while (self.jobs_root / unique_job_id).exists():
                 count += 1
                 unique_job_id = f"{job_id}-{count}"
-            defaults = self.creator_library.active_channel_defaults() or {}
             title = str(payload.get("movie_title") or candidate.get("vietnamese_title") or candidate.get("title") or "").strip()
-            create_payload = {
-                **defaults,
-                "job_id": unique_job_id,
-                "movie_title": title,
-                "content_agent": payload.get("content_agent") or "agy",
-                "visual_variety": payload.get("visual_variety") or defaults.get("visual_variety") or "balanced",
-                "tts_provider": payload.get("tts_provider") or defaults.get("tts_provider") or "edge",
-                "tts_voice": payload.get("tts_voice") if payload.get("tts_voice") is not None else defaults.get("tts_voice", ""),
-            }
-            if payload.get("watermark_enabled", True):
-                create_payload["watermark_detect"] = payload.get("watermark_detect") or "color"
-                create_payload["watermark_method"] = payload.get("watermark_method") or "propainter"
+            create_payload = {**self._quick_config(payload), "job_id": unique_job_id, "movie_title": title}
             created = self.create_job(create_payload)
             data["created_job"] = created
         return data
@@ -4031,6 +4117,11 @@ INDEX_HTML = """<!DOCTYPE html>
           <input id="newJobId" name="job_id" type="hidden">
           <label>Tên phim / truy vấn nghiên cứu</label>
           <input name="movie_title" placeholder="vd: The Matrix (1999)">
+          <div class="row">
+            <div><label for="createGenre">Thể loại (tùy chọn)</label><input id="createGenre" name="genre" maxlength="40" list="genreOptions" placeholder="vd: kinh dị" title="Thể loại quyết định giọng văn lời dẫn, câu hỏi bình luận và tiêu đề"><datalist id="genreOptions"><option value="Kinh dị"><option value="Giật gân"><option value="Trinh thám"><option value="Hành động"><option value="Hài"><option value="Tình cảm"><option value="Tâm lý"><option value="Khoa học viễn tưởng"><option value="Giả tưởng"><option value="Hoạt hình"><option value="Chiến tranh"><option value="Thảm họa"><option value="Kinh dị hài"></datalist></div>
+            <div><label for="createReviewFormat">Dạng video</label>
+              <select id="createReviewFormat" name="review_format"><option value="single">Một phim</option><option value="compilation">Tuyển tập nhiều truyện (Câu chuyện thứ N)</option></select></div>
+          </div>
           <details class="advanced-fields"><summary>Định hướng review</summary>
             <label for="briefTemplateSelect">Mẫu brief dùng lại</label>
             <select id="briefTemplateSelect"><option value="">Chọn mẫu để điền form…</option></select>
@@ -4080,9 +4171,11 @@ INDEX_HTML = """<!DOCTYPE html>
               <option value="elevenlabs">ElevenLabs (cần MRF_ELEVENLABS_API_KEY)</option>
               <option value="vieneu">VieNeu-TTS (miễn phí, offline 24kHz · cần: pip install vieneu)</option>
             </select>
-            <label>Voice ID / tên giọng (FPT.AI / ElevenLabs / VieNeu, tùy chọn)</label>
-            <input name="tts_voice" list="ttsVoiceHints" placeholder="vd: banmai (FPT.AI) hoặc 21m00Tcm4TlvDq8ikWAM (ElevenLabs)">
+            <label>Voice ID / tên giọng (Edge / FPT.AI / ElevenLabs / VieNeu, tùy chọn)</label>
+            <input name="tts_voice" list="ttsVoiceHints" placeholder="Để trống: tự chọn giọng theo thể loại">
             <datalist id="ttsVoiceHints">
+              <option value="vi-VN-NamMinhNeural">Edge · Nam Minh (nam, trầm)</option>
+              <option value="vi-VN-HoaiMyNeural">Edge · Hoài My (nữ)</option>
               <option value="banmai">FPT.AI · Ban Mai (nữ, miền Bắc)</option>
               <option value="lannhi">FPT.AI · Lan Nhi (nữ, miền Nam)</option>
               <option value="leminh">FPT.AI · Lê Minh (nam, miền Bắc)</option>
@@ -4207,6 +4300,10 @@ INDEX_HTML = """<!DOCTYPE html>
           </select>
           <label for="chTtsVoice">Voice ID / tên giọng (tùy chọn)</label>
           <input id="chTtsVoice" maxlength="120" placeholder="vd: banmai hoặc 21m00Tcm4TlvDq8ikWAM">
+          <label for="chGreeting">Câu chào mở video (tùy chọn)</label>
+          <input id="chGreeting" maxlength="200" placeholder="vd: Xin chào các bạn, mình là ... và đây là kênh ...">
+          <label for="chChannelUrl">Link kênh YouTube (tùy chọn, dùng cho link đăng ký)</label>
+          <input id="chChannelUrl" maxlength="200" placeholder="https://www.youtube.com/@tenkenh">
           <label for="chAspect">Tỷ lệ khung hình</label>
           <select id="chAspect"><option value="16:9">16:9</option><option value="9:16">9:16</option></select>
           <label for="chLanguage">Ngôn ngữ</label>
@@ -4319,12 +4416,7 @@ INDEX_HTML = """<!DOCTYPE html>
           <div style="display:flex; gap:12px; flex-wrap:wrap; align-items:flex-end">
             <label style="min-width:180px">Chủ đề:
               <select id="scoutTopicSelect">
-                <option value="all">Tất cả chủ đề</option>
-                <option value="horror">Kinh dị / Quái vật / Rùng rợn</option>
-                <option value="fantasy_mystery">Tiên hiệp / Huyền ảo / Bí ẩn</option>
-                <option value="ceo_romance">Tổng tài / Nghịch tập / Đoản kịch</option>
-                <option value="isekai_rebirth">Xuyên không / Trùng sinh</option>
-                <option value="cult_classic">Phim xưa lạ / B-Movie độc lạ</option>
+<!--@scout-topics-->
               </select>
             </label>
             <label style="min-width:180px">Nguồn dữ liệu:
@@ -4351,6 +4443,7 @@ INDEX_HTML = """<!DOCTYPE html>
     <div class="dialog-shell"><div class="dialog-header"><div><h2 id="scoutConfigTitle">Cấu hình nhanh dự án</h2><p>Kiểm tra thiết lập trước khi khởi tạo.</p></div><button id="closeScoutConfig" class="dialog-close" type="button" aria-label="Đóng">×</button></div>
       <div class="dialog-body"><form id="scoutConfigForm" class="create-form">
         <label for="scoutMovieTitle">Tên phim</label><input id="scoutMovieTitle" maxlength="300" required>
+        <label for="scoutTargetMinutes">Mục tiêu thời lượng review (phút)</label><input id="scoutTargetMinutes" type="number" value="10" min="1" max="60" step="0.5" required>
         <label class="checkbox-row"><input id="scoutWatermarkEnabled" type="checkbox" checked><span>Bật xoá watermark chìm</span></label>
         <label for="scoutWatermarkDetect">Phương pháp nhận diện</label><select id="scoutWatermarkDetect"><option value="color">Theo màu sắc</option><option value="temporal">Theo thời gian</option></select>
         <label for="scoutWatermarkMethod">Cách xoá watermark</label><select id="scoutWatermarkMethod" class="wm-method"><option value="propainter">ProPainter</option></select><p class="muted wm-method-help"></p>
@@ -4388,8 +4481,20 @@ INDEX_HTML = """<!DOCTYPE html>
       <div class="empty-help">Sau khi tạo, project mở thẳng vào workspace và giữ toàn bộ tiến trình ở một nơi.</div>
       <div id="batchPanel" class="card" style="margin-top:14px; text-align:left; width:100%; max-width:640px">
         <h3 style="margin:0 0 6px 0; font-size:1.05rem">Hàng đợi hàng loạt (chạy qua đêm)</h3>
-        <p class="muted">Dán nhiều link, mỗi dòng một link. Hệ thống tải và dựng tuần tự tới bước duyệt kịch bản cho từng video; lỗi một video sẽ bỏ qua và chạy tiếp. Xong vào từng project bấm duyệt.</p>
+        <p class="muted">Dán nhiều link, mỗi dòng một link. Hệ thống tải và dựng tuần tự từng video một mạch tới final.mp4 (AGY tự viết kịch bản, chèn CTA, tự duyệt, render, chọn bìa); lỗi một video sẽ bỏ qua và chạy tiếp. Sáng ra chỉ còn duyệt metadata.</p>
         <textarea id="batchLinks" rows="5" style="width:100%" placeholder="https://..."></textarea>
+        <details id="batchConfig" open style="margin-top:8px"><summary><strong>Cấu hình nhanh cho cả loạt</strong> <span class="muted">(áp dụng cho mọi video trong hàng đợi)</span></summary>
+          <div class="create-form" style="margin-top:8px">
+            <label for="batchTargetMinutes">Mục tiêu thời lượng review (phút)</label><input id="batchTargetMinutes" type="number" value="10" min="1" max="60" step="0.5">
+            <label class="checkbox-row"><input id="batchWatermarkEnabled" type="checkbox" checked><span>Bật xoá watermark chìm</span></label>
+            <label for="batchWatermarkDetect">Phương pháp nhận diện</label><select id="batchWatermarkDetect"><option value="color">Theo màu sắc</option><option value="temporal">Theo thời gian</option></select>
+            <label for="batchWatermarkMethod">Cách xoá watermark</label><select id="batchWatermarkMethod" class="wm-method"><option value="propainter">ProPainter</option></select><p class="muted wm-method-help"></p>
+            <label for="batchContentAgent">Bộ tạo nội dung</label><select id="batchContentAgent"><option value="agy">Nhóm AGY</option><option value="claude">Claude Code</option><option value="scaffold">Mẫu thử</option></select>
+            <label for="batchCopyright">Biến đổi hình ảnh clip</label><select id="batchCopyright"><option value="balanced">Cân bằng (khuyên dùng)</option><option value="aggressive">Mạnh</option><option value="light">Nhẹ</option><option value="off">Tắt</option></select>
+            <label for="batchTtsProvider">Giọng đọc</label><select id="batchTtsProvider"><option value="edge">Edge</option><option value="vieneu">VieNeu</option><option value="fptai">FPT.AI</option><option value="elevenlabs">ElevenLabs</option></select>
+            <label for="batchTtsVoice">Voice</label><input id="batchTtsVoice" list="ttsVoiceSuggestions" maxlength="120" placeholder="Mặc định của provider">
+          </div>
+        </details>
         <label class="row" style="gap:6px; align-items:center; margin-top:6px">
           <input id="batchRights" type="checkbox" style="width:auto"> Tôi có quyền sử dụng các video này
         </label>
@@ -4738,11 +4843,14 @@ INDEX_HTML = """<!DOCTYPE html>
         <h2>Siêu dữ liệu &amp; Duyệt</h2>
         <div id="metaState" class="muted"></div>
         <label>Tiêu đề</label>
-        <input id="metaTitle">
+        <input id="metaTitle" list="metaTitleOptions">
+        <datalist id="metaTitleOptions"></datalist>
         <label>Mô tả</label>
         <textarea id="metaDesc" rows="5"></textarea>
         <label>Thẻ (phân tách bằng dấu phẩy)</label>
         <input id="metaTags">
+        <label for="metaPinned">Bình luận ghim</label>
+        <textarea id="metaPinned" rows="3"></textarea>
         <div class="row" style="margin-top:10px">
           <button id="saveMetaBtn">Lưu thay đổi</button>
           <button id="approveBtn" class="primary">Duyệt siêu dữ liệu</button>
@@ -6237,7 +6345,7 @@ async function loadMidroll() {
     $('midrollStatus').className = 'cta-status ' + (insertion.status === 'inserted' ? 'ok' : insertion.status === 'draft' ? 'warn' : 'muted');
     $('midrollPanel').open = insertion.status === 'draft';
     $('midrollMsg').textContent = state.staged
-      ? (state.approved ? 'CTA đã duyệt; chạy pipeline để tạo bản video mới.' : 'CTA đã chèn. Kiểm tra kịch bản và bấm Duyệt kịch bản.')
+      ? (state.approved ? 'CTA đã duyệt cùng kịch bản.' : 'AGY đã tự chèn CTA vào kịch bản; sửa câu CTA ngay trong kịch bản rồi bấm Duyệt kịch bản.')
       : state.draft ? ('AGY đã soạn câu cho mốc ' + Math.round(state.draft.start_seconds) + ' giây.') : '';
   } catch (error) { $('midrollMsg').textContent = error.message; }
 }
@@ -6315,6 +6423,8 @@ function fillChannelForm(ch) {
   _chSet('chName', ch && ch.name);
   _chSet('chTtsProvider', (ch && ch.tts_provider) || 'edge');
   _chSet('chTtsVoice', ch && ch.tts_voice);
+  _chSet('chGreeting', ch && ch.greeting);
+  _chSet('chChannelUrl', ch && ch.channel_url);
   _chSet('chAspect', (ch && ch.aspect_ratio) || '16:9');
   _chSet('chLanguage', (ch && ch.language) || 'vi');
   _chSet('chIntro', ch ? ch.intro_seconds : 0);
@@ -6367,6 +6477,8 @@ function _channelPayload() {
     name: $('chName').value,
     tts_provider: $('chTtsProvider').value,
     tts_voice: $('chTtsVoice').value.trim(),
+    greeting: $('chGreeting').value.trim(),
+    channel_url: $('chChannelUrl').value.trim(),
     aspect_ratio: $('chAspect').value,
     language: $('chLanguage').value.trim() || 'vi',
     intro_seconds: Number($('chIntro').value) || 0,
@@ -6607,7 +6719,7 @@ async function loadStatus() {
   const scriptStage = s.stages.find(stage => stage.stage === 'script');
   const renderStage = s.stages.find(stage => stage.stage === 'render');
   const qaStage = s.stages.find(stage => stage.stage === 'qa');
-  $('runBtn').textContent = s.approvals.script_approved ? 'Chạy tiếp đến video' : 'Chạy đến kịch bản';
+  $('runBtn').textContent = s.approvals.script_approved ? 'Chạy tiếp đến video' : s.approvals.auto_flow ? 'Chạy đến video' : 'Chạy đến kịch bản';
   $('nextAction').textContent = s.uploading ? 'Đang import video…' : !s.has_source_video ? 'Import video MP4 để bắt đầu.'
     : s.is_indexing ? 'Đang lập chỉ mục nền (transcript/cảnh/hình ảnh). Có thể mở project khác trong lúc chờ.'
     : s.running ? 'Pipeline đang xử lý. Tiến độ cập nhật tự động.'
@@ -6769,7 +6881,7 @@ async function renderMeta(approvals) {
     ? (approvals.metadata_approved ? '<span class="ok">Siêu dữ liệu đã được duyệt.</span>'
         : '<span class="warn">Siêu dữ liệu chưa được duyệt.</span>')
     : '<span class="muted">Chưa có siêu dữ liệu (chạy pipeline tới bước Siêu dữ liệu).</span>';
-  if (!approvals.metadata_present) { metaLoaded = null; $('metaTitle').value = ''; $('metaDesc').value = ''; $('metaTags').value = ''; }
+  if (!approvals.metadata_present) { metaLoaded = null; $('metaTitle').value = ''; $('metaDesc').value = ''; $('metaTags').value = ''; $('metaPinned').value = ''; }
   else if (metaLoaded !== current) {
     try {
       const { present, metadata } = await api('GET', '/api/jobs/' + encodeURIComponent(current) + '/metadata');
@@ -6777,6 +6889,8 @@ async function renderMeta(approvals) {
         $('metaTitle').value = metadata.title || '';
         $('metaDesc').value = metadata.description || '';
         $('metaTags').value = (metadata.tags || []).join(', ');
+        $('metaPinned').value = metadata.pinned_comment || '';
+        $('metaTitleOptions').replaceChildren(...(metadata.title_options || []).map(text => { const o = document.createElement('option'); o.value = text; return o; }));
         metaLoaded = current;
       }
     } catch (e) { $('metaMsg').textContent = 'Không tải được siêu dữ liệu: ' + e.message; }
@@ -7188,7 +7302,7 @@ let batchPoller = null;
 function renderBatch(state) {
   const list = $('batchList');
   list.replaceChildren();
-  const label = {pending:'chờ', running:'đang chạy', ready:'xong (chờ duyệt)', failed:'lỗi', cancelled:'đã hủy'};
+  const label = {pending:'chờ', running:'đang chạy', ready:'xong', failed:'lỗi', cancelled:'đã hủy'};
   for (const it of (state.items || [])) {
     const row = document.createElement('div');
     row.textContent = '#' + (it.index + 1) + ' · ' + (label[it.status] || it.status)
@@ -7207,7 +7321,7 @@ async function loadBatch() {
 $('batchStartBtn').onclick = async () => {
   $('batchMsg').textContent = 'Đang khởi động hàng đợi…';
   try {
-    const state = await api('POST', '/api/batch', { links: $('batchLinks').value, confirm_rights: $('batchRights').checked });
+    const state = await api('POST', '/api/batch', { links: $('batchLinks').value, confirm_rights: $('batchRights').checked, ...quickConfig('batch') });
     $('batchMsg').textContent = 'Hàng đợi đang chạy nền. Có thể đóng tab; tiến trình vẫn chạy.';
     renderBatch(state);
     await loadJobs();
@@ -7270,7 +7384,7 @@ $('saveMetaBtn').onclick = async () => {
   const tags = $('metaTags').value.split(',').map(t => t.trim()).filter(Boolean);
   try {
     await api('POST', '/api/jobs/' + encodeURIComponent(current) + '/metadata',
-      { title: $('metaTitle').value, description: $('metaDesc').value, tags });
+      { title: $('metaTitle').value, description: $('metaDesc').value, tags, pinned_comment: $('metaPinned').value });
     $('metaMsg').innerHTML = '<span class="ok">Đã lưu. Cần duyệt lại trước khi xuất bản.</span>';
     metaLoaded = null; loadStatus();
   } catch (e) { $('metaMsg').innerHTML = '<span class="err">' + e.message + '</span>'; }
@@ -7278,8 +7392,16 @@ $('saveMetaBtn').onclick = async () => {
 
 $('approveBtn').onclick = async () => {
   try {
-    await api('POST', '/api/jobs/' + encodeURIComponent(current) + '/metadata/approve', {});
-    $('metaMsg').innerHTML = '<span class="ok">Đã duyệt siêu dữ liệu.</span>';
+    const r = await api('POST', '/api/jobs/' + encodeURIComponent(current) + '/metadata/approve', {});
+    if (r.handoff && r.handoff.href) {
+      const link = document.createElement('a');
+      link.href = r.handoff.href; link.download = r.handoff.name;
+      document.body.appendChild(link); link.click(); link.remove();
+      $('metaMsg').innerHTML = '<span class="ok">Đã duyệt và tự đóng gói bàn giao (video, phụ đề, ảnh bìa, thông tin đăng).</span>';
+    } else {
+      $('metaMsg').innerHTML = '<span class="ok">Đã duyệt siêu dữ liệu.</span>'
+        + (r.handoff_error ? ' <span class="warn">Chưa đóng gói: ' + escapeScoutHtml(r.handoff_error) + '</span>' : '');
+    }
     loadStatus();
   } catch (e) { $('metaMsg').innerHTML = '<span class="err">' + e.message + '</span>'; }
 };
@@ -7323,8 +7445,10 @@ $('saveScriptBtn').onclick = async () => {
 
 $('approveScriptBtn').onclick = async () => {
   try {
-    await api('POST', '/api/jobs/' + encodeURIComponent(current) + '/script/approve', {});
-    $('scriptMsg').innerHTML = '<span class="ok">Đã duyệt kịch bản.</span>';
+    const r = await api('POST', '/api/jobs/' + encodeURIComponent(current) + '/script/approve', {});
+    $('scriptMsg').innerHTML = r.auto_run
+      ? '<span class="ok">Đã duyệt kịch bản — đang tự dựng video (giọng đọc → render → QA → metadata → ảnh bìa).</span>'
+      : '<span class="ok">Đã duyệt kịch bản.</span>';
     loadStatus();
   } catch (e) { $('scriptMsg').innerHTML = '<span class="err">' + e.message + '</span>'; }
 };
@@ -7601,6 +7725,17 @@ async function loadScoutGems(forceRefresh) {
     showError(err);
   }
 }
+// Quick config shared by Scout "Dựng review video này" and the overnight batch (same field ids, prefix differs).
+function quickConfig(prefix) {
+  const field = name => $(prefix + name);
+  return {
+    target_minutes: Number(field('TargetMinutes').value) || 10,
+    watermark_enabled: field('WatermarkEnabled').checked, watermark_detect: field('WatermarkDetect').value,
+    watermark_method: field('WatermarkMethod').value,
+    content_agent: field('ContentAgent').value, visual_variety: field('Copyright').value,
+    tts_provider: field('TtsProvider').value, tts_voice: field('TtsVoice').value.trim(),
+  };
+}
 function enqueueScoutGem(gem) {
   pendingScoutGem = gem;
   $('scoutMovieTitle').value = scoutDisplayTitle(gem);
@@ -7622,10 +7757,7 @@ $('scoutConfigForm').onsubmit = async event => {
     const gem = pendingScoutGem;
     const res = await api('POST', '/api/scout/enqueue', {
       candidate_id: gem.id, auto_create: true, movie_title: $('scoutMovieTitle').value.trim(),
-      watermark_enabled: $('scoutWatermarkEnabled').checked, watermark_detect: $('scoutWatermarkDetect').value,
-      watermark_method: $('scoutWatermarkMethod').value,
-      content_agent: $('scoutContentAgent').value, visual_variety: $('scoutCopyright').value,
-      tts_provider: $('scoutTtsProvider').value, tts_voice: $('scoutTtsVoice').value.trim(),
+      ...quickConfig('scout'),
     });
     $('scoutConfigDialog').close(); closeToolDialog('scoutPanel'); await loadJobs();
     if (res.created_job && res.created_job.job_id) {
@@ -7633,6 +7765,9 @@ $('scoutConfigForm').onsubmit = async event => {
       if ($('sourceRetryUrl') && gem.source_url) $('sourceRetryUrl').value = gem.source_url;
       updateSourceRetryFallback(gem.title || gem.vietnamese_title);
       setWorkspaceView('explore');
+      if (gem.source_url && $('sourceRetryUrlBtn') && $('sourceRetryRights') && $('sourceRetryRights').checked) {
+        $('sourceRetryUrlBtn').click();
+      }
     }
   } catch (err) { $('scoutConfigMsg').textContent = err.message; }
   finally { if (submit) submit.disabled = false; }
@@ -7687,4 +7822,4 @@ $('chatAskBtn').addEventListener('click', () => askVideo().catch(showError));
 </script>
 </body>
 </html>
-""".replace("/*@ui-fonts*/", _UI_FONT_FACES)
+""".replace("/*@ui-fonts*/", _UI_FONT_FACES).replace("<!--@scout-topics-->", content_scout.scout_topic_options_html())

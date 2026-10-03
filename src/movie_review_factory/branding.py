@@ -3,14 +3,26 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import re
 import shutil
 from pathlib import Path
 
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
 DEFAULT_NAME = "Màn Kể"
 ASSETS = Path(__file__).resolve().parent / "assets"
+
+# Brand guard (anti-removal watermark): docs/research/brand-guard.md.
+BRAND_GUARD_ENV = "MRF_BRAND_GUARD"
+MARK_HOP_SECONDS = 45
+GHOST_HOP_SECONDS = 11
+GHOST_OPACITY = 0.16
+_INK = (8, 10, 14)
+
+
+def brand_guard_enabled() -> bool:
+    return os.environ.get(BRAND_GUARD_ENV, "1").strip().lower() not in ("0", "false", "no", "off")
 
 
 def _brand_dir(jobs_root: Path) -> Path:
@@ -199,9 +211,82 @@ def _fitted(draw: ImageDraw.ImageDraw, label: str, max_width: int, size: int):
     return font
 
 
+def _with_halo(layer: Image.Image, spread: int, blur: float, strength: float = .7) -> Image.Image:
+    """Put a soft dark halo under a transparent layer: legible on any footage, no box."""
+    halo = layer.getchannel("A").filter(ImageFilter.MaxFilter(spread * 2 + 1)).filter(ImageFilter.GaussianBlur(blur))
+    out = Image.new("RGBA", layer.size, _INK + (0,))
+    out.putalpha(halo.point(lambda value: round(value * strength)))
+    out.alpha_composite(layer)
+    return out
+
+
+def brand_lockup(jobs_root: Path, icon_size: int) -> Image.Image:
+    """Logo + channel name on a tight transparent canvas (no background tile)."""
+    name = load_settings(jobs_root)["name"]
+    logo = Image.open(logo_path(jobs_root)).convert("RGBA")
+    logo.thumbnail((icon_size, icon_size), Image.Resampling.LANCZOS)
+    font = _font(round(icon_size * .5))
+    stroke = max(2, icon_size // 16)
+    pad = stroke * 3 + 4
+    left, top, right, bottom = ImageDraw.Draw(Image.new("RGBA", (1, 1))).textbbox(
+        (0, 0), name, font=font, stroke_width=stroke)
+    gap = max(8, icon_size // 4)
+    width = pad * 2 + logo.width + gap + (right - left)
+    height = pad * 2 + max(logo.height, bottom - top)
+    layer = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    layer.alpha_composite(logo, (pad, (height - logo.height) // 2))
+    ImageDraw.Draw(layer).text(
+        (pad + logo.width + gap - left, (height - (bottom - top)) // 2 - top), name, font=font,
+        fill=(247, 248, 250, 255), stroke_width=stroke, stroke_fill=_INK + (220,))
+    return _with_halo(layer, 1, max(2, stroke))
+
+
+def _corner_icon(height: int) -> int:
+    return min(max(26, round(height * .048)), 54)
+
+
+def render_mark(jobs_root: Path, target: Path, height: int) -> Path:
+    """Corner brand lockup for the brand guard; the render moves it between top corners."""
+    target.parent.mkdir(parents=True, exist_ok=True)
+    brand_lockup(jobs_root, _corner_icon(height)).save(target, format="PNG")
+    return target
+
+
+def render_ghost(jobs_root: Path, target: Path, height: int, opacity: float = GHOST_OPACITY) -> Path:
+    """Faint lockup the render drifts over the picture: visible to people, hard to mask."""
+    layer = brand_lockup(jobs_root, max(24, round(height * .04)))
+    layer.putalpha(layer.getchannel("A").point(lambda value: round(value * opacity)))
+    target.parent.mkdir(parents=True, exist_ok=True)
+    layer.save(target, format="PNG")
+    return target
+
+
+def _hash01(slot: str, factor: float, seed: float) -> str:
+    inner = f"abs(sin({slot}*{factor}+{seed:.4f}))*43758.5453"
+    return f"({inner}-floor({inner}))"
+
+
+def mark_overlay_xy(margin: int) -> tuple[str, str]:
+    """FFmpeg overlay x/y: the corner lockup swaps top-left/top-right every hop."""
+    return f"if(eq(mod(floor(t/{MARK_HOP_SECONDS}),2),0),{margin},W-w-{margin})", str(margin)
+
+
+def ghost_overlay_xy(margin: int, seed: float) -> tuple[str, str]:
+    """FFmpeg overlay x/y: a per-job pseudo-random spot every hop, between 16% and 64% of
+    the frame height so it stays clear of the corner lockup and the captions."""
+    slot = f"floor(t/{GHOST_HOP_SECONDS})"
+    return (f"{margin}+(W-w-{2 * margin})*{_hash01(slot, 12.9898, seed)}",
+            f"H*0.16+(H*0.48-h)*{_hash01(slot, 78.233, seed)}")
+
+
 def render_overlay(jobs_root: Path, target: Path, width: int, height: int, title: str,
-                   top_band: float = 0, bottom_band: float = 0) -> Path:
-    """Compose an RGBA branding layer; explicit band coverage is opt-in per job."""
+                   top_band: float = 0, bottom_band: float = 0, include_mark: bool = True) -> Path:
+    """Compose an RGBA branding layer; explicit band coverage is opt-in per job.
+
+    Outside the opt-in bands nothing is boxed: the lockup and the chapter caption get
+    a stroke and a soft halo instead of a dark plate, so no footage is hidden.
+    ``include_mark=False`` leaves the corner lockup to the moving brand-guard layer.
+    """
     if width < 64 or height < 64 or not (0 <= top_band <= .2 and 0 <= bottom_band <= .2):
         raise ValueError("Kích thước video hoặc tỷ lệ dải nền không hợp lệ.")
     image = Image.new("RGBA", (width, height), (0, 0, 0, 0))
@@ -209,34 +294,39 @@ def render_overlay(jobs_root: Path, target: Path, width: int, height: int, title
     top = round(height * top_band)
     bottom = round(height * bottom_band)
     margin = max(12, round(width * .028))
-    name = load_settings(jobs_root)["name"]
-    logo = Image.open(logo_path(jobs_root)).convert("RGBA")
     if top:
         draw.rectangle((0, 0, width, top - 1), fill=(10, 12, 17, 255))
     if bottom:
         draw.rectangle((0, height - bottom, width, height), fill=(10, 12, 17, 255))
-    icon_size = min(max(26, round(height * .048)), max(20, top - 14) if top else 54)
-    x = margin
-    y = (top - icon_size) // 2 if top else margin
-    if not top:
-        label_width = round(width * .27)
-        draw.rounded_rectangle((x - 8, y - 6, x + label_width, y + icon_size + 6),
-                               radius=10, fill=(10, 12, 17, 205))
-    logo.thumbnail((icon_size, icon_size), Image.Resampling.LANCZOS)
-    image.alpha_composite(logo, (x, y))
-    font = _fitted(draw, name, round(width * .42), round(icon_size * .48))
-    name_height = draw.textbbox((0, 0), name, font=font)[3]
-    draw.text((x + icon_size + 12, y + (icon_size - name_height) / 2),
-              name, font=font, fill=(247, 248, 250, 255))
+    if top:
+        name = load_settings(jobs_root)["name"]
+        logo = Image.open(logo_path(jobs_root)).convert("RGBA")
+        icon_size = min(max(26, round(height * .048)), max(20, top - 14))
+        x, y = margin, (top - icon_size) // 2
+        logo.thumbnail((icon_size, icon_size), Image.Resampling.LANCZOS)
+        image.alpha_composite(logo, (x, y))
+        font = _fitted(draw, name, round(width * .42), round(icon_size * .48))
+        name_height = draw.textbbox((0, 0), name, font=font)[3]
+        draw.text((x + icon_size + 12, y + (icon_size - name_height) / 2),
+                  name, font=font, fill=(247, 248, 250, 255))
+    elif include_mark:
+        lockup = brand_lockup(jobs_root, _corner_icon(height))
+        image.alpha_composite(lockup, (max(0, margin - 10), max(0, margin - 10)))
     caption = "REVIEW PHIM  /  " + (title or "TÓM TẮT PHIM").upper()
     title_font = _fitted(draw, caption, width - 2 * margin - 18, round(height * .026))
     bbox = draw.textbbox((0, 0), caption, font=title_font)
     text_height = bbox[3] - bbox[1]
-    title_y = height - bottom + (bottom - text_height) // 2 - bbox[1] if bottom else height - margin - text_height - 18
-    if not bottom:
-        draw.rounded_rectangle((margin - 8, title_y - 7, margin + bbox[2] + 8, title_y + text_height + 14),
-                               radius=9, fill=(10, 12, 17, 205))
-    draw.text((margin, title_y), caption, font=title_font, fill=(245, 246, 248, 255))
+    if bottom:
+        title_y = height - bottom + (bottom - text_height) // 2 - bbox[1]
+        draw.text((margin, title_y), caption, font=title_font, fill=(245, 246, 248, 255))
+    else:
+        stroke = max(2, round(height * .0025))
+        pad = stroke * 3 + 4
+        strip = Image.new("RGBA", (bbox[2] + 2 * pad, bbox[3] + 2 * pad), (0, 0, 0, 0))
+        ImageDraw.Draw(strip).text((pad, pad), caption, font=title_font, fill=(245, 246, 248, 255),
+                                   stroke_width=stroke, stroke_fill=_INK + (220,))
+        strip = _with_halo(strip, 1, stroke + 1)
+        image.alpha_composite(strip, (margin - pad, height - margin - text_height - 18 - pad))
     target.parent.mkdir(parents=True, exist_ok=True)
     image.save(target, format="PNG")
     return target

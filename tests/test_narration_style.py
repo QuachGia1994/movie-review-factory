@@ -20,8 +20,15 @@ def test_language_name_and_detection() -> None:
     assert not narration_style.is_vietnamese("en")
 
 
-def test_prompt_style_is_english_only_and_targets_words() -> None:
-    assert narration_style.prompt_style("vi") is None
+def test_prompt_style_targets_words_and_carries_vietnamese_sync_guide() -> None:
+    vietnamese = narration_style.prompt_style("vi", [{"title": "Story", "budget_minutes": 2}])
+    assert vietnamese["words_per_minute"] == 240
+    assert any("trình tự phim" in rule for rule in vietnamese["guide"])
+    assert any("25 âm tiết" in rule for rule in vietnamese["guide"])
+    assert vietnamese["section_word_targets"] == [{"title": "Story", "target_words": 480}]
+    assert narration_style.prompt_style("fr") is None
+    assert narration_style.words_per_minute("fr") == 155
+    assert narration_style.target_words(10, "vi") == 2400
     style = narration_style.prompt_style("en", [
         {"title": "Hook", "budget_minutes": 0.5},
         {"title": "Story", "budget_minutes": 2},
@@ -103,13 +110,43 @@ def test_english_prompts_carry_language_name_and_style(tmp_path: Path, monkeypat
     assert '"target_words": 310' in by_stage["script"]
 
 
-def test_vietnamese_prompts_have_no_style_block(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_vietnamese_prompts_get_word_targets_and_sync_guide(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     calls = _capture_agent(monkeypatch)
     create_job(tmp_path, JobConfig(job_id="vi-agent", language="vi", target_minutes=3, content_agent="claude"))
     run_job(tmp_path, until="script")
 
-    assert all('"narration_style"' not in str(call["prompt"]) for call in calls)
+    by_stage = {call["stage"]: str(call["prompt"]) for call in calls}
+    assert '"guide"' in by_stage["script"]
+    assert "trình tự phim" in by_stage["script"]
+    assert '"target_words": 480' in by_stage["script"]
     assert "Vietnamese review/recap" in str(calls[0]["prompt"])
+
+
+def test_short_script_sections_are_expanded_toward_their_word_targets(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = _capture_agent(monkeypatch)
+    original = pipeline_mod.run_claude_json
+
+    def agent(**kwargs: object) -> dict:
+        if kwargs["stage"] != "script_expand":
+            return original(**kwargs)
+        calls.append(kwargs)
+        if "section 'Story'" in str(kwargs["prompt"]):
+            return {"narration": "chữ " * 470}
+        return {"narration": "ngắn"}
+
+    monkeypatch.setattr(pipeline_mod, "run_claude_json", agent)
+    create_job(tmp_path, JobConfig(job_id="vi-long", language="vi", target_minutes=3, content_agent="claude"))
+    run_job(tmp_path, until="script")
+
+    script = json.loads((tmp_path / "script.json").read_text(encoding="utf-8"))
+    expand_calls = [call for call in calls if call["stage"] == "script_expand"]
+    # Round 1 expands both short sections; round 2 retries only the Hook, whose rewrite was not longer.
+    assert len(expand_calls) == 3
+    assert script["sections"][1]["narration"].count("chữ") == 470
+    assert script["sections"][0]["narration"] == "A cop walks into a trap."
+    assert (script["word_count"], script["target_words"]) == (476, 720)
 
 
 def test_vieneu_is_not_vietnamese_only() -> None:
@@ -135,9 +172,11 @@ def test_english_metadata_uses_movie_title_and_english_copy(tmp_path: Path) -> N
     pipeline_mod._metadata(tmp_path, load_manifest(tmp_path))
 
     meta = json.loads((tmp_path / "youtube_metadata.json").read_text(encoding="utf-8"))
-    assert meta["title"] == "Heat – Movie Recap"
-    assert "In this video:" in meta["description"]
-    assert "phim" not in meta["tags"]
+    assert meta["title"] == "Heat | Movie recap"
+    assert "fair use" in meta["description"]
+    assert "#MovieRecap #Heat" in meta["description"]
+    assert "review phim" not in meta["tags"]
+    assert meta["pinned_comment"].startswith("Which moment in Heat")
     assert meta["approved"] is False
 
 

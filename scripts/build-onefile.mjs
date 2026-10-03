@@ -36,6 +36,8 @@ const runtimeFiles = [
   "midroll.py",
   "narration_alignment.py",
   "narration_style.py",
+  "packaging.py",
+  "genre_tone.py",
   "tts_providers.py",
   "batch_queue.py",
   "models.py",
@@ -50,7 +52,9 @@ const runtimeFiles = [
   "short_variants.py",
   "thumbnail_editor.py",
   "versions.py",
+  "runtime_cache.py",
   "semantic_search.py",
+  "shot_planner.py",
   "visual_rhythm.py",
   "webapp.py",
 ];

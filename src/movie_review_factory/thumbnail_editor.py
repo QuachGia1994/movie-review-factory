@@ -10,6 +10,9 @@ from PIL import Image, ImageDraw, ImageFont
 
 _LAYOUTS = ("bottom-left", "top-left", "bottom-center")
 _SAFE = (96, 72, 1184, 648)
+_BAND_ACCENT = (255, 204, 0, 255)
+_BAND_STRIPE = (220, 38, 38, 255)
+_BAND_TOP = 582
 
 
 def _font(size: int) -> ImageFont.FreeTypeFont:
@@ -65,7 +68,40 @@ def headline_fits(headline: str) -> bool:
     return True
 
 
-def _draw_variant(source: Path, headline: str, channel: str, layout: str, top_band: float = 0.0, bottom_band: float = 0.0) -> tuple[Image.Image, list[dict]]:
+def _fit_band(label: str, title: str) -> tuple[ImageFont.FreeTypeFont, str]:
+    probe = ImageDraw.Draw(Image.new("RGB", (1, 1)))
+
+    def width(text: str, font: ImageFont.FreeTypeFont) -> int:
+        return int(probe.textbbox((0, 0), f"{label} {text}", font=font)[2])
+
+    for size in range(44, 29, -2):
+        font = _font(size)
+        if width(title, font) <= 1020:
+            return font, title
+    text = title
+    while text and width(text.rstrip() + "…", font) > 1020:
+        text = text[:-1]
+    if not text:
+        raise ValueError("title band cannot fit")
+    return font, text.rstrip() + "…"
+
+
+def _draw_title_band(draw: ImageDraw.ImageDraw, label: str, title: str, centered: bool = False) -> dict:
+    """Bottom 'Review Phim : <movie>' strip: white label, accent movie title, red stripe."""
+    font, title = _fit_band(label, title)
+    label_width = int(draw.textbbox((0, 0), label + " ", font=font)[2])
+    width = int(draw.textbbox((0, 0), f"{label} {title}", font=font)[2])
+    left = (1280 - (width + 46)) // 2 if centered else 98
+    x, y = left + 30, _BAND_TOP + (56 - font.size) // 2 - 2
+    box = (left, _BAND_TOP, x + width + 16, _BAND_TOP + 60)
+    draw.rounded_rectangle(box, radius=10, fill=(6, 16, 31, 225))
+    draw.rectangle((box[0], box[1], box[0] + 10, box[3]), fill=_BAND_STRIPE)
+    draw.text((x, y), label, font=font, fill=(255, 255, 255, 255), stroke_width=1, stroke_fill=(6, 16, 31, 255))
+    draw.text((x + label_width, y), title, font=font, fill=_BAND_ACCENT, stroke_width=2, stroke_fill=(6, 16, 31, 255))
+    return {"kind": "title_band", "text": f"{label} {title}", "box": list(box)}
+
+
+def _draw_variant(source: Path, headline: str, channel: str, layout: str, top_band: float = 0.0, bottom_band: float = 0.0, band: tuple[str, str] | None = None) -> tuple[Image.Image, list[dict]]:
     with Image.open(source) as original:
         base = original.convert("RGB").resize((1280, 720), Image.Resampling.LANCZOS)
     # Cover any residual top/bottom brand bands carried over from the source
@@ -88,7 +124,7 @@ def _draw_variant(source: Path, headline: str, channel: str, layout: str, top_ba
     brand_width = int(draw.textbbox((0, 0), channel, font=brand_font)[2])
     if brand_width > 780:
         raise ValueError("channel_name exceeds safe area")
-    brand_y = 99 if layout != "top-left" else 579
+    brand_y = 99 if layout != "top-left" or band else 579
     brand_x = 110
     brand_box = (brand_x - 12, brand_y - 8, brand_x + brand_width + 14, brand_y + 50)
     draw.rounded_rectangle(brand_box, radius=12, fill=(6, 16, 31, 210))
@@ -96,7 +132,8 @@ def _draw_variant(source: Path, headline: str, channel: str, layout: str, top_ba
     layers.append({"kind": "brand", "text": channel, "box": list(brand_box)})
 
     line_height = headline_font.size + 15
-    top = 195 if layout == "top-left" else 603 - line_height * len(lines)
+    bottom = _BAND_TOP - 22 if band else 603
+    top = 195 if layout == "top-left" else bottom - line_height * len(lines)
     for line in lines:
         width = int(draw.textbbox((0, 0), line, font=headline_font)[2])
         x = (1280 - width) // 2 if layout == "bottom-center" else 110
@@ -105,6 +142,8 @@ def _draw_variant(source: Path, headline: str, channel: str, layout: str, top_ba
         draw.text((x, top), line, font=headline_font, fill=(255, 255, 255, 255), stroke_width=2, stroke_fill=(6, 16, 31, 255))
         layers.append({"kind": "headline", "text": line, "box": list(plate)})
         top += line_height
+    if band:
+        layers.append(_draw_title_band(draw, *band, centered=layout == "bottom-center"))
 
     for layer in layers:
         x0, y0, x1, y1 = layer["box"]
@@ -120,6 +159,7 @@ def render_thumbnail_variants(
     channel_name: str,
     headlines: list[str] | None = None,
     force_cover: bool = False,
+    title_band: bool = True,
 ) -> dict:
     """Prepare editable overlays on three existing candidate images; selection remains manual.
 
@@ -132,6 +172,7 @@ def render_thumbnail_variants(
     auto-thumbnail flow. ``force_cover`` raises the brand band floors
     (top >= 0.10, bottom >= 0.14) so a source channel's residual watermark is
     always painted over even when the job never configured brand bands.
+    ``title_band`` adds the 'Review Phim : <movie>' strip when the job manifest names the film.
     """
     root = Path(job_root)
     headline = " ".join(headline.split())
@@ -164,13 +205,18 @@ def render_thumbnail_variants(
     # Brand bands to cover on each variant, read from the job manifest when
     # present (default 0 = no cover, e.g. unit fixtures without a manifest).
     top_band = bottom_band = 0.0
+    band = None
     manifest_file = root / "manifest.json"
     if manifest_file.is_file():
         try:
             job_cfg = json.loads(manifest_file.read_text(encoding="utf-8")).get("config", {})
             top_band = float(job_cfg.get("brand_top_band") or 0)
             bottom_band = float(job_cfg.get("brand_bottom_band") or 0)
-        except (ValueError, OSError, TypeError):
+            movie = " ".join(str(job_cfg.get("movie_title") or "").split())[:80]
+            if title_band and movie:
+                vi = str(job_cfg.get("language") or "vi").lower().startswith("vi")
+                band = ("Review Phim :" if vi else "Movie Recap:", movie)
+        except (ValueError, OSError, TypeError, AttributeError):
             top_band = bottom_band = 0.0
     if force_cover:
         # Auto flow always covers a source's residual band watermark; the manual flow keeps the job's own bands.
@@ -183,12 +229,12 @@ def render_thumbnail_variants(
         for i, (source_name, layout) in enumerate(zip(source_names, _LAYOUTS), start=1):
             variant_headline = variant_headlines[i - 1]
             revision = hashlib.sha256(
-                (variant_headline + "\0" + channel_name).encode("utf-8")
+                (variant_headline + "\0" + channel_name + ("\0" + " ".join(band) if band else "")).encode("utf-8")
                 + (root / source_name).read_bytes()
             ).hexdigest()[:12]
             full_name = f"thumbnail-edit-{i}-{revision}.jpg"
             preview_name = f"thumbnail-edit-{i}-{revision}-small.jpg"
-            image, layers = _draw_variant(root / source_name, variant_headline, channel_name, layout, top_band, bottom_band)
+            image, layers = _draw_variant(root / source_name, variant_headline, channel_name, layout, top_band, bottom_band, band)
             image.save(staged / full_name, quality=92, subsampling=0)
             image.resize((320, 180), Image.Resampling.LANCZOS).save(staged / preview_name, quality=90)
             variants.append({

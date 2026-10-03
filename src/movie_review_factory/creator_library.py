@@ -98,6 +98,22 @@ class CreatorLibrary:
         with self._lock:
             return sorted(self._load()["series"].values(), key=lambda item: item["title"].casefold())
 
+    def series_context(self, job_id: str) -> dict | None:
+        """Part number and neighbouring titles for the first series that lists this job."""
+        for series in self.list_series():
+            entries = series.get("entries") or []
+            for position, entry in enumerate(entries):
+                if entry.get("job_id") != job_id:
+                    continue
+                return {
+                    "title": series["title"],
+                    "part": position + 1,
+                    "total": len(entries),
+                    "previous": entries[position - 1]["movie_title"] if position else "",
+                    "next": entries[position + 1]["movie_title"] if position + 1 < len(entries) else "",
+                }
+        return None
+
     def save_brief(self, name: str, brief: CreativeBrief | dict) -> dict:
         name = _name(name, "brief name")
         result = {"name": name, **CreativeBrief.model_validate(brief).model_dump()}
@@ -299,6 +315,15 @@ class CreatorLibrary:
         if record is None:
             return None
         return {key: record[key] for key in self._CHANNEL_DEFAULT_FIELDS if key in record}
+
+    def active_channel_identity(self) -> dict:
+        """Name, greeting and channel URL of the active profile; empty strings when unset."""
+        with self._lock:
+            data = self._load()
+            active = data.get("active_channel")
+            record = data["channels"].get(active) if active else None
+        record = record or {}
+        return {key: str(record.get(key) or "") for key in ("name", "greeting", "channel_url")}
 
     # -- transition SFX palette (reuses audio_mix effects) -------------------
 

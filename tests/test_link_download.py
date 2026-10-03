@@ -115,6 +115,100 @@ def test_download_failure_reports_only_error_lines(tmp_path: Path) -> None:
     assert len(calls) == 1
 
 
+# Real yt-dlp stderr from a Bilibili HEVC stream the CDN cut short (\r became \n in the pipe).
+_BILI_CUT = (
+    "WARNING: [BiliBili] Subtitles are only available when logged in.\n"
+    "ERROR: \n[download] Got error: 161 bytes read, 250765220 more expected. Giving up after 10 retries\n"
+)
+
+
+def test_download_error_keeps_the_message_after_a_carriage_return() -> None:
+    assert link_download._ytdlp_error(_BILI_CUT) == (
+        "ERROR: [download] Got error: 161 bytes read, 250765220 more expected. Giving up after 10 retries"
+    )
+    assert link_download._ytdlp_error("ERROR: \r[download] Got error: boom\n") == "ERROR: [download] Got error: boom"
+
+
+def test_default_format_prefers_h264_and_cut_stream_falls_back_once(tmp_path: Path) -> None:
+    formats: list[str] = []
+
+    def runner(command: list[str], **kwargs: object) -> object:
+        if "-o" not in command:
+            return type("R", (), {"returncode": 0, "stdout": '{"format":{"duration":"1.0"}}', "stderr": ""})()
+        formats.append(command[command.index("-f") + 1])
+        staging = Path(command[command.index("-o") + 1]).parent
+        if len(formats) == 1:
+            (staging / "source.f30077.mp4.part").write_bytes(b"x" * 10)
+            return type("R", (), {"returncode": 1, "stderr": _BILI_CUT})()
+        assert not list(staging.glob("*.part"))
+        (staging / "source.mp4").write_bytes(b"fake-mp4")
+        return type("R", (), {"returncode": 0, "stderr": ""})()
+
+    result = link_download.download_video(
+        "https://x/v", tmp_path, confirm_rights=True, ytdlp="/yt-dlp", runner=runner,
+    )
+    assert formats[0].startswith("bestvideo[height<=1080][vcodec^=avc1]")
+    assert formats == [link_download.DEFAULT_FORMAT, link_download.FALLBACK_FORMAT]
+    assert "161 bytes read" in result["stream_warning"]
+    assert Path(result["source_video"]).read_bytes() == b"fake-mp4"
+
+
+def test_cut_stream_on_the_fallback_still_fails(tmp_path: Path) -> None:
+    calls: list[list[str]] = []
+
+    def runner(command: list[str], **kwargs: object) -> object:
+        calls.append(command)
+        return type("R", (), {"returncode": 1, "stderr": _BILI_CUT})()
+
+    with pytest.raises(RuntimeError, match="161 bytes read"):
+        link_download.download_video(
+            "https://x/v", tmp_path, confirm_rights=True, ytdlp="/yt-dlp", runner=runner,
+        )
+    assert len(calls) == 2
+
+
+def test_bilibili_download_moves_akamai_streams_to_bilibili_mirror(tmp_path: Path) -> None:
+    akamai = "https://upos-hz-mirrorakam.akamaized.net/upgcxcode/32/46/1-1-30080.m4s?e=sig&os=akam"
+    info = {"id": "BV1", "formats": [{"format_id": "30080", "url": akamai},
+                                       {"format_id": "x", "url": "https://other.example/x"}],
+            "requested_formats": [{"format_id": "30080", "url": akamai}],
+            "requested_downloads": [{"requested_formats": [{"format_id": "30080", "url": akamai}]}]}
+    downloads: list[list[str]] = []
+
+    def runner(command: list[str], **kwargs: object) -> object:
+        if "--dump-single-json" in command:
+            assert command[-1] == "https://www.bilibili.com/video/BV1"
+            return type("R", (), {"returncode": 0, "stdout": json.dumps(info), "stderr": ""})()
+        if "-o" not in command:
+            return type("R", (), {"returncode": 0, "stdout": '{"format":{"duration":"1.0"}}', "stderr": ""})()
+        downloads.append(command)
+        saved = json.loads(Path(command[command.index("--load-info-json") + 1]).read_text(encoding="utf-8"))
+        assert saved["formats"][0]["url"].startswith("https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/32/46/")
+        assert saved["formats"][0]["url"].endswith("?e=sig&os=akam")
+        assert saved["formats"][1]["url"] == "https://other.example/x"
+        assert saved["requested_formats"][0]["url"] == saved["formats"][0]["url"]
+        assert saved["requested_downloads"][0]["requested_formats"][0]["url"] == saved["formats"][0]["url"]
+        (Path(command[command.index("-o") + 1]).parent / "source.mp4").write_bytes(b"fake-mp4")
+        return type("R", (), {"returncode": 0, "stderr": ""})()
+
+    result = link_download.download_video(
+        "https://www.bilibili.com/video/BV1", tmp_path, confirm_rights=True, ytdlp="/yt-dlp", runner=runner,
+    )
+    assert len(downloads) == 1 and "--" not in downloads[0]
+    assert Path(result["source_video"]).read_bytes() == b"fake-mp4"
+    assert not (tmp_path / "info.json").exists()
+
+
+def test_non_bilibili_and_unswappable_links_download_by_url() -> None:
+    assert link_download._is_bilibili("https://m.bilibili.com/video/BV1")
+    assert link_download._is_bilibili("https://b23.tv/abc")
+    assert not link_download._is_bilibili("https://notbilibili.com/video")
+    info = {"formats": [{"url": "https://upos-sz-mirrorcos.bilivideo.com/a.m4s"}]}
+    assert link_download._swap_bilibili_mirrors(info) == 0
+    command = link_download.build_download_command("/yt-dlp", "https://x/v", "/o/s.%(ext)s", info_json="/o/i.json")
+    assert command[-2:] == ["--load-info-json", "/o/i.json"] and "https://x/v" not in command
+
+
 def test_fetch_metadata_parses_json(tmp_path: Path) -> None:
     payload = {
         "title": "My Own Clip",

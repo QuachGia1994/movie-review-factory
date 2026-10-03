@@ -1,8 +1,16 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" fill="none" aria-label="Màn Kể - silhouette người xem phim">
-<rect x="24" y="24" width="464" height="464" rx="112" fill="#11151D"/>
-<rect x="78" y="122" width="356" height="251" rx="28" stroke="#F6F6F4" stroke-width="18"/>
-<path d="M147 173h218M147 207h130" stroke="#66DBC7" stroke-width="16" stroke-linecap="round"/>
-<circle cx="256" cy="280" r="47" fill="#F6F6F4"/>
-<path d="M151 371c13-59 53-91 105-91s92 32 105 91" fill="#F6F6F4"/>
-<path d="M137 402h238" stroke="#66DBC7" stroke-width="16" stroke-linecap="round"/>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" fill="none" aria-label="Màn Kể - màn hình kể chuyện">
+<defs><filter id="halo" x="-10%" y="-10%" width="120%" height="120%">
+<feMorphology in="SourceAlpha" operator="dilate" radius="8" result="grown"/>
+<feGaussianBlur in="grown" stdDeviation="3" result="soft"/>
+<feFlood flood-color="#080A0E" flood-opacity=".6"/>
+<feComposite in2="soft" operator="in" result="shadow"/>
+<feMerge><feMergeNode in="shadow"/><feMergeNode in="SourceGraphic"/></feMerge>
+</filter></defs>
+<g filter="url(#halo)">
+<rect x="79.0" y="99.0" width="354" height="238" rx="41.0" stroke="#F6F6F4" stroke-width="30"/>
+<path d="M150 340L122 436L238 340Z" fill="#F6F6F4"/>
+<path d="M92.0 112.0L200.0 112.0L193.3 114.3L186.7 116.9L180.4 119.8L174.2 123.0L168.3 126.5L162.5 130.2L156.9 134.3L151.6 138.7L146.4 143.3L141.4 148.2L136.6 153.5L132.0 159.0L127.6 164.8L123.4 170.9L119.4 177.3L115.6 184.0L111.9 191.0L108.5 198.2L105.3 205.8L102.2 213.7L99.4 221.8L96.7 230.2L94.3 239.0L92.0 248.0Z" fill="#F6F6F4"/>
+<path d="M420.0 112.0L312.0 112.0L318.7 114.3L325.3 116.9L331.6 119.8L337.8 123.0L343.7 126.5L349.5 130.2L355.1 134.3L360.4 138.7L365.6 143.3L370.6 148.2L375.4 153.5L380.0 159.0L384.4 164.8L388.6 170.9L392.6 177.3L396.4 184.0L400.1 191.0L403.5 198.2L406.7 205.8L409.8 213.7L412.6 221.8L415.3 230.2L417.7 239.0L420.0 248.0Z" fill="#F6F6F4"/>
+<path d="M222 176L322 226L222 276Z" fill="#66DBC7" stroke="#66DBC7" stroke-width="36" stroke-linejoin="round"/>
+</g>
 </svg>

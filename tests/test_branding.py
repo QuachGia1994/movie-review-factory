@@ -40,6 +40,53 @@ def test_brand_overlay_has_source_bands_and_readable_title(tmp_path):
         assert image.getpixel((1000, 540))[3] == 0
 
 
+def test_bundled_logo_is_transparent_without_background_tile():
+    with Image.open(branding.ASSETS / "man-ke.png") as image:
+        logo = image.convert("RGBA")
+    alpha = logo.getchannel("A")
+    assert alpha.getextrema() == (0, 255)
+    for corner in ((0, 0), (logo.width - 1, 0), (0, logo.height - 1), (logo.width - 1, logo.height - 1)):
+        assert alpha.getpixel(corner) == 0
+    # Mostly see-through: the old dark tile covered the whole square.
+    assert sum(alpha.histogram()[201:]) < logo.width * logo.height * .45
+    assert "#11151d" not in (branding.ASSETS / "man-ke.svg").read_text(encoding="utf-8").lower()
+
+
+def test_overlay_without_bands_has_no_dark_plates(tmp_path):
+    target = tmp_path / "overlay.png"
+    branding.render_overlay(tmp_path, target, 1920, 1080, "BEN 10")
+    with Image.open(target) as image:
+        alpha = image.getchannel("A")
+        # Lockup + caption keep only glyph/halo pixels; most of each area stays clear.
+        for box in ((0, 0, 520, 140), (0, 960, 1100, 1080)):
+            region = alpha.crop(box)
+            assert region.getextrema()[1] == 255
+            assert sum(region.histogram()[151:]) < region.width * region.height * .5
+        assert alpha.getpixel((960, 540)) == 0
+    branding.render_overlay(tmp_path, target, 1920, 1080, "BEN 10", include_mark=False)
+    with Image.open(target) as image:
+        assert image.getchannel("A").crop((0, 0, 520, 140)).getextrema()[1] == 0
+
+
+def test_brand_guard_layers_are_transparent_and_ghost_is_faint(tmp_path, monkeypatch):
+    mark = branding.render_mark(tmp_path, tmp_path / "mark.png", 1080)
+    ghost = branding.render_ghost(tmp_path, tmp_path / "ghost.png", 1080)
+    with Image.open(mark) as image:
+        alpha = image.getchannel("A")
+        assert alpha.getpixel((0, 0)) == 0 and alpha.getextrema()[1] == 255
+    with Image.open(ghost) as image:
+        assert image.getchannel("A").getextrema()[1] <= round(255 * branding.GHOST_OPACITY) + 1
+    x, y = branding.mark_overlay_xy(30)
+    assert "W-w-30" in x and f"t/{branding.MARK_HOP_SECONDS}" in x and y == "30"
+    gx, gy = branding.ghost_overlay_xy(30, 1.5)
+    assert f"floor(t/{branding.GHOST_HOP_SECONDS})" in gx and "H*0.16" in gy
+    assert branding.ghost_overlay_xy(30, 2.5) != (gx, gy)
+    monkeypatch.setenv(branding.BRAND_GUARD_ENV, "0")
+    assert not branding.brand_guard_enabled()
+    monkeypatch.setenv(branding.BRAND_GUARD_ENV, "1")
+    assert branding.brand_guard_enabled()
+
+
 @pytest.mark.parametrize("width,height", [(1920, 1080), (1080, 1920)])
 def test_render_card_is_frame_sized_and_branded(tmp_path, width, height):
     target = tmp_path / "intro-card.png"

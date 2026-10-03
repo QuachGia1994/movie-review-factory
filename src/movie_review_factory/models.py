@@ -90,6 +90,9 @@ class JobConfig(BaseModel):
     # 'banmai' or an ElevenLabs voice id). Empty falls back to MRF_TTS_VOICE then a
     # per-provider default. Ignored by the edge provider. Not a secret.
     tts_voice: str = Field(default="", max_length=120)
+    # 'compilation' structures the video as 'Câu chuyện thứ N' sections (anthology films).
+    review_format: Literal["single", "compilation"] = "single"
+    genre: str = Field(default="", max_length=40)
 
 
 class ChannelProfile(BaseModel):
@@ -111,6 +114,9 @@ class ChannelProfile(BaseModel):
     brand_top_band: float = Field(default=0, ge=0, le=0.2)
     brand_bottom_band: float = Field(default=0, ge=0, le=0.2)
     visual_variety: str = Field(default="off", max_length=30, validation_alias=VISUAL_VARIETY_KEYS)
+    # Verbal branding and the subscribe link used by script prompts and YouTube packaging.
+    greeting: str = Field(default="", max_length=200)
+    channel_url: str = Field(default="", max_length=200)
 
     @field_validator("name")
     @classmethod
@@ -118,6 +124,19 @@ class ChannelProfile(BaseModel):
         text = str(value).strip()
         if not text or len(text) > 40 or any(ord(c) < 32 or ord(c) == 127 for c in text):
             raise ValueError("Tên kênh cần 1–40 ký tự và không chứa ký tự điều khiển.")
+        return text
+
+    @field_validator("greeting")
+    @classmethod
+    def _clean_greeting(cls, value: str) -> str:
+        return " ".join(str(value or "").split())
+
+    @field_validator("channel_url")
+    @classmethod
+    def _clean_channel_url(cls, value: str) -> str:
+        text = str(value or "").strip()
+        if text and not text.startswith("https://"):
+            raise ValueError("Link kênh phải bắt đầu bằng https://")
         return text
 
 
