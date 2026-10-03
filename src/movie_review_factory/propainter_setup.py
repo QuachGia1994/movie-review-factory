@@ -55,6 +55,9 @@ def install_root() -> Path:
     configured = (os.environ.get(PROPAINTER_ENV) or "").strip()
     if configured:
         return Path(configured).expanduser()
+    app_cache = (os.environ.get("MRF_CACHE_ROOT") or "").strip()
+    if app_cache:
+        return Path(app_cache).expanduser() / "propainter" / PROPAINTER_COMMIT
     cache_root = (os.environ.get("XDG_CACHE_HOME") or "").strip()
     base = Path(cache_root).expanduser() if cache_root else Path.home() / ".cache"
     return base / "movie-review-factory" / "propainter" / PROPAINTER_COMMIT

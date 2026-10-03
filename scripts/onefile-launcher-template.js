@@ -236,6 +236,35 @@ function appDataRoot() {
   return path.join(base, APP_NAME);
 }
 
+function cacheRoot() {
+  if (process.env.MRF_CACHE_ROOT) {
+    return path.resolve(process.env.MRF_CACHE_ROOT);
+  }
+  return path.join(appDataRoot(), "cache");
+}
+
+function cacheEnvironment() {
+  var root = cacheRoot();
+
+  function configured(name, fallback) {
+    return process.env[name] || fallback;
+  }
+
+  return {
+    MRF_CACHE_ROOT: root,
+    XDG_CACHE_HOME: configured("XDG_CACHE_HOME", path.join(root, "xdg")),
+    HF_HOME: configured("HF_HOME", path.join(root, "huggingface")),
+    HF_HUB_CACHE: configured("HF_HUB_CACHE", path.join(root, "huggingface", "hub")),
+    TRANSFORMERS_CACHE: configured("TRANSFORMERS_CACHE", path.join(root, "huggingface", "transformers")),
+    TORCH_HOME: configured("TORCH_HOME", path.join(root, "torch")),
+    UV_CACHE_DIR: configured("UV_CACHE_DIR", path.join(root, "uv")),
+    PIP_CACHE_DIR: configured("PIP_CACHE_DIR", path.join(root, "pip")),
+    PLAYWRIGHT_BROWSERS_PATH: configured("PLAYWRIGHT_BROWSERS_PATH", path.join(root, "playwright")),
+    MRF_WHISPER_CACHE: configured("MRF_WHISPER_CACHE", path.join(root, "models", "whisper")),
+    MRF_EMBED_CACHE: configured("MRF_EMBED_CACHE", path.join(root, "models", "embeddings"))
+  };
+}
+
 function runtimeRoot() {
   return path.join(appDataRoot(), "runtime", BUNDLE_HASH.slice(0, 16));
 }
@@ -562,7 +591,8 @@ function ensureCoreDependencies(py) {
 }
 
 function ensureSystemRuntimeDependencies(py) {
-  if (checkRuntimeDependencies(py, process.env)) {
+  var env = mergeEnv(cacheEnvironment());
+  if (checkRuntimeDependencies(py, env)) {
     return true;
   }
   if (hasArg("--no-auto-install") || process.env.MRF_NO_AUTO_INSTALL === "1" || noNetwork()) {
@@ -573,9 +603,9 @@ function ensureSystemRuntimeDependencies(py) {
   var install = childProcess.spawnSync(
     py.command,
     pythonArgs(py, ["-m", "pip", "install", "--user"].concat(requirements)),
-    { stdio: "inherit", windowsHide: false }
+    { env: env, stdio: "inherit", windowsHide: false }
   );
-  return install.status === 0 && checkRuntimeDependencies(py, process.env);
+  return install.status === 0 && checkRuntimeDependencies(py, env);
 }
 
 function commandPath(command) {
@@ -665,12 +695,10 @@ function ensureUv() {
 }
 
 function managedEnvironment() {
-  return mergeEnv({
-    UV_PYTHON_INSTALL_DIR: path.join(toolchainRoot(), "python"),
-    UV_CACHE_DIR: path.join(appDataRoot(), "cache", "uv"),
-    UV_NO_PROGRESS: "1",
-    HF_HOME: path.join(appDataRoot(), "cache", "huggingface")
-  });
+  var env = cacheEnvironment();
+  env.UV_PYTHON_INSTALL_DIR = path.join(toolchainRoot(), "python");
+  env.UV_NO_PROGRESS = "1";
+  return mergeEnv(env);
 }
 
 function pythonInfo(py, env) {
@@ -922,16 +950,17 @@ function ensureToolchain() {
   }
 
   var ffmpegBin = ensureFfmpeg();
-  var childEnv = mergeEnv(pythonRuntime.env || {});
+  var childEnv = mergeEnv(cacheEnvironment());
+  Object.keys(pythonRuntime.env || {}).forEach(function (key) {
+    childEnv[key] = pythonRuntime.env[key];
+  });
   prependEnvPath(childEnv, ffmpegBin);
   childEnv.MRF_FFMPEG_BIN = ffmpegBin;
   if (pythonRuntime.uv) {
     childEnv.MRF_UV = pythonRuntime.uv;
   }
-  childEnv.MRF_WHISPER_CACHE = path.join(appDataRoot(), "models", "whisper");
   childEnv.MRF_WHISPER_BATCH_SIZE = childEnv.MRF_WHISPER_BATCH_SIZE ||
     (os.totalmem() >= 16 * 1024 * 1024 * 1024 ? "8" : "4");
-  childEnv.MRF_EMBED_CACHE = path.join(appDataRoot(), "models", "embeddings");
   if (noNetwork()) {
     childEnv.MRF_WHISPER_OFFLINE = "1";
     childEnv.MRF_EMBED_OFFLINE = "1";
